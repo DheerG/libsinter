@@ -57,20 +57,23 @@
  * limiting PSNR to ~22 dB even at low QP. At 60% strength,
  * we get meaningful deblocking while keeping the post-filter
  * error amplification manageable. */
-#define LAP4_T0  6951    /* 0.60 * 11585 ≈ 0.212 in Q15 */
-#define LAP4_T1  6951
-#define LAP4_S0  3762    /* 0.60 * 6270 ≈ 0.115 in Q15 */
-#define LAP4_S1  3762
+/* Q15 lifting coefficients: 20% of Malvar theoretical values.
+ * At QP=4 with hybrid PVQ/scalar, 20% gives 46.43 dB (0.28 dB from H.264).
+ * Weaker lapping = less post-filter error amplification = higher PSNR.
+ * Still provides meaningful deblocking at higher QP where blocking is visible. */
+#define LAP4_T0  2317    /* 0.20 * 11585 */
+#define LAP4_T1  2317
+#define LAP4_S0  1254    /* 0.20 * 6270 */
+#define LAP4_S1  1254
 
-/* 8-point filter at 60% of Timothy's reviewed values */
-#define LAP8_T0  7724    /* 0.60 * 12873 */
-#define LAP8_T1  7724
-#define LAP8_T2  5320    /* 0.60 * 8867 */
-#define LAP8_T3  5320
-#define LAP8_S0  3459    /* 0.60 * 5765 */
-#define LAP8_S1  3459
-#define LAP8_S2  1881    /* 0.60 * 3135 */
-#define LAP8_S3  1881
+#define LAP8_T0  2575    /* 0.20 * 12873 */
+#define LAP8_T1  2575
+#define LAP8_T2  1773    /* 0.20 * 8867 */
+#define LAP8_T3  1773
+#define LAP8_S0  1153    /* 0.20 * 5765 */
+#define LAP8_S1  1153
+#define LAP8_S2  627     /* 0.20 * 3135 */
+#define LAP8_S3  627
 
 /* ── Q15 lifting step helper ─────────────────────────────────────── */
 static inline int16_t lift(int16_t x, int16_t coeff) {

@@ -4,9 +4,6 @@
 #include <stdint.h>
 #include "../core/sinter_types.h"
 
-/* Convert QP to quantization step size. */
-uint16_t snte_qp_to_step(uint8_t qp);
-
 /* Encode a single luma frame.
  * ctx: encoder context (must have header and psy_cfg set).
  * input_y: input luma plane. width/height/stride: frame dimensions.

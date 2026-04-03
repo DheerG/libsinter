@@ -16,9 +16,7 @@
 #include "../core/bitstream/bitstream.h"
 #include "../core/prediction/intra.h"
 #include "../core/grain/grain_synth.h"
-
-/* QP to step (same table as encoder — must match exactly) */
-extern uint16_t snte_qp_to_step(uint8_t qp);
+#include "../core/quantize/qp_table.h"
 
 int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                        uint32_t bs_len, uint8_t *output_y,
@@ -41,7 +39,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     int blk_rows = pad_h / BLK;
     int total_blocks = blk_cols * blk_rows;
 
-    uint16_t step = snte_qp_to_step(ctx->header.base_qp);
+    uint16_t step = snt_qp_to_step(ctx->header.base_qp);
 
     /* Read block data */
     snt_br_byte_align(&br);
@@ -66,7 +64,9 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         if (!pvq_codes[i].skip) {
             pvq_codes[i].gain = snt_br_get_bits(&br, 16);
             pvq_codes[i].k = (uint16_t)snt_br_get_bits(&br, 16);
-            pvq_codes[i].shape_idx = snt_br_get_bits(&br, 32);
+            uint64_t hi = snt_br_get_bits(&br, 32);
+            uint64_t lo = snt_br_get_bits(&br, 32);
+            pvq_codes[i].shape_idx = (hi << 32) | lo;
         }
     }
 

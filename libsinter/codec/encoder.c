@@ -20,22 +20,10 @@
 #include "../core/entropy/rans.h"
 #include "../core/bitstream/bitstream.h"
 #include "../core/prediction/intra.h"
+#include "../core/quantize/qp_table.h"
 #include "../perceptual/csf_weights.h"
 #include "../perceptual/activity_mask.h"
 #include "../perceptual/ptd.h"
-
-/* QP to quantization step mapping (exponential, similar to H.264/AV1) */
-static const uint16_t qp_to_step[64] = {
-     1,  1,  2,  2,  3,  3,  4,  4,  5,  6,  7,  8,  9, 10, 11, 12,
-    14, 16, 18, 20, 22, 24, 28, 32, 36, 40, 44, 48, 56, 64, 72, 80,
-    88, 96,112,128,144,160,176,192,224,256,288,320,352,384,448,512,
-    576,640,704,768,896,1024,1152,1280,1408,1536,1792,2048,2304,2560,2816,3072
-};
-
-uint16_t snte_qp_to_step(uint8_t qp) {
-    if (qp > 63) qp = 63;
-    return qp_to_step[qp];
-}
 
 int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                        int width, int height, int stride,
@@ -72,7 +60,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     snt_lap_pre_filter_2d_ref(work, pad_w, pad_h, pad_w, BLK);
 
     /* Step 2: Process blocks — DCT, PVQ quantize, collect symbols */
-    uint16_t step = snte_qp_to_step(ctx->header.base_qp);
+    uint16_t step = snt_qp_to_step(ctx->header.base_qp);
     int blk_cols = pad_w / BLK;
     int blk_rows = pad_h / BLK;
     int total_blocks = blk_cols * blk_rows;
@@ -128,7 +116,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
 
             /* Use base QP step (activity masking is encoder-only heuristic;
              * decoder uses base_qp so quant/dequant must match). */
-            uint16_t blk_step = snte_qp_to_step(ctx->header.base_qp);
+            uint16_t blk_step = snt_qp_to_step(ctx->header.base_qp);
 
             /* Quantize DC */
             dc_levels[bidx] = pvq_quantize_dc(residual[0], blk_step, 1);
@@ -169,7 +157,8 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         if (!pvq_codes[i].skip) {
             snt_bw_put_bits(&bw, pvq_codes[i].gain, 16);
             snt_bw_put_bits(&bw, pvq_codes[i].k, 16);
-            snt_bw_put_bits(&bw, (uint32_t)pvq_codes[i].shape_idx, 32);
+            snt_bw_put_bits(&bw, (uint32_t)(pvq_codes[i].shape_idx >> 32), 32);
+            snt_bw_put_bits(&bw, (uint32_t)(pvq_codes[i].shape_idx & 0xFFFFFFFF), 32);
         }
     }
 

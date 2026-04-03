@@ -28,7 +28,11 @@ static int csf_initialized = 0;
  * w(f) = exp(-0.5 * ((log2(f/f_peak))^2) / bw^2)
  * where f is spatial frequency in cycles/degree. */
 static float csf_weight_for_freq(float freq_cpd) {
-    if (freq_cpd < 0.1f) return 1.0f; /* DC: full weight */
+    /* DC (freq ≈ 0) gets reduced weight — the HVS is less sensitive to
+     * very low spatial frequencies than to the 4-8 cpd peak band.
+     * The bandpass model naturally gives DC a lower weight (~0.3) since
+     * it's far from the peak frequency. */
+    if (freq_cpd < 0.01f) freq_cpd = 0.01f; /* avoid log(0) */
     float log_ratio = logf(freq_cpd / CSF_PEAK_FREQ) / logf(2.0f);
     float w = expf(-0.5f * (log_ratio * log_ratio) / (CSF_BANDWIDTH * CSF_BANDWIDTH));
     /* Clamp to [0.01, 1.0] — never zero (every coefficient matters a little) */
@@ -53,11 +57,15 @@ static void csf_init_table(float *table, int size) {
         }
     }
 
-    /* Normalize: DC weight = 1.0 (CSF-weighted DC error = unweighted DC error) */
-    float dc_weight = table[0];
-    if (dc_weight > 0.0f) {
+    /* Normalize: max weight = 1.0 (at peak CSF band).
+     * DC gets ~0.3-0.7 depending on block size, reflecting the HVS's
+     * reduced sensitivity to very low spatial frequencies. */
+    float max_weight = 0.0f;
+    for (int i = 0; i < size * size; i++)
+        if (table[i] > max_weight) max_weight = table[i];
+    if (max_weight > 0.0f) {
         for (int i = 0; i < size * size; i++)
-            table[i] /= dc_weight;
+            table[i] /= max_weight;
     }
 }
 

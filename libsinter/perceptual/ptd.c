@@ -35,10 +35,12 @@ float psy_ptd_distortion(const int16_t *orig, const int16_t *recon,
 }
 
 float psy_mse_distortion(const int16_t *orig, const int16_t *recon, int n) {
+    /* Returns SUM of squared errors (not mean) to match PTD convention.
+     * RDO needs sums for rate-distortion cost computation. */
     float dist = 0.0f;
     for (int i = 0; i < n; i++) {
         float diff = (float)(orig[i] - recon[i]);
         dist += diff * diff;
     }
-    return dist / n;
+    return dist;
 }

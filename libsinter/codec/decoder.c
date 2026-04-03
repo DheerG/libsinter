@@ -78,29 +78,39 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 int start = band_bounds[b];
                 int n = band_bounds[b + 1] - start;
 
-                uint8_t skip = (uint8_t)snt_br_get_bits(&br, 1);
-                if (!skip) {
-                    SntPVQCode code;
-                    code.skip = 0;
-                    code.gain = snt_br_get_bits(&br, 16);
-                    code.k = (uint16_t)snt_br_get_bits(&br, 16);
-                    int shape_bits = pvq_shape_bits(n, code.k); /* computed, not signaled */
-                    if (shape_bits > 64) shape_bits = 64;
-                    if (shape_bits > 32) {
-                        uint64_t hi = snt_br_get_bits(&br, shape_bits - 32);
-                        uint64_t lo = snt_br_get_bits(&br, 32);
-                        code.shape_idx = (hi << 32) | lo;
-                    } else {
-                        code.shape_idx = snt_br_get_bits(&br, shape_bits);
-                    }
+                uint8_t quant_mode = (uint8_t)snt_br_get_bits(&br, 1);
 
-                    int16_t band_recon[16];
-                    pvq_decode(&code, n, step, band_recon);
-                    for (int i = 0; i < n; i++)
-                        recon_coeffs[1 + start + i] = band_recon[i];
+                if (quant_mode == 1) {
+                    /* Scalar mode: each coefficient independently */
+                    for (int i = 0; i < n; i++) {
+                        int16_t level = (int16_t)(uint16_t)snt_br_get_bits(&br, 16);
+                        recon_coeffs[1 + start + i] = pvq_dequantize_dc(level, step);
+                    }
                 } else {
-                    for (int i = 0; i < n; i++)
-                        recon_coeffs[1 + start + i] = 0;
+                    /* PVQ mode */
+                    uint8_t skip = (uint8_t)snt_br_get_bits(&br, 1);
+                    if (!skip) {
+                        SntPVQCode code;
+                        code.skip = 0;
+                        code.gain = snt_br_get_bits(&br, 16);
+                        code.k = (uint16_t)snt_br_get_bits(&br, 16);
+                        int shape_bits = pvq_shape_bits(n, code.k);
+                        if (shape_bits > 64) shape_bits = 64;
+                        if (shape_bits > 32) {
+                            uint64_t hi = snt_br_get_bits(&br, shape_bits - 32);
+                            uint64_t lo = snt_br_get_bits(&br, 32);
+                            code.shape_idx = (hi << 32) | lo;
+                        } else {
+                            code.shape_idx = snt_br_get_bits(&br, shape_bits);
+                        }
+                        int16_t band_recon[16];
+                        pvq_decode(&code, n, step, band_recon);
+                        for (int i = 0; i < n; i++)
+                            recon_coeffs[1 + start + i] = band_recon[i];
+                    } else {
+                        for (int i = 0; i < n; i++)
+                            recon_coeffs[1 + start + i] = 0;
+                    }
                 }
             }
 

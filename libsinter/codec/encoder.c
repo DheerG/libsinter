@@ -130,23 +130,49 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                 uint8_t band_csf = (uint8_t)(csf_sum / n * 255.0f);
                 if (band_csf < 1) band_csf = 1;
 
-                SntPVQCode code;
-                int16_t band_recon[16];
-                pvq_encode(&coeffs[1 + start], n, step, 1, band_csf, &code, band_recon);
+                /* Hybrid PVQ/Scalar mode decision per band.
+                 * If energy is concentrated in 1-2 coefficients (sparse),
+                 * scalar quantization is better (no shape noise).
+                 * If energy is spread (texture), PVQ is better (preserves energy). */
+                int16_t *band_coeffs = &coeffs[1 + start];
+                int32_t max_sq = 0, sum_sq = 0;
+                for (int i = 0; i < n; i++) {
+                    int32_t sq = (int32_t)band_coeffs[i] * band_coeffs[i];
+                    sum_sq += sq;
+                    if (sq > max_sq) max_sq = sq;
+                }
+                /* Energy concentration: if top coeff holds >60% of energy, use scalar */
+                int use_scalar = (sum_sq > 0 && max_sq * 10 > sum_sq * 6);
 
-                snt_bw_put_bits(&bw, code.skip, 1);
-                if (!code.skip) {
-                    snt_bw_put_bits(&bw, code.gain & 0xFFFF, 16);
-                    snt_bw_put_bits(&bw, code.k, 16);
-                    int shape_bits = pvq_shape_bits(n, code.k);
-                    if (shape_bits < 1) shape_bits = 1;
-                    if (shape_bits > 64) shape_bits = 64;
-                    /* shape_bits NOT signaled — decoder computes pvq_shape_bits(n,k) */
-                    if (shape_bits > 32) {
-                        snt_bw_put_bits(&bw, (uint32_t)(code.shape_idx >> 32), shape_bits - 32);
-                        snt_bw_put_bits(&bw, (uint32_t)(code.shape_idx & 0xFFFFFFFF), 32);
-                    } else {
-                        snt_bw_put_bits(&bw, (uint32_t)code.shape_idx, shape_bits);
+                int16_t band_recon[16];
+
+                if (use_scalar) {
+                    /* Scalar mode: quantize each coefficient independently */
+                    snt_bw_put_bits(&bw, 1, 1); /* mode=1: scalar */
+                    for (int i = 0; i < n; i++) {
+                        int16_t level = pvq_quantize_dc(band_coeffs[i], step, 1);
+                        snt_bw_put_bits(&bw, (uint32_t)(uint16_t)level, 16);
+                        band_recon[i] = pvq_dequantize_dc(level, step);
+                    }
+                } else {
+                    /* PVQ mode */
+                    snt_bw_put_bits(&bw, 0, 1); /* mode=0: PVQ */
+                    SntPVQCode code;
+                    pvq_encode(band_coeffs, n, step, 1, band_csf, &code, band_recon);
+
+                    snt_bw_put_bits(&bw, code.skip, 1);
+                    if (!code.skip) {
+                        snt_bw_put_bits(&bw, code.gain & 0xFFFF, 16);
+                        snt_bw_put_bits(&bw, code.k, 16);
+                        int shape_bits = pvq_shape_bits(n, code.k);
+                        if (shape_bits < 1) shape_bits = 1;
+                        if (shape_bits > 64) shape_bits = 64;
+                        if (shape_bits > 32) {
+                            snt_bw_put_bits(&bw, (uint32_t)(code.shape_idx >> 32), shape_bits - 32);
+                            snt_bw_put_bits(&bw, (uint32_t)(code.shape_idx & 0xFFFFFFFF), 32);
+                        } else {
+                            snt_bw_put_bits(&bw, (uint32_t)code.shape_idx, shape_bits);
+                        }
                     }
                 }
                 for (int i = 0; i < n; i++)

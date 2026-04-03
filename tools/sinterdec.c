@@ -72,7 +72,8 @@ int main(int argc, char **argv) {
 
         int out_w, out_h;
         int ret = sntd_decode_frame(&ctx, bitstream, frame_len, output_y,
-                                     &out_w, &out_h, (int)width);
+                                     NULL, NULL, &out_w, &out_h,
+                                     (int)width, 0);
         if (ret != 0) {
             fprintf(stderr, "Decode error at frame %u\n", f);
             break;

@@ -68,13 +68,13 @@ static int test_flat_gray(void) {
     init_encoder_ctx(&enc_ctx, 4);
 
     uint32_t bs_len;
-    int ret = snte_encode_frame(&enc_ctx, input, W, H, W, bitstream, 65536, &bs_len);
+    int ret = snte_encode_frame(&enc_ctx, input, NULL, NULL, W, H, W, 0, bitstream, 65536, &bs_len);
     if (ret != 0) { printf("  FAIL: encode returned %d\n", ret); goto fail; }
 
     SntDecoderCtx dec_ctx;
     memset(&dec_ctx, 0, sizeof(dec_ctx));
     int out_w, out_h;
-    ret = sntd_decode_frame(&dec_ctx, bitstream, bs_len, output, &out_w, &out_h, W);
+    ret = sntd_decode_frame(&dec_ctx, bitstream, bs_len, output, NULL, NULL, &out_w, &out_h, W, 0);
     if (ret != 0) { printf("  FAIL: decode returned %d\n", ret); goto fail; }
 
     double psnr = compute_psnr(input, output, W, H, W);
@@ -116,13 +116,13 @@ static int test_gradient(void) {
     init_encoder_ctx(&enc_ctx, 8);
 
     uint32_t bs_len;
-    int ret = snte_encode_frame(&enc_ctx, input, W, H, W, bitstream, 65536, &bs_len);
+    int ret = snte_encode_frame(&enc_ctx, input, NULL, NULL, W, H, W, 0, bitstream, 65536, &bs_len);
     if (ret != 0) { printf("  FAIL: encode returned %d\n", ret); goto fail; }
 
     SntDecoderCtx dec_ctx;
     memset(&dec_ctx, 0, sizeof(dec_ctx));
     int out_w, out_h;
-    ret = sntd_decode_frame(&dec_ctx, bitstream, bs_len, output, &out_w, &out_h, W);
+    ret = sntd_decode_frame(&dec_ctx, bitstream, bs_len, output, NULL, NULL, &out_w, &out_h, W, 0);
     if (ret != 0) { printf("  FAIL: decode returned %d\n", ret); goto fail; }
 
     double psnr = compute_psnr(input, output, W, H, W);
@@ -157,8 +157,8 @@ static int test_determinism(void) {
     init_encoder_ctx(&ctx2, 28);
 
     uint32_t len1, len2;
-    snte_encode_frame(&ctx1, input, W, H, W, bs1, 65536, &len1);
-    snte_encode_frame(&ctx2, input, W, H, W, bs2, 65536, &len2);
+    snte_encode_frame(&ctx1, input, NULL, NULL, W, H, W, 0, bs1, 65536, &len1);
+    snte_encode_frame(&ctx2, input, NULL, NULL, W, H, W, 0, bs2, 65536, &len2);
 
     if (len1 != len2) {
         printf("  FAIL: different bitstream lengths: %u vs %u\n", len1, len2);
@@ -198,12 +198,12 @@ static int test_quality_monotonic(void) {
         init_encoder_ctx(&enc_ctx, qps[q]);
 
         uint32_t bs_len;
-        snte_encode_frame(&enc_ctx, input, W, H, W, bitstream, 65536, &bs_len);
+        snte_encode_frame(&enc_ctx, input, NULL, NULL, W, H, W, 0, bitstream, 65536, &bs_len);
 
         SntDecoderCtx dec_ctx;
         memset(&dec_ctx, 0, sizeof(dec_ctx));
         int out_w, out_h;
-        sntd_decode_frame(&dec_ctx, bitstream, bs_len, output, &out_w, &out_h, W);
+        sntd_decode_frame(&dec_ctx, bitstream, bs_len, output, NULL, NULL, &out_w, &out_h, W, 0);
 
         double psnr = compute_psnr(input, output, W, H, W);
         printf("  QP=%d: PSNR=%.2f dB, size=%u bytes\n", qps[q], psnr, bs_len);
@@ -241,13 +241,13 @@ static int test_dimensions(void) {
     init_encoder_ctx(&enc_ctx, 24);
 
     uint32_t bs_len;
-    int ret = snte_encode_frame(&enc_ctx, input, W, H, W, bitstream, 65536, &bs_len);
+    int ret = snte_encode_frame(&enc_ctx, input, NULL, NULL, W, H, W, 0, bitstream, 65536, &bs_len);
     if (ret != 0) { printf("  FAIL: encode returned %d\n", ret); goto fail; }
 
     SntDecoderCtx dec_ctx;
     memset(&dec_ctx, 0, sizeof(dec_ctx));
     int out_w, out_h;
-    ret = sntd_decode_frame(&dec_ctx, bitstream, bs_len, output, &out_w, &out_h, W);
+    ret = sntd_decode_frame(&dec_ctx, bitstream, bs_len, output, NULL, NULL, &out_w, &out_h, W, 0);
     if (ret != 0) { printf("  FAIL: decode returned %d\n", ret); goto fail; }
 
     if (out_w != W || out_h != H) {

@@ -93,7 +93,8 @@ int main(int argc, char **argv) {
         ctx.header.frame_number = (uint32_t)f;
 
         uint32_t bs_len;
-        int ret = snte_encode_frame(&ctx, input_y, width, height, width,
+        int ret = snte_encode_frame(&ctx, input_y, NULL, NULL,
+                                     width, height, width, 0,
                                      bitstream, (uint32_t)(frame_size * 2), &bs_len);
         if (ret != 0) {
             fprintf(stderr, "Encode error at frame %d\n", f);

@@ -152,15 +152,48 @@ static void encode_leaf_block(int x, int y, int size, int tx_mode, void *ctx_ptr
     (*ctx->block_count)++;
 }
 
+/* ── Encode a single chroma plane (simple scalar quantization) ──────── */
+static void encode_chroma_plane(const uint8_t *input, int width, int height,
+                                 int stride, uint16_t step,
+                                 SntBitWriter *bw) {
+    const int BLK = 4; /* chroma block size (half of luma 8x8) */
+    int pad_w = ((width + BLK - 1) / BLK) * BLK;
+    int pad_h = ((height + BLK - 1) / BLK) * BLK;
+
+    for (int by = 0; by < pad_h; by += BLK) {
+        for (int bx = 0; bx < pad_w; bx += BLK) {
+            /* Compute DC of this chroma block */
+            int32_t sum = 0;
+            int count = 0;
+            for (int y = 0; y < BLK && by + y < height; y++) {
+                for (int x = 0; x < BLK && bx + x < width; x++) {
+                    sum += input[(by + y) * stride + bx + x];
+                    count++;
+                }
+            }
+            int16_t dc = (count > 0) ? (int16_t)(sum / count) : 128;
+
+            /* Simple scalar quantization of DC - 128 (centered) */
+            int16_t centered = dc - 128;
+            int16_t level = pvq_quantize_dc(centered, step, 1);
+            snt_bw_put_bits(bw, (uint32_t)(uint16_t)level, 16);
+        }
+    }
+}
+
+/* ── Decode a single chroma plane ──────────────────────────────────── */
+/* (defined here for shared use; decoder.c has its own copy) */
+
 /* ── Main encoder entry point ─────────────────────────────────────── */
 int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
-                       int width, int height, int stride,
+                       const uint8_t *input_u, const uint8_t *input_v,
+                       int width, int height, int stride_y, int stride_uv,
                        uint8_t *bitstream, uint32_t bs_capacity,
                        uint32_t *bs_len) {
     /* Step 0: Grain estimation (strip grain before encoding) */
     if (ctx->psy_cfg.grain_enabled) {
         extern void psy_estimate_grain(const uint8_t *, int, int, int, SntGrainParams *);
-        psy_estimate_grain(input_y, width, height, stride, &ctx->header.grain);
+        psy_estimate_grain(input_y, width, height, stride_y, &ctx->header.grain);
         ctx->header.grain.seed = (uint16_t)(ctx->header.frame_number & 0xFFFF);
     }
 
@@ -184,7 +217,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     /* Convert input to int16_t work buffer */
     for (int y = 0; y < height; y++)
         for (int x = 0; x < width; x++)
-            work[y * pad_w + x] = (int16_t)input_y[y * stride + x];
+            work[y * pad_w + x] = (int16_t)input_y[y * stride_y + x];
 
     /* Step 1: Quad-tree split decisions */
     uint8_t *split_flags = (uint8_t *)calloc(MAX_SPLIT_FLAGS, 1);
@@ -220,7 +253,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         .stride = pad_w, .frame_w = pad_w, .frame_h = pad_h,
         .base_qp = ctx->header.base_qp, .mean_activity = mean_activity,
         .alpha = ctx->psy_cfg.alpha, .is_inter = 0,
-        .ref_y = NULL, .cur_y = input_y, .ref_stride = stride,
+        .ref_y = NULL, .cur_y = input_y, .ref_stride = stride_y,
         .mv_map = NULL, .mv_stride = 0,
         .blocks = blocks, .block_count = &block_count
     };
@@ -327,6 +360,23 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                 snt_bw_put_bits(&bw, (uint32_t)b->pvq_code.shape_idx, shape_bits);
             }
         }
+    }
+
+    /* Step 8: Encode chroma planes (YUV420 at half resolution) */
+    snt_bw_byte_align(&bw);
+    if (input_u && input_v) {
+        int chroma_w = width / 2;
+        int chroma_h = height / 2;
+        int chroma_qp = ctx->header.base_qp + ctx->header.chroma_qp_offset;
+        if (chroma_qp < 0) chroma_qp = 0;
+        if (chroma_qp > 63) chroma_qp = 63;
+        uint16_t chroma_step = snt_qp_to_step((uint8_t)chroma_qp);
+
+        snt_bw_put_bits(&bw, 1, 1); /* chroma_present flag */
+        encode_chroma_plane(input_u, chroma_w, chroma_h, stride_uv, chroma_step, &bw);
+        encode_chroma_plane(input_v, chroma_w, chroma_h, stride_uv, chroma_step, &bw);
+    } else {
+        snt_bw_put_bits(&bw, 0, 1); /* no chroma */
     }
 
     snt_bw_byte_align(&bw);

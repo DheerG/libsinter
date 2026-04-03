@@ -86,7 +86,9 @@ static void decode_leaf_block(int x, int y, int size, int tx_mode, void *ctx_ptr
 /* ── Main decoder entry point ─────────────────────────────────────── */
 int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                        uint32_t bs_len, uint8_t *output_y,
-                       int *out_width, int *out_height, int stride) {
+                       uint8_t *output_u, uint8_t *output_v,
+                       int *out_width, int *out_height,
+                       int stride_y, int stride_uv) {
     SntBitReader br;
     snt_br_init(&br, bitstream, bs_len);
     snt_read_frame_header(&br, &ctx->header);
@@ -243,12 +245,49 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     /* Copy to output, clipping to [0, 255] */
     for (int y = 0; y < height; y++)
         for (int x = 0; x < width; x++)
-            output_y[y * stride + x] = snt_clip_pixel((int32_t)recon[y * pad_w + x]);
+            output_y[y * stride_y + x] = snt_clip_pixel((int32_t)recon[y * pad_w + x]);
+
+    /* Decode chroma planes */
+    if (!snt_br_eof(&br)) {
+        uint32_t chroma_present = snt_br_get_bits(&br, 1);
+        if (chroma_present && output_u && output_v) {
+            int chroma_w = width / 2;
+            int chroma_h = height / 2;
+            int chroma_qp = ctx->header.base_qp + ctx->header.chroma_qp_offset;
+            if (chroma_qp < 0) chroma_qp = 0;
+            if (chroma_qp > 63) chroma_qp = 63;
+            uint16_t chroma_step = snt_qp_to_step((uint8_t)chroma_qp);
+            int chroma_blk = 4;
+            int cpw = ((chroma_w + chroma_blk - 1) / chroma_blk) * chroma_blk;
+            int cph = ((chroma_h + chroma_blk - 1) / chroma_blk) * chroma_blk;
+
+            /* Decode U plane */
+            for (int by = 0; by < cph; by += chroma_blk) {
+                for (int bx = 0; bx < cpw; bx += chroma_blk) {
+                    int16_t level = (int16_t)(uint16_t)snt_br_get_bits(&br, 16);
+                    int16_t dc = pvq_dequantize_dc(level, chroma_step) + 128;
+                    for (int y = 0; y < chroma_blk && by + y < chroma_h; y++)
+                        for (int x = 0; x < chroma_blk && bx + x < chroma_w; x++)
+                            output_u[(by + y) * stride_uv + bx + x] = snt_clip_pixel(dc);
+                }
+            }
+            /* Decode V plane */
+            for (int by = 0; by < cph; by += chroma_blk) {
+                for (int bx = 0; bx < cpw; bx += chroma_blk) {
+                    int16_t level = (int16_t)(uint16_t)snt_br_get_bits(&br, 16);
+                    int16_t dc = pvq_dequantize_dc(level, chroma_step) + 128;
+                    for (int y = 0; y < chroma_blk && by + y < chroma_h; y++)
+                        for (int x = 0; x < chroma_blk && bx + x < chroma_w; x++)
+                            output_v[(by + y) * stride_uv + bx + x] = snt_clip_pixel(dc);
+                }
+            }
+        }
+    }
 
     /* Apply film grain synthesis (last step) */
     if (ctx->header.grain.enabled) {
-        snt_grain_apply(&ctx->header.grain, output_y, NULL, NULL,
-                        width, height, stride, 0);
+        snt_grain_apply(&ctx->header.grain, output_y, output_u, output_v,
+                        width, height, stride_y, stride_uv);
     }
 
     free(split_flags);

@@ -68,8 +68,8 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
              * Split 63 AC coefficients into 4 bands of ~15-16 dims each.
              * This avoids combinatorial overflow and gives much better
              * shape resolution (K=40-60 per band vs K=14 monolithic). */
-            #define NUM_BANDS 4
-            static const int band_bounds[NUM_BANDS + 1] = {0, 15, 31, 47, 63};
+            #define NUM_BANDS 9
+            static const int band_bounds[NUM_BANDS + 1] = {0, 7, 14, 21, 28, 35, 42, 49, 56, 63};
             int16_t recon_ac[63];
             memset(recon_ac, 0, sizeof(recon_ac));
 

@@ -52,8 +52,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             recon_coeffs[0] = pvq_dequantize_dc(dc_level, step);
 
             /* AC via band-partitioned PVQ (4 bands of ~15 dims) */
-            #define NUM_BANDS 4
-            static const int band_bounds[NUM_BANDS + 1] = {0, 15, 31, 47, 63};
+            #define NUM_BANDS 9
+            static const int band_bounds[NUM_BANDS + 1] = {0, 7, 14, 21, 28, 35, 42, 49, 56, 63};
 
             for (int b = 0; b < NUM_BANDS; b++) {
                 int start = band_bounds[b];

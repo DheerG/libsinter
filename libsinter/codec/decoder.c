@@ -12,6 +12,7 @@
 #include "../core/quantize/qp_table.h"
 #include "../core/bitstream/bitstream.h"
 #include "../core/grain/grain_synth.h"
+#include "../perceptual/csf_weights.h"
 
 #define BLK 8
 
@@ -81,10 +82,20 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 uint8_t quant_mode = (uint8_t)snt_br_get_bits(&br, 1);
 
                 if (quant_mode == 1) {
-                    /* Scalar mode: each coefficient independently */
+                    /* Scalar mode with CSF-weighted step (must match encoder) */
+                    float csf_sum = 0;
+                    for (int i = 0; i < n; i++)
+                        csf_sum += psy_csf_weight(8, 1 + start + i);
+                    uint8_t band_csf_d = (uint8_t)(csf_sum / n * 255.0f);
+                    if (band_csf_d < 1) band_csf_d = 1;
+                    uint16_t eff_step = step;
+                    if (band_csf_d < 128) {
+                        eff_step = (uint16_t)((uint32_t)step * 256 / band_csf_d);
+                        if (eff_step > 3072) eff_step = 3072;
+                    }
                     for (int i = 0; i < n; i++) {
                         int16_t level = (int16_t)(uint16_t)snt_br_get_bits(&br, 16);
-                        recon_coeffs[1 + start + i] = pvq_dequantize_dc(level, step);
+                        recon_coeffs[1 + start + i] = pvq_dequantize_dc(level, eff_step);
                     }
                 } else {
                     /* PVQ mode */

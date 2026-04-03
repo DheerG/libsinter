@@ -147,12 +147,19 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                 int16_t band_recon[16];
 
                 if (use_scalar) {
-                    /* Scalar mode: quantize each coefficient independently */
+                    /* Scalar mode with CSF-weighted step: wider step for HF bands
+                     * zeros out perceptually invisible coefficients, reducing noise.
+                     * This is Sinter's equivalent of H.264's quantization matrix. */
+                    uint16_t eff_step = step;
+                    if (band_csf < 128) {
+                        eff_step = (uint16_t)((uint32_t)step * 256 / band_csf);
+                        if (eff_step > 3072) eff_step = 3072;
+                    }
                     snt_bw_put_bits(&bw, 1, 1); /* mode=1: scalar */
                     for (int i = 0; i < n; i++) {
-                        int16_t level = pvq_quantize_dc(band_coeffs[i], step, 1);
+                        int16_t level = pvq_quantize_dc(band_coeffs[i], eff_step, 1);
                         snt_bw_put_bits(&bw, (uint32_t)(uint16_t)level, 16);
-                        band_recon[i] = pvq_dequantize_dc(level, step);
+                        band_recon[i] = pvq_dequantize_dc(level, eff_step);
                     }
                 } else {
                     /* PVQ mode */

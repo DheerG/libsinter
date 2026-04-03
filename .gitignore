@@ -1,0 +1,32 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test artifacts
+test_output/
+*.yuv
+*.y4m
+*.snt
+
+# Debug
+core
+*.dSYM/
+
+# Cargo (Rust encoder, future)
+target/
+Cargo.lock
+
+# OS
+Thumbs.db

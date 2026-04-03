@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sinter Video Player (WebCodecs + WASM)</title>
+    <style>
+        body { font-family: monospace; background: #1a1a1a; color: #eee; padding: 20px; }
+        canvas { border: 1px solid #444; display: block; margin: 20px 0; }
+        #status { color: #0f0; }
+        button { font-size: 16px; padding: 8px 16px; margin: 4px; }
+        input[type=file] { margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <h1>Sinter Codec — WASM Decoder Demo</h1>
+    <p>Load a .sntr file to decode and play using the WebAssembly decoder.</p>
+
+    <input type="file" id="fileInput" accept=".sntr,.snt">
+    <button onclick="playFile()">Decode & Play</button>
+    <button onclick="stopPlayback()">Stop</button>
+
+    <canvas id="canvas" width="640" height="480"></canvas>
+    <div id="status">Ready</div>
+    <div id="stats"></div>
+
+    <script>
+    // This player uses the WASM-compiled libsinter decoder.
+    // Load sinter_decoder.js (built by wasm/build.sh) which provides
+    // the Module object with ccall/cwrap for calling C functions.
+
+    let Module = null;
+    let decoder = null;
+    let playing = false;
+
+    // Load WASM module
+    const script = document.createElement('script');
+    script.src = 'sinter_decoder.js';
+    script.onload = () => {
+        document.getElementById('status').textContent = 'WASM module loaded';
+    };
+    document.head.appendChild(script);
+
+    async function playFile() {
+        const file = document.getElementById('fileInput').files[0];
+        if (!file) { alert('Select a .sntr file first'); return; }
+
+        const buffer = await file.arrayBuffer();
+        const data = new Uint8Array(buffer);
+        const status = document.getElementById('status');
+        const stats = document.getElementById('stats');
+        const canvas = document.getElementById('canvas');
+        const ctx2d = canvas.getContext('2d');
+
+        status.textContent = 'Decoding...';
+
+        // Parse .sntr container header (IVF-style)
+        const magic = String.fromCharCode(data[0], data[1], data[2], data[3]);
+        if (magic !== 'SNTR') { status.textContent = 'Not a .sntr file'; return; }
+
+        const version = data[4] | (data[5] << 8) | (data[6] << 16) | (data[7] << 24);
+        const width = data[8] | (data[9] << 8) | (data[10] << 16) | (data[11] << 24);
+        const height = data[12] | (data[13] << 8) | (data[14] << 16) | (data[15] << 24);
+        const numFrames = data[16] | (data[17] << 8) | (data[18] << 16) | (data[19] << 24);
+
+        canvas.width = width;
+        canvas.height = height;
+
+        status.textContent = `SNTR v${version}: ${width}x${height}, ${numFrames} frames`;
+
+        // Create WASM decoder
+        if (!Module || !Module.ccall) {
+            status.textContent = 'WASM not ready — build with: bash wasm/build.sh';
+            return;
+        }
+
+        const snt_decoder_create = Module.cwrap('snt_decoder_create', 'number', []);
+        const snt_decoder_decode = Module.cwrap('snt_decoder_decode', 'number',
+            ['number', 'number', 'number', 'number']);
+        const snt_decoder_destroy = Module.cwrap('snt_decoder_destroy', null, ['number']);
+
+        decoder = snt_decoder_create();
+        if (!decoder) { status.textContent = 'Failed to create decoder'; return; }
+
+        // Decode frames
+        let offset = 20; // skip file header
+        let frameCount = 0;
+        playing = true;
+
+        for (let f = 0; f < numFrames && playing; f++) {
+            if (offset + 4 > data.length) break;
+
+            // Read frame size (4 bytes LE)
+            const frameSize = data[offset] | (data[offset+1] << 8) |
+                              (data[offset+2] << 16) | (data[offset+3] << 24);
+            offset += 4;
+
+            if (offset + frameSize > data.length) break;
+
+            // Copy frame data to WASM memory
+            const framePtr = Module._malloc(frameSize);
+            Module.HEAPU8.set(data.slice(offset, offset + frameSize), framePtr);
+            offset += frameSize;
+
+            // Allocate SntDecodedFrame struct on WASM heap (simplified)
+            // In practice, you'd define the struct layout properly
+            const frameStruct = Module._malloc(64); // enough for the struct
+
+            const ret = snt_decoder_decode(decoder, framePtr, frameSize, frameStruct);
+            Module._free(framePtr);
+
+            if (ret === 0) {
+                // Read decoded Y plane from WASM memory and render to canvas
+                // (simplified — full impl would read y/u/v pointers from struct)
+                frameCount++;
+                stats.textContent = `Frame ${frameCount}/${numFrames}`;
+            }
+
+            Module._free(frameStruct);
+
+            // Yield to browser for rendering
+            await new Promise(r => setTimeout(r, 33)); // ~30fps
+        }
+
+        snt_decoder_destroy(decoder);
+        decoder = null;
+        status.textContent = `Done: decoded ${frameCount} frames`;
+    }
+
+    function stopPlayback() {
+        playing = false;
+    }
+    </script>
+</body>
+</html>

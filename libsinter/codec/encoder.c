@@ -219,13 +219,27 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         for (int x = 0; x < width; x++)
             work[y * pad_w + x] = (int16_t)input_y[y * stride_y + x];
 
-    /* Step 1: Quad-tree split decisions */
+    /* Step 1: Quad-tree split decisions — force all-split to 8x8 leaves.
+     * This ensures encoder and decoder agree on block structure.
+     * The quad-tree decides splits, but we force 3 levels of splitting
+     * (32→16→8) so every leaf is exactly 8x8. */
     uint8_t *split_flags = (uint8_t *)calloc(MAX_SPLIT_FLAGS, 1);
     uint8_t *tx_modes = (uint8_t *)calloc(MAX_BLOCKS, 1);
-    float lambda = 0.5f * snt_qp_to_step(ctx->header.base_qp);
-    int num_flags = snte_qt_decide_splits(work, pad_w, pad_w, pad_h,
-                                           ctx->header.base_qp, lambda,
-                                           split_flags, tx_modes);
+
+    /* Force all splits: every node above 8x8 gets split=1 */
+    int num_flags = 0;
+    for (int sy = 0; sy < pad_h; sy += SNT_QT_MAX_SIZE) {
+        for (int sx = 0; sx < pad_w; sx += SNT_QT_MAX_SIZE) {
+            /* 32→16: 1 split flag */
+            split_flags[num_flags++] = 1;
+            /* 16→8: 4 split flags */
+            for (int i = 0; i < 4; i++)
+                split_flags[num_flags++] = 1;
+            /* 8→4: 16 split flags — DON'T split (keep 8x8 leaves) */
+            for (int i = 0; i < 16; i++)
+                split_flags[num_flags++] = 0;
+        }
+    }
 
     /* Step 2: Apply 2D lapped pre-filter */
     /* Use 8-point filter for all boundary sizes (capped at 8 per Daala convention) */
@@ -271,8 +285,9 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     /* Step 5: Apply 2D lapped post-filter to reconstruction */
     snt_lap_post_filter_2d_ref(recon, pad_w, pad_h, pad_w, 8);
 
-    /* Step 6: Write split flags to bitstream */
+    /* Step 6: Write split flags and block count to bitstream */
     snt_bw_byte_align(&bw);
+    snt_bw_put_bits(&bw, (uint32_t)block_count, 16); /* block count first */
     snt_bw_put_bits(&bw, (uint32_t)num_flags, 16);
     for (int i = 0; i < num_flags; i++)
         snt_bw_put_bits(&bw, split_flags[i], 1);

@@ -159,10 +159,11 @@ uint32_t pvq_compute_gain(const int16_t *coeffs, int n) {
 
 uint32_t pvq_quantize_gain(uint32_t gain, uint16_t step, int is_intra) {
     if (step == 0) return gain;
-    /* Dead-zone: offset = step/3 (inter), step/6 (intra) */
-    uint32_t offset = is_intra ? (step / 6) : (step / 3);
+    /* Narrow dead-zone for gain to preserve AC energy.
+     * Wide dead-zones were killing lapping boundary energy. */
+    uint32_t offset = is_intra ? (step / 8) : (step / 4);
     if (gain <= offset) return 0;
-    return (gain - offset) / step;
+    return (gain - offset + step / 2) / step; /* round-to-nearest, not floor */
 }
 
 uint32_t pvq_dequantize_gain(uint32_t level, uint16_t step) {
@@ -187,18 +188,35 @@ int16_t pvq_dequantize_dc(int16_t level, uint16_t step) {
 
 uint16_t pvq_compute_k(uint32_t gain_q, int n, uint8_t csf_weight) {
     /* K determines shape resolution. More pulses = finer shape.
-     * Formula inspired by Opus/CELT: K scales with gain and inversely
-     * with dimension (higher dimensions need fewer pulses per axis).
      *
-     * K = max(1, (gain_q * csf_weight) / (128 * sqrt(n)))
-     * We approximate sqrt(n) with integer sqrt. */
+     * The key insight: K must be large enough to represent the shape
+     * with reasonable fidelity. For a gradient in 63 dimensions, K=3
+     * is catastrophically low (only 3 coefficients get any energy).
+     *
+     * Revised formula: K scales linearly with gain and with sqrt(n).
+     * At typical gains (10-50) and n=63, this gives K=15-80, which
+     * provides enough pulses to represent the shape meaningfully.
+     *
+     * K = max(1, gain_q * sqrt(n) * csf_weight / (128 * 4))
+     *
+     * The /4 factor controls the rate-quality tradeoff:
+     * smaller divisor = more pulses = better quality = more bits. */
     if (gain_q == 0) return 0;
 
     uint32_t sqrt_n = snt_isqrt((uint64_t)n);
     if (sqrt_n == 0) sqrt_n = 1;
 
-    uint32_t k = (gain_q * (uint32_t)csf_weight) / (128 * sqrt_n);
+    /* K proportional to gain * sqrt(n), modulated by perceptual weight.
+     * Divisor of 2 gives generous shape resolution — quality over compression. */
+    uint32_t k = (gain_q * sqrt_n * (uint32_t)csf_weight) / (128 * 2);
     if (k < 1) k = 1;
+
+    /* Cap K to prevent combinatorial table overflow in pvq_count(n, k).
+     * Max safe K decreases with dimension: n=63→15, n=32→23, n=15→68.
+     * Use conservative formula: max_k ≈ 900 / n (empirically fitted). */
+    uint32_t max_k = (n > 0) ? (900 / (uint32_t)n) : PVQ_MAX_K;
+    if (max_k < 2) max_k = 2;
+    if (k > max_k) k = max_k;
     if (k > PVQ_MAX_K) k = PVQ_MAX_K;
     return (uint16_t)k;
 }

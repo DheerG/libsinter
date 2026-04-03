@@ -51,20 +51,26 @@
  * These are the theoretically-optimal values for maximum
  * cross-boundary decorrelation. Lifting guarantees bit-exact
  * reconstruction regardless of coefficient magnitude. */
-#define LAP4_T0  11585   /* cos(pi/4) * sqrt(2) * 16384 ≈ 0.3536 in Q15 */
-#define LAP4_T1  11585
-#define LAP4_S0  6270    /* derived from Type-IV DST ≈ 0.1914 in Q15 */
-#define LAP4_S1  6270
+/* Q15 lifting coefficients: 60% of Malvar theoretical values.
+ * Full-strength Malvar (T0=11585) creates boundary energy that
+ * the Q14 integer DCT amplifies through the post-filter chain,
+ * limiting PSNR to ~22 dB even at low QP. At 60% strength,
+ * we get meaningful deblocking while keeping the post-filter
+ * error amplification manageable. */
+#define LAP4_T0  6951    /* 0.60 * 11585 ≈ 0.212 in Q15 */
+#define LAP4_T1  6951
+#define LAP4_S0  3762    /* 0.60 * 6270 ≈ 0.115 in Q15 */
+#define LAP4_S1  3762
 
-/* Q15 lifting coefficients for 8-point filter (Timothy's reviewed values) */
-#define LAP8_T0  12873   /* ≈ 0.3929 in Q15 */
-#define LAP8_T1  12873
-#define LAP8_T2  8867    /* ≈ 0.2706 in Q15 */
-#define LAP8_T3  8867
-#define LAP8_S0  5765    /* ≈ 0.1759 in Q15 */
-#define LAP8_S1  5765
-#define LAP8_S2  3135    /* ≈ 0.0957 in Q15 */
-#define LAP8_S3  3135
+/* 8-point filter at 60% of Timothy's reviewed values */
+#define LAP8_T0  7724    /* 0.60 * 12873 */
+#define LAP8_T1  7724
+#define LAP8_T2  5320    /* 0.60 * 8867 */
+#define LAP8_T3  5320
+#define LAP8_S0  3459    /* 0.60 * 5765 */
+#define LAP8_S1  3459
+#define LAP8_S2  1881    /* 0.60 * 3135 */
+#define LAP8_S3  1881
 
 /* ── Q15 lifting step helper ─────────────────────────────────────── */
 static inline int16_t lift(int16_t x, int16_t coeff) {

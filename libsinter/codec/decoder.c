@@ -101,8 +101,9 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     int pad_w = ((width + SNT_QT_MAX_SIZE - 1) / SNT_QT_MAX_SIZE) * SNT_QT_MAX_SIZE;
     int pad_h = ((height + SNT_QT_MAX_SIZE - 1) / SNT_QT_MAX_SIZE) * SNT_QT_MAX_SIZE;
 
-    /* Read split flags */
+    /* Read block count and split flags */
     snt_br_byte_align(&br);
+    uint32_t total_blocks = snt_br_get_bits(&br, 16);
     uint32_t num_flags = snt_br_get_bits(&br, 16);
     uint8_t *split_flags = (uint8_t *)calloc(num_flags + 1, 1);
     for (uint32_t i = 0; i < num_flags; i++)
@@ -162,10 +163,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     DecBlockData *blocks = (DecBlockData *)calloc(MAX_BLOCKS, sizeof(DecBlockData));
     int actual_blocks = 0;
 
-    /* We don't know exact block count from split flags alone without full traversal.
-     * Decode symbols until rANS runs out or we hit a limit. */
-    for (int i = 0; i < MAX_BLOCKS; i++) {
-        /* Try to decode — if rANS state is exhausted, stop */
+    /* Decode exactly total_blocks blocks (count read from bitstream) */
+    for (uint32_t i = 0; i < total_blocks && i < MAX_BLOCKS; i++) {
         uint16_t qpd_sym = rans_dec_symbol(&rans_dec, &cdf_qp_delta);
         blocks[i].qp_delta = (int8_t)((int)qpd_sym - 6);
 
@@ -211,10 +210,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             }
         }
 
-        actual_blocks = i + 1;
-
-        /* Stop if we've read all the bitstream */
-        if (snt_br_eof(&br)) break;
+        /* (block count bounded by total_blocks from bitstream) */
     }
 
     free(rans_bytes);

@@ -17,6 +17,7 @@
 #include "../core/prediction/intra.h"
 #include "../core/grain/grain_synth.h"
 #include "../core/quantize/qp_table.h"
+#include "../core/entropy/rans.h"
 
 int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                        uint32_t bs_len, uint8_t *output_y,
@@ -41,28 +42,65 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
 
     uint16_t step = snt_qp_to_step(ctx->header.base_qp);
 
-    /* Read block data */
+    /* Read block data: rANS-coded symbols + raw supplementary data */
     snt_br_byte_align(&br);
 
     int16_t *dc_levels = (int16_t *)calloc(total_blocks, sizeof(int16_t));
     SntPVQCode *pvq_codes = (SntPVQCode *)calloc(total_blocks, sizeof(SntPVQCode));
+    int8_t *qp_deltas = (int8_t *)calloc(total_blocks, sizeof(int8_t));
     int16_t *recon = (int16_t *)calloc((size_t)pad_w * pad_h, sizeof(int16_t));
     int16_t *coeff_buf = (int16_t *)calloc((size_t)total_blocks * BLK * BLK, sizeof(int16_t));
-    if (!dc_levels || !pvq_codes || !recon || !coeff_buf) {
-        free(dc_levels); free(pvq_codes); free(recon); free(coeff_buf);
+    if (!dc_levels || !pvq_codes || !recon || !coeff_buf || !qp_deltas) {
+        free(dc_levels); free(pvq_codes); free(recon);
+        free(coeff_buf); free(qp_deltas);
         return -1;
     }
 
-    /* Read DC levels */
+    /* Read rANS payload */
+    uint32_t rans_len = snt_br_get_bits(&br, 16);
+    uint8_t *rans_bytes = (uint8_t *)calloc(rans_len * 2, 1);
+    for (uint32_t i = 0; i < rans_len; i++) {
+        uint8_t lo_byte = (uint8_t)snt_br_get_bits(&br, 8);
+        uint8_t hi_byte = (uint8_t)snt_br_get_bits(&br, 8);
+        rans_bytes[i * 2]     = lo_byte;
+        rans_bytes[i * 2 + 1] = hi_byte;
+    }
+
+    /* Initialize rANS decoder */
+    RansDecoder rans_dec;
+    rans_dec_init(&rans_dec, rans_bytes, rans_len * 2, ctx->header.dual_rans);
+
+    /* Initialize CDFs (must match encoder's initial state) */
+    RansCDF cdf_skip, cdf_gain;
+    rans_cdf_init_uniform(&cdf_skip, 2, RANS_ADAPT_RATE_MODE);
+    rans_cdf_init_uniform(&cdf_gain, 256, RANS_ADAPT_RATE_COEFF);
+
+    /* Decode rANS symbols (forward order, matching encoder's CDF state) */
+    for (int i = 0; i < total_blocks; i++) {
+        /* Skip flag */
+        uint16_t skip_sym = rans_dec_symbol(&rans_dec, &cdf_skip);
+        pvq_codes[i].skip = (uint8_t)skip_sym;
+
+        /* PVQ gain low byte */
+        if (!pvq_codes[i].skip) {
+            uint16_t gain_lo = rans_dec_symbol(&rans_dec, &cdf_gain);
+            pvq_codes[i].gain = gain_lo; /* high byte added below from raw data */
+        }
+    }
+
+    free(rans_bytes);
+
+    /* Read raw supplementary data: QP deltas, DC levels, gain high byte, K, shape */
+    for (int i = 0; i < total_blocks; i++) {
+        qp_deltas[i] = (int8_t)((int)snt_br_get_bits(&br, 4) - 8);
+    }
     for (int i = 0; i < total_blocks; i++) {
         dc_levels[i] = (int16_t)(uint16_t)snt_br_get_bits(&br, 16);
     }
-
-    /* Read PVQ codes */
     for (int i = 0; i < total_blocks; i++) {
-        pvq_codes[i].skip = (uint8_t)snt_br_get_bits(&br, 1);
         if (!pvq_codes[i].skip) {
-            pvq_codes[i].gain = snt_br_get_bits(&br, 16);
+            uint32_t gain_hi = snt_br_get_bits(&br, 8);
+            pvq_codes[i].gain |= (gain_hi << 8);
             pvq_codes[i].k = (uint16_t)snt_br_get_bits(&br, 16);
             uint64_t hi = snt_br_get_bits(&br, 32);
             uint64_t lo = snt_br_get_bits(&br, 32);
@@ -83,13 +121,19 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             const int16_t *above_c = (by > 0) ? &coeff_buf[above_bidx * BLK * BLK] : NULL;
             snt_intra_predict_freq_ref(left_c, above_c, BLK, pred);
 
+            /* Apply per-block QP delta for dequantization */
+            int eff_qp = ctx->header.base_qp + qp_deltas[bidx];
+            if (eff_qp < 0) eff_qp = 0;
+            if (eff_qp > 63) eff_qp = 63;
+            uint16_t blk_step = snt_qp_to_step((uint8_t)eff_qp);
+
             /* Dequantize DC */
             int16_t *recon_coeffs = &coeff_buf[bidx * BLK * BLK];
-            recon_coeffs[0] = pvq_dequantize_dc(dc_levels[bidx], step) + pred[0];
+            recon_coeffs[0] = pvq_dequantize_dc(dc_levels[bidx], blk_step) + pred[0];
 
             /* Dequantize AC with PVQ */
             int16_t recon_ac[63];
-            pvq_decode(&pvq_codes[bidx], 63, step, recon_ac);
+            pvq_decode(&pvq_codes[bidx], 63, blk_step, recon_ac);
             for (int i = 0; i < 63; i++)
                 recon_coeffs[i + 1] = recon_ac[i] + pred[i + 1];
 
@@ -117,6 +161,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
 
     free(dc_levels);
     free(pvq_codes);
+    free(qp_deltas);
     free(recon);
     free(coeff_buf);
 

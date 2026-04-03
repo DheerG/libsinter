@@ -107,18 +107,18 @@ static int test_gain_deadzone(void) {
         return 0;
     }
 
-    /* Gain=30, step=30: level = (30 - 10) / 30 = 0 (still in effective dead-zone).
-     * Need gain >= offset + step = 40 for level=1. */
+    /* With narrowed dead-zone (offset=step/4=7 for inter) and round-to-nearest:
+     * gain=30, offset=7: (30-7+15)/30 = 38/30 = 1. So gain=30 is NOT in dead-zone. */
     uint32_t q_inter = pvq_quantize_gain(30, step, 0);
-    if (q_inter != 0) {
-        printf("  FAIL: gain=30 should be in effective dead-zone (offset+step=40)\n");
+    if (q_inter == 0) {
+        printf("  FAIL: gain=30 should not be in dead-zone with narrow offset\n");
         return 0;
     }
 
-    /* Value outside dead-zone: gain=50, offset=10, level = (50-10)/30 = 1 */
-    uint32_t q_outside = pvq_quantize_gain(50, step, 0);
-    if (q_outside != 1) {
-        printf("  FAIL: gain=50 should quantize to 1, got %u\n", q_outside);
+    /* Small gain within dead-zone: gain=5, offset=7, 5<=7 → level=0 */
+    uint32_t q_small = pvq_quantize_gain(5, step, 0);
+    if (q_small != 0) {
+        printf("  FAIL: gain=5 should be in dead-zone, got %u\n", q_small);
         return 0;
     }
 

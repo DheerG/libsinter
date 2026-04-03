@@ -20,8 +20,8 @@ test_output/
 *.y4m
 *.snt
 
-# Debug
-core
+# Debug (core dumps, not libsinter/core/)
+/core
 *.dSYM/
 
 # Cargo (Rust encoder, future)

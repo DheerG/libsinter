@@ -41,15 +41,30 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     (void)total_blocks; /* we know it's blk_cols * blk_rows */
 
     int16_t *recon = (int16_t *)calloc((size_t)pad_w * pad_h, sizeof(int16_t));
+    int16_t *dc_recon_above = (int16_t *)calloc(blk_cols, sizeof(int16_t));
+    int16_t dc_recon_left = 0;
 
     /* Decode each block */
     for (int by = 0; by < blk_rows; by++) {
+        dc_recon_left = 0;
         for (int bx = 0; bx < blk_cols; bx++) {
             int16_t recon_coeffs[64];
 
-            /* DC */
+            /* DC prediction (mirrors encoder exactly) */
+            int16_t dc_pred = 0;
+            if (bx > 0 && by > 0)
+                dc_pred = (dc_recon_left + dc_recon_above[bx] + 1) >> 1;
+            else if (bx > 0)
+                dc_pred = dc_recon_left;
+            else if (by > 0)
+                dc_pred = dc_recon_above[bx];
+
+            /* DC: read residual, add prediction */
             int16_t dc_level = (int16_t)(uint16_t)snt_br_get_bits(&br, 16);
-            recon_coeffs[0] = pvq_dequantize_dc(dc_level, step);
+            int16_t dc_recon = pvq_dequantize_dc(dc_level, step) + dc_pred;
+            recon_coeffs[0] = dc_recon;
+            dc_recon_left = dc_recon;
+            dc_recon_above[bx] = dc_recon;
 
             /* AC via band-partitioned PVQ (4 bands of ~15 dims) */
             #define NUM_BANDS 9
@@ -65,7 +80,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     code.skip = 0;
                     code.gain = snt_br_get_bits(&br, 16);
                     code.k = (uint16_t)snt_br_get_bits(&br, 16);
-                    int shape_bits = (int)snt_br_get_bits(&br, 8);
+                    int shape_bits = pvq_shape_bits(n, code.k); /* computed, not signaled */
                     if (shape_bits > 64) shape_bits = 64;
                     if (shape_bits > 32) {
                         uint64_t hi = snt_br_get_bits(&br, shape_bits - 32);
@@ -134,5 +149,6 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     }
 
     free(recon);
+    free(dc_recon_above);
     return 0;
 }

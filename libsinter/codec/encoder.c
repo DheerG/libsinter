@@ -54,15 +54,36 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     snt_bw_byte_align(&bw);
     snt_bw_put_bits(&bw, (uint32_t)total_blocks, 16);
 
-    /* Encode each block: DCT → PVQ → raw bits to bitstream */
+    /* DC prediction buffer: stores reconstructed DC per column for above prediction */
+    int16_t *dc_recon_above = (int16_t *)calloc(blk_cols, sizeof(int16_t));
+    int16_t dc_recon_left = 0;
+
+    /* Encode each block: DCT → DC predict → PVQ → raw bits to bitstream */
     for (int by = 0; by < blk_rows; by++) {
+        dc_recon_left = 0;
         for (int bx = 0; bx < blk_cols; bx++) {
             int16_t coeffs[64];
             snt_dct_fwd_2d_ref(&work[by * BLK * pad_w + bx * BLK], pad_w, BLK, coeffs);
 
-            /* Quantize DC */
-            int16_t dc_level = pvq_quantize_dc(coeffs[0], step, 1);
+            /* DC prediction from reconstructed neighbors (coefficient domain).
+             * Average of left and above if both available. */
+            int16_t dc_pred = 0;
+            if (bx > 0 && by > 0)
+                dc_pred = (dc_recon_left + dc_recon_above[bx] + 1) >> 1;
+            else if (bx > 0)
+                dc_pred = dc_recon_left;
+            else if (by > 0)
+                dc_pred = dc_recon_above[bx];
+
+            /* Quantize DC residual (not absolute DC) */
+            int16_t dc_residual = coeffs[0] - dc_pred;
+            int16_t dc_level = pvq_quantize_dc(dc_residual, step, 1);
             snt_bw_put_bits(&bw, (uint32_t)(uint16_t)dc_level, 16);
+
+            /* Reconstruct DC for prediction of future blocks */
+            int16_t dc_recon = pvq_dequantize_dc(dc_level, step) + dc_pred;
+            dc_recon_left = dc_recon;
+            dc_recon_above[bx] = dc_recon;
 
             /* Quantize AC via band-partitioned PVQ.
              * Split 63 AC coefficients into 4 bands of ~15-16 dims each.
@@ -87,7 +108,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     int shape_bits = pvq_shape_bits(n, code.k);
                     if (shape_bits < 1) shape_bits = 1;
                     if (shape_bits > 64) shape_bits = 64;
-                    snt_bw_put_bits(&bw, (uint32_t)shape_bits, 8);
+                    /* shape_bits NOT signaled — decoder computes pvq_shape_bits(n,k) */
                     if (shape_bits > 32) {
                         snt_bw_put_bits(&bw, (uint32_t)(code.shape_idx >> 32), shape_bits - 32);
                         snt_bw_put_bits(&bw, (uint32_t)(code.shape_idx & 0xFFFFFFFF), 32);
@@ -101,7 +122,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
 
             /* Reconstruct for reference */
             int16_t recon_coeffs[64];
-            recon_coeffs[0] = pvq_dequantize_dc(dc_level, step);
+            recon_coeffs[0] = dc_recon; /* use predicted+dequantized DC */
             for (int i = 0; i < 63; i++)
                 recon_coeffs[i + 1] = recon_ac[i];
 
@@ -146,5 +167,6 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
 
     free(work);
     free(recon);
+    free(dc_recon_above);
     return 0;
 }

@@ -122,10 +122,11 @@ static int test_gain_deadzone(void) {
         return 0;
     }
 
-    /* Dequantization is exact */
+    /* Dequantization uses midpoint reconstruction: level*step + step/2 */
     uint32_t dq = pvq_dequantize_gain(3, step);
-    if (dq != 90) {
-        printf("  FAIL: dequant(3, step=30) = %u, expected 90\n", dq);
+    uint32_t expected = 3 * 30 + 15; /* 105 = midpoint of bin [90, 120) */
+    if (dq != expected) {
+        printf("  FAIL: dequant(3, step=30) = %u, expected %u\n", dq, expected);
         return 0;
     }
 

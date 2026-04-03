@@ -43,6 +43,10 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     int16_t *recon = (int16_t *)calloc((size_t)pad_w * pad_h, sizeof(int16_t));
     int16_t *dc_recon_above = (int16_t *)calloc(blk_cols, sizeof(int16_t));
     int16_t dc_recon_left = 0;
+    #define NUM_PRED_AC 4
+    static const int pred_ac_idx[NUM_PRED_AC] = {1, 8, 2, 9};
+    int16_t *ac_recon_above = (int16_t *)calloc((size_t)blk_cols * NUM_PRED_AC, sizeof(int16_t));
+    int16_t ac_recon_left[NUM_PRED_AC] = {0};
 
     /* Decode each block */
     for (int by = 0; by < blk_rows; by++) {
@@ -100,9 +104,23 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 }
             }
 
+            /* Add back AC prediction (mirrors encoder) */
+            for (int p = 0; p < NUM_PRED_AC; p++) {
+                int idx = pred_ac_idx[p];
+                int16_t pred_val = 0;
+                if (idx < 8 && bx > 0)
+                    pred_val = ac_recon_left[p];
+                else if (idx >= 8 && by > 0)
+                    pred_val = ac_recon_above[bx * NUM_PRED_AC + p];
+                recon_coeffs[idx] += pred_val;
+                ac_recon_left[p] = recon_coeffs[idx];
+                ac_recon_above[bx * NUM_PRED_AC + p] = recon_coeffs[idx];
+            }
+
             snt_dct_inv_2d_ref(recon_coeffs, BLK,
                                &recon[by * BLK * pad_w + bx * BLK], pad_w);
         }
+        memset(ac_recon_left, 0, sizeof(ac_recon_left));
     }
 
     /* Post-filter */
@@ -150,5 +168,6 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
 
     free(recon);
     free(dc_recon_above);
+    free(ac_recon_above);
     return 0;
 }

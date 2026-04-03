@@ -55,9 +55,16 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     snt_bw_byte_align(&bw);
     snt_bw_put_bits(&bw, (uint32_t)total_blocks, 16);
 
-    /* DC prediction buffer: stores reconstructed DC per column for above prediction */
+    /* DC + low-AC prediction buffers */
     int16_t *dc_recon_above = (int16_t *)calloc(blk_cols, sizeof(int16_t));
     int16_t dc_recon_left = 0;
+    /* Predict lowest 4 AC coefficients from neighbors:
+     * AC[1] (horiz freq-1) from left, AC[8] (vert freq-1) from above,
+     * AC[2] (horiz freq-2) from left, AC[9] (diag) from above-left avg */
+    #define NUM_PRED_AC 4
+    static const int pred_ac_idx[NUM_PRED_AC] = {1, 8, 2, 9};
+    int16_t *ac_recon_above = (int16_t *)calloc((size_t)blk_cols * NUM_PRED_AC, sizeof(int16_t));
+    int16_t ac_recon_left[NUM_PRED_AC] = {0};
 
     /* Encode each block: DCT → DC predict → PVQ → raw bits to bitstream */
     for (int by = 0; by < blk_rows; by++) {
@@ -86,10 +93,25 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
             dc_recon_left = dc_recon;
             dc_recon_above[bx] = dc_recon;
 
-            /* Quantize AC via band-partitioned PVQ.
-             * Split 63 AC coefficients into 4 bands of ~15-16 dims each.
-             * This avoids combinatorial overflow and gives much better
-             * shape resolution (K=40-60 per band vs K=14 monolithic). */
+            /* Low-AC prediction: predict lowest AC coefficients from neighbors.
+             * AC[1] predicted from left (horizontal continuity),
+             * AC[8] predicted from above (vertical continuity),
+             * AC[2] from left, AC[9] from above. */
+            int16_t ac_pred[64]; /* prediction for each coefficient */
+            memset(ac_pred, 0, sizeof(ac_pred));
+            for (int p = 0; p < NUM_PRED_AC; p++) {
+                int idx = pred_ac_idx[p];
+                int16_t pred_val = 0;
+                /* AC[1], AC[2] predict from left; AC[8], AC[9] predict from above */
+                if (idx < 8 && bx > 0) {
+                    pred_val = ac_recon_left[p]; /* horizontal prediction */
+                } else if (idx >= 8 && by > 0) {
+                    pred_val = ac_recon_above[bx * NUM_PRED_AC + p]; /* vertical prediction */
+                }
+                ac_pred[idx] = pred_val;
+                coeffs[idx] -= pred_val; /* subtract prediction from coefficient */
+            }
+
             #define NUM_BANDS 16
             static const int band_bounds[NUM_BANDS + 1] = {0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,59,63};
             int16_t recon_ac[63];
@@ -133,13 +155,28 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
 
             /* Reconstruct for reference */
             int16_t recon_coeffs[64];
-            recon_coeffs[0] = dc_recon; /* use predicted+dequantized DC */
+            recon_coeffs[0] = dc_recon;
             for (int i = 0; i < 63; i++)
                 recon_coeffs[i + 1] = recon_ac[i];
+
+            /* Add back AC prediction to get full reconstructed coefficients */
+            for (int p = 0; p < NUM_PRED_AC; p++) {
+                int idx = pred_ac_idx[p];
+                recon_coeffs[idx] += ac_pred[idx];
+            }
+
+            /* Store reconstructed AC for future prediction */
+            for (int p = 0; p < NUM_PRED_AC; p++) {
+                int idx = pred_ac_idx[p];
+                ac_recon_left[p] = recon_coeffs[idx];
+                ac_recon_above[bx * NUM_PRED_AC + p] = recon_coeffs[idx];
+            }
 
             snt_dct_inv_2d_ref(recon_coeffs, BLK,
                                &recon[by * BLK * pad_w + bx * BLK], pad_w);
         }
+        /* Reset left AC prediction at row start */
+        memset(ac_recon_left, 0, sizeof(ac_recon_left));
     }
 
     /* Post-filter */
@@ -179,5 +216,6 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     free(work);
     free(recon);
     free(dc_recon_above);
+    free(ac_recon_above);
     return 0;
 }

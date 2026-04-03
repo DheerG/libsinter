@@ -421,6 +421,21 @@ void pvq_encode(const int16_t *coeffs, int n, uint16_t step,
         return;
     }
 
+    /* Perceptual skip threshold (Jim Bankoski's fix):
+     * If the total AC energy is barely above the dead-zone, PVQ's shape
+     * quantization will inject more noise than it preserves signal.
+     * On smooth content (gradients, sky, walls), this skip produces
+     * clean, noise-free reconstruction instead of grainy texture.
+     * Threshold: gain must exceed 2*step to justify shape coding. */
+    if (code->gain <= 2) {
+        code->skip = 1;
+        code->gain = 0;
+        code->k = 0;
+        code->shape_idx = 0;
+        memset(recon, 0, n * sizeof(int16_t));
+        return;
+    }
+
     code->skip = 0;
 
     /* Step 2: Compute K and encode shape */

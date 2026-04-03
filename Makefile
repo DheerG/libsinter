@@ -16,11 +16,15 @@ CORE_SRC = \
 	$(SRC_DIR)/core/bitstream/bitstream.c \
 	$(SRC_DIR)/core/prediction/intra.c \
 	$(SRC_DIR)/core/prediction/obmc.c \
+	$(SRC_DIR)/core/prediction/motion_est.c \
+	$(SRC_DIR)/core/partition/quadtree.c \
 	$(SRC_DIR)/core/grain/grain_synth.c \
+	$(SRC_DIR)/core/tile/tile.c \
 	$(SRC_DIR)/perceptual/csf_weights.c \
 	$(SRC_DIR)/perceptual/activity_mask.c \
 	$(SRC_DIR)/perceptual/ptd.c \
 	$(SRC_DIR)/perceptual/grain_analysis.c \
+	$(SRC_DIR)/perceptual/butteraugli_target.c \
 	$(SRC_DIR)/codec/encoder.c \
 	$(SRC_DIR)/codec/decoder.c \
 	$(SRC_DIR)/codec/rdo.c

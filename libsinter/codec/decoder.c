@@ -119,11 +119,9 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             uint32_t k_hi = snt_br_get_bits(&br, 8);
             pvq_codes[i].k |= (uint16_t)(k_hi << 8);
             /* Shape index: variable-width, same computation as encoder */
-            int shape_bits;
-            if (pvq_codes[i].k <= 1) shape_bits = (int)(63 * 1);
-            else shape_bits = (int)(pvq_codes[i].k * 4);
-            if (shape_bits > 64) shape_bits = 64;
+            int shape_bits = pvq_shape_bits(63, pvq_codes[i].k);
             if (shape_bits < 1) shape_bits = 1;
+            if (shape_bits > 64) shape_bits = 64;
 
             pvq_codes[i].shape_idx = 0;
             if (shape_bits > 32) {

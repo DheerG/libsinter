@@ -263,14 +263,11 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
             snt_bw_put_bits(&bw, (pvq_codes[i].k >> 8) & 0xFF, 8);
             /* Shape index: variable-width based on combinatorial count.
              * Both encoder and decoder can compute bits_needed from (n, k). */
-            /* Compute bits needed for shape index: ceil(log2(pvq_count(n, k))).
-             * For now, use a conservative estimate based on K.
-             * Both encoder and decoder compute the same value from K. */
-            int shape_bits;
-            if (pvq_codes[i].k <= 1) shape_bits = (int)(63 * 1); /* ~6 bits per dim for k=1 */
-            else shape_bits = (int)(pvq_codes[i].k * 4); /* rough estimate */
-            if (shape_bits > 64) shape_bits = 64;
+            /* Exact bits needed: ceil(log2(pvq_count(63, k))).
+             * Both encoder and decoder compute identically from K. */
+            int shape_bits = pvq_shape_bits(63, pvq_codes[i].k);
             if (shape_bits < 1) shape_bits = 1;
+            if (shape_bits > 64) shape_bits = 64;
             if (shape_bits > 64) shape_bits = 64;
             if (shape_bits > 32) {
                 snt_bw_put_bits(&bw, (uint32_t)(pvq_codes[i].shape_idx >> 32), shape_bits - 32);

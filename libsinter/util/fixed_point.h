@@ -85,10 +85,10 @@ static inline int snt_ilog2(uint32_t x) {
 }
 
 /* Integer square root (floor) — used for PVQ gain computation.
- * Decoder-safe: no floating point. */
+ * Decoder-safe: no floating point. Newton's method starting from x. */
 static inline uint32_t snt_isqrt(uint64_t x) {
-    if (x == 0) return 0;
-    uint64_t r = 1;
+    if (x <= 1) return (uint32_t)x;
+    uint64_t r = x;
     uint64_t next = (r + x / r) >> 1;
     while (next < r) {
         r = next;

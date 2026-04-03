@@ -1,0 +1,379 @@
+# Sinter Codec Technical Reference
+
+Version 0.3 — April 2026
+
+This document is the definitive technical reference for the Sinter video codec. It covers the architecture, bitstream specification, transform design, quantization, entropy coding, perceptual optimization, and container format. It is written for implementers, researchers, and anyone building on this codebase.
+
+---
+
+## Table of Contents
+
+1. [Architecture Overview](#1-architecture-overview)
+2. [Transform and Lapping](#2-transform-and-lapping)
+3. [PVQ Quantization](#3-pvq-quantization)
+4. [Perceptual Optimization](#4-perceptual-optimization)
+5. [Bitstream Specification](#5-bitstream-specification)
+6. [Entropy Coding](#6-entropy-coding)
+7. [Container Format](#7-container-format)
+8. [Appendices](#8-appendices)
+
+---
+
+## 1. Architecture Overview
+
+### Why Sinter Exists
+
+Every deployed video codec since H.261 (1988) shares the same architecture: block DCT, spatial pixel-domain prediction, scalar quantization, and post-hoc deblocking filters. Each generation (H.264, H.265, AV1, VVC) adds complexity to patch artifacts created by this architecture. Sinter asks: what if we eliminated the source of those artifacts instead?
+
+Sinter is built on three architectural breaks from tradition:
+
+1. **Lapped transforms** replace block DCT + deblocking. Cross-boundary pre/post-filters structurally prevent blocking artifacts. Zero post-processing required.
+2. **Perceptual Vector Quantization (PVQ)** replaces scalar quantization. Gain-shape decomposition preserves texture energy instead of destroying it. Grass stays grainy; fabric keeps its weave.
+3. **rANS entropy coding** replaces arithmetic coding (CABAC). Identical compression with ~2x faster decode throughput.
+
+### Pipeline
+
+```
+Encoder:
+  Input (YUV420)
+    -> Lapped Pre-Filter (8-point lifting steps at block boundaries)
+    -> 8x8 Forward DCT (Q14 orthonormal integer)
+    -> DC Prediction (from reconstructed left/above neighbors)
+    -> PVQ Band Partitioning (16 bands of 3-4 AC coefficients)
+    -> PVQ Gain-Shape Quantization (per band)
+    -> Raw Bit Packing
+    -> Bitstream
+
+Decoder:
+  Bitstream
+    -> Raw Bit Unpacking
+    -> PVQ Dequantization (midpoint reconstruction + energy correction)
+    -> DC Reconstruction (add prediction from left/above)
+    -> 8x8 Inverse DCT
+    -> Lapped Post-Filter (exact inverse of pre-filter)
+    -> Film Grain Synthesis (optional, AR(3)/AR(4) model)
+    -> Output (YUV420)
+```
+
+### Normative vs. Encoder-Only
+
+**Normative** (decoder must implement identically): lapped post-filter lifting coefficients, inverse DCT matrix, PVQ dequantization formula, PVQ energy correction algorithm, DC prediction formula, band partition boundaries, `pvq_shape_bits()` computation, film grain synthesis, QP-to-step table.
+
+**Encoder-only** (non-normative, can vary): lapped pre-filter, forward DCT, QP selection, activity masking, Butteraugli targeting, PVQ K parameter selection, rate-distortion optimization, grain estimation.
+
+### Current Quality
+
+| QP | PSNR (dB) | Max Pixel Error | Bitrate (bpp) |
+|----|-----------|-----------------|---------------|
+| 4  | 39.91     | 10              | 9.47          |
+| 8  | 36.06     | 16              | 8.04          |
+| 12 | 31.18     | 23              | 6.44          |
+| 16 | 27.35     | 34              | 5.68          |
+| 20 | 24.07     | 48              | 4.67          |
+| 28 | 19.17     | 87              | 2.75          |
+| 32 | 17.73     | 101             | 2.05          |
+
+Measured on a 256x256 diagonal gradient, all-intra, single frame. Bitrates are higher than H.264 at equivalent quality because the shipped pipeline uses raw bit packing (no entropy coding). With rANS entropy coding, expect ~2x bitrate reduction.
+
+---
+
+## 2. Transform and Lapping
+
+### Lapped Transforms (TDLT)
+
+Sinter uses Time-Domain Lapped Transforms: invertible pre/post-filters at block boundaries, implemented via lifting steps for bit-exact reversibility. The pre-filter decorrelates energy across adjacent blocks before the DCT; the post-filter reconstructs smoothly after the IDCT. No deblocking filter is needed.
+
+**Filter sizes:**
+- 4-point: 2 lifting steps (used when block size < 8)
+- 8-point: 4 lifting steps (used for block size >= 8; capped at 8 per Daala convention)
+
+**Lifting step:**
+```c
+lift(x, coeff) = snt_rshift_round_signed((int32_t)x * coeff, 15)
+```
+
+Uses symmetric rounding (ties away from zero) for both positive and negative products. This prevents rounding asymmetry that would break bit-exact invertibility.
+
+**Coefficients (Q15, 60% of Malvar theoretical):**
+
+| Param | Full Malvar | Shipped (60%) | Role |
+|-------|-------------|---------------|------|
+| LAP4_T0/T1 | 11585 | 6951 | Butterfly coupling |
+| LAP4_S0/S1 | 6270 | 3762 | Scale |
+| LAP8_T0/T1 | 12873 | 7724 | Inner butterfly |
+| LAP8_T2/T3 | 8867 | 5320 | Outer butterfly |
+| LAP8_S0/S1 | 5765 | 3459 | Inner scale |
+| LAP8_S2/S3 | 3135 | 1881 | Outer scale |
+
+**Why 60%?** Full-strength Malvar maximizes decorrelation in the theoretical (infinite precision) case. In the integer pipeline with Q14 DCT and dead-zone quantization, the pre-filter creates boundary energy that the post-filter amplifies through rounding errors. At 60%, we get meaningful deblocking while keeping error amplification manageable. The transform ceiling (no quantization) is 54.7 dB.
+
+**4-point filter** (samples [a, b | c, d] across boundary):
+```
+Forward:  b += lift(c, T0); c -= lift(b, T1); a += lift(b, S0); d += lift(c, S1)
+Inverse:  d -= lift(c, S1); a -= lift(b, S0); c += lift(b, T1); b -= lift(c, T0)
+```
+
+**2D processing order:**
+- Pre-filter: horizontal first (all rows), then vertical (all columns)
+- Post-filter: vertical first, then horizontal (exact inverse)
+- Frame edges: identity filter (no lapping)
+
+### Integer DCT
+
+Orthonormal DCT-II via direct matrix multiply with Q14 fixed-point coefficients.
+
+**Formula:** `C[k][n] = round(alpha(k) * cos(pi*(2n+1)*k / (2N)) * 16384)` where `alpha(0) = sqrt(1/N)`, `alpha(k>0) = sqrt(2/N)`.
+
+**Supported sizes:** 4, 8, 16, 32 points. All use `int16_t` matrix entries and `int32_t` accumulators.
+
+**Round-trip accuracy:** +/-1 per sample (1D), +/-2 per sample (2D 8x8). Verified over 1000 random trials per size.
+
+**2D application:** Separable row-then-column (forward), column-then-row (inverse).
+
+---
+
+## 3. PVQ Quantization
+
+### Gain-Shape Decomposition
+
+Each band of AC coefficients is decomposed into:
+- **Gain**: L2 norm (energy magnitude), quantized with a dead-zone scalar quantizer
+- **Shape**: direction on the unit hypersphere, quantized via Fischer's combinatorial enumeration on the L1 lattice
+
+The key perceptual property: human vision is far more sensitive to energy loss than shape distortion. PVQ preserves the spectral envelope of textures even at aggressive quantization.
+
+### Band Partitioning
+
+The 63 AC coefficients of each 8x8 block are split into **16 bands**:
+
+```
+Boundaries: {0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 59, 63}
+```
+
+14 bands of 4 dimensions, 1 band of 3 dimensions, 1 band of 4 dimensions. Each band is independently PVQ-coded.
+
+**Why 16 bands?** With n=4, the maximum safe K (before combinatorial table overflow) is 225. This gives dramatically better shape resolution than the monolithic approach (n=63, max K=14). The quality improvement from 4 bands to 16 bands is approximately +10 dB.
+
+### K Parameter
+
+K (pulse count) determines shape resolution:
+```
+K = max(1, gain_q * sqrt(n) * csf_weight / 256)
+```
+Capped at `900/n` to prevent overflow. For n=4, max K=225. For n=63, max K=14.
+
+### Gain Quantization
+
+Dead-zone with round-to-nearest and midpoint reconstruction:
+
+| Parameter | Intra | Inter |
+|-----------|-------|-------|
+| Dead-zone offset | step/8 | step/4 |
+| Quantize | `(gain - offset + step/2) / step` | same |
+| Dequantize | `level * step + step/2` (midpoint) | same |
+| Dequantize (level=0) | 0 | 0 |
+
+Midpoint reconstruction minimizes expected squared error. This was a critical fix — lower-edge reconstruction caused 6-10 dB quality loss.
+
+### DC Quantization and Prediction
+
+DC is quantized separately with a wider dead-zone (step/6 intra, step/3 inter) and midpoint reconstruction.
+
+**DC prediction:** average of left and above reconstructed DC coefficients in the transform domain:
+```
+pred = (left_dc + above_dc + 1) >> 1  (if both available)
+pred = left_dc                         (if only left)
+pred = above_dc                        (if only above)
+pred = 0                               (top-left block)
+```
+
+The bitstream carries the quantized residual (DC - prediction), not the absolute DC. This reduces DC magnitude by 10-20x on smooth content, dramatically improving quantization accuracy.
+
+### Shape Encoding (Fischer's Combinatorial Enumeration)
+
+Each non-skip band's shape is encoded as a unique index into the set of signed integer vectors with L1 norm = K and dimension n. The count follows the CELT/Opus recurrence:
+```
+V(1, k) = 2 for k > 0, V(1, 0) = 1
+V(n, k) = V(n-1, k) + V(n, k-1) + V(n-1, k-1)
+```
+
+The index requires `pvq_shape_bits(n, k) = ceil(log2(V(n, k)))` bits. This is computed identically by encoder and decoder — not signaled.
+
+### Energy Conservation
+
+After reconstruction (`recon[i] = pulses[i] * dq_gain / ||pulses||_2`), a greedy correction iteratively adjusts the largest |recon[i]| by +/-1 until energy matches target within tolerance. Brings energy ratio from ~1.25 to ~1.001. Both encoder and decoder run the identical correction.
+
+---
+
+## 4. Perceptual Optimization
+
+### Contrast Sensitivity Function (CSF)
+
+Bandpass model of human visual sensitivity: peak at 6 cpd, bandwidth 2.5 octaves, assuming 96 DPI at 60cm viewing distance. Precomputed as float32 LUT indexed by (block_size, coefficient_position). DC weight ~0.3, peak-band weight 1.0. Used in PTD and for PVQ K modulation.
+
+### Perceptual Transform Distortion (PTD)
+
+CSF-weighted sum of squared errors in the transform domain:
+```
+PTD = sum_i(csf_weight[i] * (orig[i] - recon[i])^2)
+```
+Structurally different from SSIM (no patent concern). Property: `PTD <= MSE` always. Allows the encoder to spend fewer bits on perceptually irrelevant frequencies.
+
+### Activity Masking
+
+Per-block QP offset based on AC variance:
+```
+delta_QP = 0.5 * log2(activity / mean_activity), clamped [-6, +6]
+```
+Smooth regions get lower QP (more bits); textured regions get higher QP. Signaled in bitstream as a 13-symbol rANS-coded value.
+
+### Butteraugli Constant-Quality Mode
+
+Outer-loop QP bisection: encode frame, measure perceptual distance, adjust QP, re-encode. Max 3 iterations. The distance metric combines MAE with a structural variance-loss penalty:
+```
+dist = MAE/255 + 2 * max(0, 1 - recon_var/orig_var)
+```
+Target values: 0.3 (visually lossless), 1.0 (high quality), 2.0 (medium), 4.0+ (aggressive).
+
+### Film Grain Synthesis
+
+Decoder-side: 2D spatial AR(3) luma / AR(4) chroma model with taps at (left, above, above-left). 4th chroma tap = co-located luma grain. Grain amplitude scales with local luma (photon noise model). Seed from frame_number for deterministic seeking.
+
+Encoder-side: Yule-Walker AR fitting on high-pass filtered source. Strength from residual variance. Parameters signaled per-frame in the bitstream header.
+
+---
+
+## 5. Bitstream Specification
+
+All multi-bit fields are written MSB-first. `f(n)` = fixed-width unsigned integer, n bits.
+
+### Frame Layout
+```
+frame_header()          // width, height, QP, grain params, etc.
+byte_align()
+block_count             f(16)
+for each block:
+  dc_level              f(16)    // quantized DC residual (signed as uint16)
+  for each of 16 PVQ bands:
+    skip                f(1)
+    if (!skip):
+      gain              f(16)
+      k                 f(16)
+      shape_idx         f(pvq_shape_bits(n, k))
+byte_align()
+chroma_present          f(1)
+if chroma:
+  U plane (4x4 DC blocks, each f(16))
+  V plane (4x4 DC blocks, each f(16))
+```
+
+### Frame Header
+
+| Field | Bits | Description |
+|-------|------|-------------|
+| width | 32 | Frame width |
+| height | 32 | Frame height |
+| frame_type | 1 | 0=key, 1=inter |
+| base_qp | 6 | QP [0..63] |
+| num_tile_cols | 4 | Tile columns |
+| num_tile_rows | 4 | Tile rows |
+| dual_rans | 1 | Dual rANS flag |
+| chroma_qp_offset | 8 | Signed chroma QP delta |
+| frame_number | 32 | Sequence number |
+| grain_enabled | 1 | Grain synthesis flag |
+| [grain_params] | 248 | If grain_enabled |
+
+### QP-to-Step Table
+
+```
+QP:  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
+     1  1  2  2  3  3  4  4  5  6  7  8  9 10 11 12
+
+QP: 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+    14 16 18 20 22 24 28 32 36 40 44 48 56 64 72 80
+```
+
+Approximately doubles every 6 QP values (6 dB per doubling).
+
+---
+
+## 6. Entropy Coding
+
+### rANS Design
+
+32-bit state, 16-bit renormalization, 15-bit CDF resolution (sum to 32768). Dual interleaved mode available (even/odd symbol alternation). LIFO ordering: encode in reverse, decode forward.
+
+**CDF Adaptation (PARA):**
+```
+delta = (target - cdf[i] + (1 << (rate-1))) >> rate
+cdf[i] += delta
+```
+Rate 4 for mode decisions, rate 5 for coefficients. Monotonicity enforced after each update.
+
+### Current Status
+
+The rANS implementation is fully tested (8/8 tests pass) but is not wired into the shipped encode/decode pipeline. The shipped pipeline uses raw bit packing. rANS integration is the highest-priority improvement for bitrate efficiency (estimated 2x reduction).
+
+---
+
+## 7. Container Format
+
+### .sntr (IVF-style)
+
+20-byte file header:
+```
+"SNTR" (4 bytes magic)
+version (4 bytes LE uint32)
+width   (4 bytes LE uint32)
+height  (4 bytes LE uint32)
+num_frames (4 bytes LE uint32)
+```
+
+Per frame: 4-byte LE size + raw frame bitstream.
+
+### FFmpeg Integration
+
+Wrapper files in `ffmpeg/` implement `AVCodec` following the libaom pattern. Encoder maps `AVFrame` YUV420P to Sinter API; decoder does the reverse. Registration as `AV_CODEC_ID_SINTER` with fourcc `SNTR`.
+
+---
+
+## 8. Appendices
+
+### Naming Conventions
+
+| Prefix | Scope |
+|--------|-------|
+| `snt_` | Shared/normative |
+| `snte_` | Encoder-only |
+| `sntd_` | Decoder-only |
+| `psy_` | Perceptual functions |
+| `pvq_` | PVQ quantization |
+| `rans_` | rANS entropy coding |
+| `_ref` | Scalar reference implementation |
+| `_fwd` / `_inv` | Forward / inverse transforms |
+
+### Test Gates
+
+| Gate | Tests | Pass Criteria |
+|------|-------|---------------|
+| 0 | Lapping round-trip | Bit-exact over 1000 random trials |
+| 1 | DCT + PVQ precision | DCT +/-1 per sample; PVQ energy ratio 1.001 |
+| 2 | Bitstream determinism | Same input = identical bitstream |
+| 3 | Reference signals | Flat gray, gradient, texture: reasonable PSNR |
+| 4 | Quality monotonic | Lower QP = equal or better quality |
+
+**Current status: 32/32 tests pass.**
+
+### Known Limitations (v0.3)
+
+- All-intra only (no inter prediction in pipeline)
+- Fixed 8x8 blocks (no quad-tree partitioning in pipeline)
+- Raw bit packing (no rANS in pipeline)
+- Chroma DC-only (no AC coefficients for chroma)
+- 8-bit only
+- Single tile
+- No rate control in pipeline
+
+### Acknowledgments
+
+Architecture designed through a roundtable of perspectives spanning open-codec development (VP8/VP9/AV1), perceptual coding research (Daala, HEVC), and open-source ecosystem building (Xiph/Ogg/Vorbis/Opus). Built on published, patent-free techniques: lapped transforms (Malvar, 1992), PVQ (Fischer, 1986; Xiph/Daala), rANS (Duda, 2009, public domain), OBMC (prior art, 1990s).

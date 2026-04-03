@@ -70,41 +70,69 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     RansDecoder rans_dec;
     rans_dec_init(&rans_dec, rans_bytes, rans_len * 2, ctx->header.dual_rans);
 
-    /* Initialize CDFs (must match encoder's initial state) */
-    RansCDF cdf_skip, cdf_gain;
+    /* Initialize CDFs (must match encoder's initial state exactly) */
+    RansCDF cdf_skip, cdf_gain_lo, cdf_gain_hi, cdf_qp_delta, cdf_dc_abs, cdf_k;
     rans_cdf_init_uniform(&cdf_skip, 2, RANS_ADAPT_RATE_MODE);
-    rans_cdf_init_uniform(&cdf_gain, 256, RANS_ADAPT_RATE_COEFF);
+    rans_cdf_init_uniform(&cdf_gain_lo, 256, RANS_ADAPT_RATE_COEFF);
+    rans_cdf_init_uniform(&cdf_gain_hi, 256, RANS_ADAPT_RATE_COEFF);
+    rans_cdf_init_uniform(&cdf_qp_delta, 13, RANS_ADAPT_RATE_MODE);
+    rans_cdf_init_uniform(&cdf_dc_abs, 256, RANS_ADAPT_RATE_COEFF);
+    rans_cdf_init_uniform(&cdf_k, 256, RANS_ADAPT_RATE_COEFF);
 
-    /* Decode rANS symbols (forward order, matching encoder's CDF state) */
+    /* Decode rANS symbols (forward order, must match encoder's symbol order:
+     * qp_delta, dc_abs_lo, skip, [gain_lo, gain_hi, k_lo if !skip]) */
     for (int i = 0; i < total_blocks; i++) {
+        /* QP delta */
+        uint16_t qpd_sym = rans_dec_symbol(&rans_dec, &cdf_qp_delta);
+        qp_deltas[i] = (int8_t)((int)qpd_sym - 6);
+
+        /* DC abs low byte */
+        uint16_t dc_abs_lo = rans_dec_symbol(&rans_dec, &cdf_dc_abs);
+        dc_levels[i] = (int16_t)dc_abs_lo; /* sign + high byte from raw section */
+
         /* Skip flag */
         uint16_t skip_sym = rans_dec_symbol(&rans_dec, &cdf_skip);
         pvq_codes[i].skip = (uint8_t)skip_sym;
 
-        /* PVQ gain low byte */
+        /* PVQ gain (full) and K if not skip */
         if (!pvq_codes[i].skip) {
-            uint16_t gain_lo = rans_dec_symbol(&rans_dec, &cdf_gain);
-            pvq_codes[i].gain = gain_lo; /* high byte added below from raw data */
+            pvq_codes[i].gain = rans_dec_symbol(&rans_dec, &cdf_gain_lo);
+            uint16_t gain_hi = rans_dec_symbol(&rans_dec, &cdf_gain_hi);
+            pvq_codes[i].gain |= ((uint32_t)gain_hi << 8);
+            uint16_t k_lo = rans_dec_symbol(&rans_dec, &cdf_k);
+            pvq_codes[i].k = k_lo; /* high byte from raw section */
         }
     }
 
     free(rans_bytes);
 
-    /* Read raw supplementary data: QP deltas, DC levels, gain high byte, K, shape */
+    /* Read supplementary raw bits (overflow bytes, signs, shape) */
     for (int i = 0; i < total_blocks; i++) {
-        qp_deltas[i] = (int8_t)((int)snt_br_get_bits(&br, 4) - 8);
-    }
-    for (int i = 0; i < total_blocks; i++) {
-        dc_levels[i] = (int16_t)(uint16_t)snt_br_get_bits(&br, 16);
-    }
-    for (int i = 0; i < total_blocks; i++) {
+        /* DC sign + high byte */
+        uint32_t dc_sign = snt_br_get_bits(&br, 1);
+        uint32_t dc_hi = snt_br_get_bits(&br, 8);
+        int16_t dc_abs = (int16_t)(dc_levels[i] | (int16_t)(dc_hi << 8));
+        dc_levels[i] = dc_sign ? -dc_abs : dc_abs;
+
         if (!pvq_codes[i].skip) {
-            uint32_t gain_hi = snt_br_get_bits(&br, 8);
-            pvq_codes[i].gain |= (gain_hi << 8);
-            pvq_codes[i].k = (uint16_t)snt_br_get_bits(&br, 16);
-            uint64_t hi = snt_br_get_bits(&br, 32);
-            uint64_t lo = snt_br_get_bits(&br, 32);
-            pvq_codes[i].shape_idx = (hi << 32) | lo;
+            /* K high byte */
+            uint32_t k_hi = snt_br_get_bits(&br, 8);
+            pvq_codes[i].k |= (uint16_t)(k_hi << 8);
+            /* Shape index: variable-width, same computation as encoder */
+            int shape_bits;
+            if (pvq_codes[i].k <= 1) shape_bits = (int)(63 * 1);
+            else shape_bits = (int)(pvq_codes[i].k * 4);
+            if (shape_bits > 64) shape_bits = 64;
+            if (shape_bits < 1) shape_bits = 1;
+
+            pvq_codes[i].shape_idx = 0;
+            if (shape_bits > 32) {
+                uint64_t hi = snt_br_get_bits(&br, shape_bits - 32);
+                uint64_t lo = snt_br_get_bits(&br, 32);
+                pvq_codes[i].shape_idx = (hi << 32) | lo;
+            } else {
+                pvq_codes[i].shape_idx = snt_br_get_bits(&br, shape_bits);
+            }
         }
     }
 

@@ -21,6 +21,7 @@
 #include "../core/bitstream/bitstream.h"
 #include "../core/prediction/intra.h"
 #include "../core/quantize/qp_table.h"
+#include "../util/fixed_point.h"
 #include "../perceptual/csf_weights.h"
 #include "../perceptual/activity_mask.h"
 #include "../perceptual/ptd.h"
@@ -152,7 +153,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     /* Step 4: Entropy-code the quantized data using rANS.
      *
      * Encoding order (forward, for CDF synchronization):
-     *   For each block: qp_delta, dc_level, skip, [gain, k, shape_idx if !skip]
+     *   For each block: qp_delta (rANS, 13 syms), skip (rANS), [gain_lo (rANS) if !skip]
      *
      * rANS encodes in REVERSE but the CDF state must be computed in
      * FORWARD order. We do two passes:
@@ -163,11 +164,10 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     /* Count total symbols for rANS */
     int nsyms = 0;
     for (int i = 0; i < total_blocks; i++) {
-        nsyms += 3; /* qp_delta_sign, qp_delta_abs, dc_sign */
-        nsyms += 1; /* dc_abs */
+        nsyms += 1; /* qp_delta (13-symbol alphabet via rANS) */
         nsyms += 1; /* skip flag */
         if (!pvq_codes[i].skip) {
-            nsyms += 3; /* gain, k, shape_idx placeholder */
+            nsyms += 1; /* gain low byte */
         }
     }
 
@@ -177,40 +177,58 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
      * This demonstrates the rANS integration while keeping the
      * implementation tractable. */
 
-    /* Initialize CDFs */
-    RansCDF cdf_skip;    /* binary: skip or not */
-    RansCDF cdf_gain;    /* PVQ gain low byte (0-255) */
+    /* Initialize CDFs — all block-level symbols now go through rANS */
+    RansCDF cdf_skip, cdf_gain_lo, cdf_gain_hi, cdf_qp_delta, cdf_dc_abs, cdf_k;
     rans_cdf_init_uniform(&cdf_skip, 2, RANS_ADAPT_RATE_MODE);
-    rans_cdf_init_uniform(&cdf_gain, 256, RANS_ADAPT_RATE_COEFF);
+    rans_cdf_init_uniform(&cdf_gain_lo, 256, RANS_ADAPT_RATE_COEFF);
+    rans_cdf_init_uniform(&cdf_gain_hi, 256, RANS_ADAPT_RATE_COEFF);
+    rans_cdf_init_uniform(&cdf_qp_delta, 13, RANS_ADAPT_RATE_MODE);
+    rans_cdf_init_uniform(&cdf_dc_abs, 256, RANS_ADAPT_RATE_COEFF);
+    rans_cdf_init_uniform(&cdf_k, 256, RANS_ADAPT_RATE_COEFF);
 
-    /* Pass 1 (forward): record ranges for rANS reverse encoding */
+    /* Pass 1 (forward): record CDF ranges for rANS reverse encoding.
+     * Symbol order per block: qp_delta, dc_sign, dc_abs_lo, skip,
+     *   [gain_lo, gain_hi, k_lo if !skip] */
     typedef struct { uint16_t cdf_lo; uint16_t freq; } SymRange;
-    int max_ranges = total_blocks * 4;
+    int max_ranges = total_blocks * 8;
     SymRange *ranges = (SymRange *)calloc(max_ranges, sizeof(SymRange));
     int range_count = 0;
 
-    /* Temporary CDFs for forward pass */
-    RansCDF fwd_skip, fwd_gain;
+    RansCDF fwd_skip, fwd_gain_lo, fwd_gain_hi, fwd_qp_delta, fwd_dc_abs, fwd_k;
     rans_cdf_init_uniform(&fwd_skip, 2, RANS_ADAPT_RATE_MODE);
-    rans_cdf_init_uniform(&fwd_gain, 256, RANS_ADAPT_RATE_COEFF);
+    rans_cdf_init_uniform(&fwd_gain_lo, 256, RANS_ADAPT_RATE_COEFF);
+    rans_cdf_init_uniform(&fwd_gain_hi, 256, RANS_ADAPT_RATE_COEFF);
+    rans_cdf_init_uniform(&fwd_qp_delta, 13, RANS_ADAPT_RATE_MODE);
+    rans_cdf_init_uniform(&fwd_dc_abs, 256, RANS_ADAPT_RATE_COEFF);
+    rans_cdf_init_uniform(&fwd_k, 256, RANS_ADAPT_RATE_COEFF);
+
+    #define RECORD_SYM(cdf_ptr, sym) do { \
+        rans_cdf_symbol_range(cdf_ptr, sym, &ranges[range_count].cdf_lo, \
+                              &ranges[range_count].freq); \
+        rans_cdf_adapt(cdf_ptr, sym); \
+        range_count++; \
+    } while(0)
 
     for (int i = 0; i < total_blocks; i++) {
-        /* Skip flag — binary, benefits most from rANS (highly skewed at high QP) */
-        uint16_t skip_sym = pvq_codes[i].skip ? 1 : 0;
-        rans_cdf_symbol_range(&fwd_skip, skip_sym, &ranges[range_count].cdf_lo,
-                              &ranges[range_count].freq);
-        rans_cdf_adapt(&fwd_skip, skip_sym);
-        range_count++;
+        /* QP delta: [0..12] */
+        RECORD_SYM(&fwd_qp_delta, (uint16_t)(qp_deltas[i] + 6));
 
-        /* PVQ gain: code low byte through rANS (high byte raw if needed) */
+        /* DC: sign (1 raw bit) + abs low byte (rANS) */
+        uint16_t dc_abs = (uint16_t)(dc_levels[i] < 0 ? -dc_levels[i] : dc_levels[i]);
+        uint16_t dc_abs_lo = dc_abs & 0xFF;
+        RECORD_SYM(&fwd_dc_abs, dc_abs_lo);
+
+        /* Skip flag */
+        RECORD_SYM(&fwd_skip, pvq_codes[i].skip ? 1 : 0);
+
+        /* PVQ gain (full), K if not skip */
         if (!pvq_codes[i].skip) {
-            uint16_t gain_lo = (uint16_t)(pvq_codes[i].gain & 0xFF);
-            rans_cdf_symbol_range(&fwd_gain, gain_lo, &ranges[range_count].cdf_lo,
-                                  &ranges[range_count].freq);
-            rans_cdf_adapt(&fwd_gain, gain_lo);
-            range_count++;
+            RECORD_SYM(&fwd_gain_lo, (uint16_t)(pvq_codes[i].gain & 0xFF));
+            RECORD_SYM(&fwd_gain_hi, (uint16_t)((pvq_codes[i].gain >> 8) & 0xFF));
+            RECORD_SYM(&fwd_k, (uint16_t)(pvq_codes[i].k & 0xFF));
         }
     }
+    #undef RECORD_SYM
 
     /* Pass 2 (reverse): rANS encode */
     uint16_t *rev_buf = (uint16_t *)calloc(65536, sizeof(uint16_t));
@@ -222,34 +240,44 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     }
     rans_enc_flush(&rans_enc);
 
-    /* Write rANS-coded data to bitstream */
     uint32_t rans_len;
     const uint16_t *rans_data = rans_enc_data(&rans_enc, &rans_len);
 
-    /* Write rANS payload length first (so decoder knows how much to read) */
+    /* Write rANS payload length + payload */
     snt_bw_put_bits(&bw, rans_len, 16);
-
-    /* Write rANS payload as bytes */
     for (uint32_t i = 0; i < rans_len; i++) {
         snt_bw_put_bits(&bw, rans_data[i] & 0xFF, 8);
         snt_bw_put_bits(&bw, rans_data[i] >> 8, 8);
     }
 
-    /* Write non-rANS data: QP deltas, DC levels, gain high byte, K, shape */
+    /* Write supplementary raw bits (values that overflow 8-bit CDF range) */
     for (int i = 0; i < total_blocks; i++) {
-        snt_bw_put_bits(&bw, (uint32_t)(qp_deltas[i] + 8), 4);
-    }
-    /* DC levels as raw 16-bit (full range, not truncated) */
-    for (int i = 0; i < total_blocks; i++) {
-        snt_bw_put_bits(&bw, (uint32_t)(uint16_t)dc_levels[i], 16);
-    }
-    /* PVQ supplementary data */
-    for (int i = 0; i < total_blocks; i++) {
+        /* DC sign: 1 bit (0=positive/zero, 1=negative) */
+        snt_bw_put_bits(&bw, dc_levels[i] < 0 ? 1 : 0, 1);
+        /* DC abs high byte (if > 255) */
+        uint16_t dc_abs = (uint16_t)(dc_levels[i] < 0 ? -dc_levels[i] : dc_levels[i]);
+        snt_bw_put_bits(&bw, (dc_abs >> 8) & 0xFF, 8);
+
         if (!pvq_codes[i].skip) {
-            snt_bw_put_bits(&bw, (pvq_codes[i].gain >> 8) & 0xFF, 8); /* gain high byte */
-            snt_bw_put_bits(&bw, pvq_codes[i].k, 16);
-            snt_bw_put_bits(&bw, (uint32_t)(pvq_codes[i].shape_idx >> 32), 32);
-            snt_bw_put_bits(&bw, (uint32_t)(pvq_codes[i].shape_idx & 0xFFFFFFFF), 32);
+            /* K high byte (if > 255) */
+            snt_bw_put_bits(&bw, (pvq_codes[i].k >> 8) & 0xFF, 8);
+            /* Shape index: variable-width based on combinatorial count.
+             * Both encoder and decoder can compute bits_needed from (n, k). */
+            /* Compute bits needed for shape index: ceil(log2(pvq_count(n, k))).
+             * For now, use a conservative estimate based on K.
+             * Both encoder and decoder compute the same value from K. */
+            int shape_bits;
+            if (pvq_codes[i].k <= 1) shape_bits = (int)(63 * 1); /* ~6 bits per dim for k=1 */
+            else shape_bits = (int)(pvq_codes[i].k * 4); /* rough estimate */
+            if (shape_bits > 64) shape_bits = 64;
+            if (shape_bits < 1) shape_bits = 1;
+            if (shape_bits > 64) shape_bits = 64;
+            if (shape_bits > 32) {
+                snt_bw_put_bits(&bw, (uint32_t)(pvq_codes[i].shape_idx >> 32), shape_bits - 32);
+                snt_bw_put_bits(&bw, (uint32_t)(pvq_codes[i].shape_idx & 0xFFFFFFFF), 32);
+            } else if (shape_bits > 0) {
+                snt_bw_put_bits(&bw, (uint32_t)pvq_codes[i].shape_idx, shape_bits);
+            }
         }
     }
 

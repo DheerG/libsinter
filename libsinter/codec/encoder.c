@@ -15,6 +15,7 @@
 #include "../core/bitstream/bitstream.h"
 #include "../util/fixed_point.h"
 #include "../perceptual/activity_mask.h"
+#include "../perceptual/csf_weights.h"
 
 #define BLK 8
 
@@ -97,9 +98,19 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
             for (int b = 0; b < NUM_BANDS; b++) {
                 int start = band_bounds[b];
                 int n = band_bounds[b + 1] - start;
+
+                /* Compute per-band CSF weight (Jens-Rainer's fix):
+                 * High-frequency bands get lower weight -> fewer K pulses -> cleaner skip.
+                 * Low-frequency bands get higher weight -> more K pulses -> better fidelity. */
+                float csf_sum = 0.0f;
+                for (int i = 0; i < n; i++)
+                    csf_sum += psy_csf_weight(BLK, 1 + start + i);
+                uint8_t band_csf = (uint8_t)(csf_sum / n * 255.0f);
+                if (band_csf < 1) band_csf = 1;
+
                 SntPVQCode code;
                 int16_t band_recon[16];
-                pvq_encode(&coeffs[1 + start], n, step, 1, 128, &code, band_recon);
+                pvq_encode(&coeffs[1 + start], n, step, 1, band_csf, &code, band_recon);
 
                 snt_bw_put_bits(&bw, code.skip, 1);
                 if (!code.skip) {

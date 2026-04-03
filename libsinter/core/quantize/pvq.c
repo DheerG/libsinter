@@ -176,11 +176,13 @@ uint32_t pvq_dequantize_gain(uint32_t level, uint16_t step) {
 
 int16_t pvq_quantize_dc(int16_t dc, uint16_t step, int is_intra) {
     if (step == 0) return dc;
+    /* Round-to-nearest with dead-zone (Gary's fix: match midpoint dequant).
+     * Dead-zone kills small values; round-to-nearest minimizes error for the rest. */
     uint32_t offset = is_intra ? (step / 6) : (step / 3);
     int16_t abs_dc = dc < 0 ? -dc : dc;
     int16_t sign = dc < 0 ? -1 : 1;
     if ((uint32_t)abs_dc <= offset) return 0;
-    return sign * (int16_t)((abs_dc - offset) / step);
+    return sign * (int16_t)((abs_dc - offset + step / 2) / step);
 }
 
 int16_t pvq_dequantize_dc(int16_t level, uint16_t step) {

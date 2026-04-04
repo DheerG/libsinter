@@ -103,18 +103,18 @@ lift(x, coeff) = snt_rshift_round_signed((int32_t)x * coeff, 15)
 
 Uses symmetric rounding (ties away from zero) for both positive and negative products. This prevents rounding asymmetry that would break bit-exact invertibility.
 
-**Coefficients (Q15, 60% of Malvar theoretical):**
+**Coefficients (Q15, 20% of Malvar theoretical):**
 
-| Param | Full Malvar | Shipped (60%) | Role |
+| Param | Full Malvar | Shipped (20%) | Role |
 |-------|-------------|---------------|------|
-| LAP4_T0/T1 | 11585 | 6951 | Butterfly coupling |
-| LAP4_S0/S1 | 6270 | 3762 | Scale |
-| LAP8_T0/T1 | 12873 | 7724 | Inner butterfly |
-| LAP8_T2/T3 | 8867 | 5320 | Outer butterfly |
-| LAP8_S0/S1 | 5765 | 3459 | Inner scale |
-| LAP8_S2/S3 | 3135 | 1881 | Outer scale |
+| LAP4_T0/T1 | 11585 | 2317 | Butterfly coupling |
+| LAP4_S0/S1 | 6270 | 1254 | Scale |
+| LAP8_T0/T1 | 12873 | 2575 | Inner butterfly |
+| LAP8_T2/T3 | 8867 | 1773 | Outer butterfly |
+| LAP8_S0/S1 | 5765 | 1153 | Inner scale |
+| LAP8_S2/S3 | 3135 | 627 | Outer scale |
 
-**Why 60%?** Full-strength Malvar maximizes decorrelation in the theoretical (infinite precision) case. In the integer pipeline with Q14 DCT and dead-zone quantization, the pre-filter creates boundary energy that the post-filter amplifies through rounding errors. At 60%, we get meaningful deblocking while keeping error amplification manageable. The transform ceiling (no quantization) is 54.7 dB.
+**Why 20%?** Full-strength Malvar (100%) maximizes decorrelation but the Q14 integer DCT amplifies errors through the post-filter chain, limiting PSNR to ~22 dB. At 60%, PSNR reaches ~42 dB. At 20%, PSNR reaches ~46 dB — within 0.77 dB of H.264. The 20% value was determined empirically through a lapping strength sweep during quality improvement loops. The tradeoff is less aggressive deblocking at high QP, but for the primary use case (high-quality encoding, QP 0-20) this is optimal.
 
 **4-point filter** (samples [a, b | c, d] across boundary):
 ```
@@ -159,7 +159,13 @@ The 63 AC coefficients of each 8x8 block are split into **16 bands**:
 Boundaries: {0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 59, 63}
 ```
 
-14 bands of 4 dimensions, 1 band of 3 dimensions, 1 band of 4 dimensions. Each band is independently PVQ-coded.
+15 bands of 4 dimensions, 1 band of 3 dimensions. Each band is independently coded using either PVQ or scalar quantization (hybrid mode, 1 bit per band).
+
+### Hybrid PVQ/Scalar Mode
+
+For each band, the encoder measures energy concentration: if the top coefficient holds >60% of total band energy (`max_sq * 10 > sum_sq * 6`), use per-coefficient **scalar** quantization (clean gradients, no shape noise). Otherwise use **PVQ** gain-shape (texture preservation). Signaled as 1 bit per band: 0=PVQ, 1=scalar.
+
+Scalar mode uses CSF-weighted step sizes for high-frequency bands (`eff_step = step * 256 / band_csf` when `band_csf < 128`). This was the single biggest quality improvement: +3.49 dB.
 
 **Why 16 bands?** With n=4, the maximum safe K (before combinatorial table overflow) is 225. This gives dramatically better shape resolution than the monolithic approach (n=63, max K=14). The quality improvement from 4 bands to 16 bands is approximately +10 dB.
 
@@ -308,20 +314,19 @@ Approximately doubles every 6 QP values (6 dB per doubling).
 
 ## 6. Entropy Coding
 
-### rANS Design
+### Exp-Golomb VLC (Shipped Pipeline)
 
-32-bit state, 16-bit renormalization, 15-bit CDF resolution (sum to 32768). Dual interleaved mode available (even/odd symbol alternation). LIFO ordering: encode in reverse, decode forward.
+All integer syntax elements use Exponential-Golomb variable-length codes (order 0, same as H.264 baseline). This provides 79% bitstream reduction vs fixed-width raw coding.
 
-**CDF Adaptation (PARA):**
-```
-delta = (target - cdf[i] + (1 << (rate-1))) >> rate
-cdf[i] += delta
-```
-Rate 4 for mode decisions, rate 5 for coefficients. Monotonicity enforced after each update.
+- **Unsigned:** value `v` written as `floor(log2(v+1))` zero bits, then `v+1` in binary
+- **Signed:** zigzag mapping (`0→0, 1→1, -1→2, 2→3, -2→4, ...`), then unsigned Exp-Golomb
+- Small values (0, +/-1) use 1-3 bits; larger values scale logarithmically
 
-### Current Status
+Applied to: DC residuals, scalar AC levels, PVQ gain, PVQ K, chroma DC residuals, chroma AC levels. Skip flags and mode bits remain as 1 raw bit each.
 
-The rANS implementation is fully tested (8/8 tests pass) but is not wired into the shipped encode/decode pipeline. The shipped pipeline uses raw bit packing. rANS integration is the highest-priority improvement for bitrate efficiency (estimated 2x reduction).
+### rANS (Built, Not Yet Wired)
+
+The full rANS infrastructure in `core/entropy/rans.c` is tested (8/8 tests pass) and supports 32-bit state, 15-bit CDFs, dual interleaved mode, and PARA adaptive CDFs. Wiring it into the pipeline is the #1 compression priority for v0.4 — expected additional 20-30% reduction beyond Exp-Golomb.
 
 ---
 
@@ -373,15 +378,15 @@ Wrapper files in `ffmpeg/` implement `AVCodec` following the libaom pattern. Enc
 
 **Current status: 32/32 tests pass.**
 
-### Known Limitations (v0.3)
+### Known Limitations (v0.3 final)
 
-- All-intra only (no inter prediction in pipeline)
-- Fixed 8x8 blocks (no quad-tree partitioning in pipeline)
-- Raw bit packing (no rANS in pipeline)
-- Chroma DC-only (no AC coefficients for chroma)
-- 8-bit only
-- Single tile
-- No rate control in pipeline
+- All-intra only (no inter prediction — biggest remaining compression gap)
+- Fixed 8x8 luma blocks, 4x4 chroma blocks (no quad-tree partitioning)
+- Exp-Golomb VLC entropy coding (rANS built but not wired — ~20-30% compression left on table)
+- No chroma AC prediction (luma has DC + 4 AC prediction, chroma has DC only)
+- 8-bit samples only (10-bit types defined, pipeline not extended)
+- Single tile (multi-tile infrastructure exists but uses 1x1 grid)
+- No rate control in pipeline (CRF module exists but not wired)
 
 ### Acknowledgments
 

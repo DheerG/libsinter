@@ -106,7 +106,10 @@ uint16_t rans_dec_get(const RansDecoder *dec);
 /* Advance decoder state after identifying the symbol. */
 void rans_dec_advance(RansDecoder *dec, uint16_t cdf_lo, uint16_t freq);
 
-/* Convenience: decode one symbol given a CDF. */
+/* Convenience: decode one symbol given a CDF.
+ * IMPORTANT: This function does NOT adapt the CDF. Callers MUST call
+ * rans_cdf_adapt(cdf, symbol) after each call, or CDF states will
+ * diverge between encoder and decoder. */
 uint16_t rans_dec_symbol(RansDecoder *dec, RansCDF *cdf);
 
 #endif /* SNT_RANS_H */

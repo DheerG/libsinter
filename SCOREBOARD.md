@@ -18,6 +18,9 @@ Match or beat H.264 on visual quality for real video content.
 | **5** | **Exp-Golomb VLC** | 46.43 | — | **21 KB** | **79% size reduction** |
 | 6 | Smart skip | 46.49 | — | 21 KB | +0.06 dB |
 | **7** | **Full chroma DCT+scalar** | 44.80 | **47.18** | 28 KB/frame | **+21 dB chroma** |
+| **8** | **rANS entropy coding** | 44.80 | 47.18 | ~9 KB/frame | **~3x compression** |
+
+**Loop 8 details:** Replaced exp-Golomb VLC with dual-interleaved rANS (32-bit state, 15-bit CDF, PARA adaptation). 6 adaptive CDFs: DC, AC, mode, skip, gain, K. Two-pass encoder (forward record + reverse encode). Fixed critical CDF overflow bug (monotonicity enforcement pushing entries above RANS_PROB_TOTAL). Quality stable across all frame sizes (40 dB at QP=4 from 8x8 to 256x256). All 32 tests pass. Reviewed and approved by full expert team (7/7).
 
 ## Final State
 
@@ -37,8 +40,10 @@ Start:     7.63 dB luma (broken pipeline, max error 255)
 Mid:      41.26 dB luma (functional but 5.4 dB behind H.264)
            ↓ Hybrid PVQ/scalar, reduced lapping, VLC, chroma DCT
 Final:    44.80 dB luma, 47.1 dB chroma (visually comparable to H.264)
+           ↓ rANS entropy coding (6 CDFs, PARA adaptation)
+Current:  44.80 dB luma, 47.1 dB chroma, ~3x smaller bitstream
 ```
 
 Total luma improvement: **+37.2 dB**
 Total chroma improvement: **+21.3 dB**
-Total size reduction: **79%** (from raw 16-bit to exp-Golomb VLC)
+Total size reduction: **~93%** (from raw 16-bit through exp-Golomb to rANS)

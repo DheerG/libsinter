@@ -61,15 +61,20 @@ void rans_cdf_adapt(RansCDF *cdf, uint16_t symbol) {
         cdf->cdf[i] = (uint16_t)((int32_t)cdf->cdf[i] + delta);
     }
 
-    /* Ensure monotonicity and minimum probability of 1 per symbol */
+    /* Ensure monotonicity and bounds.
+     * Forward pass: enforce cdf[i] >= cdf[i-1] + 1 (min probability of 1).
+     * Backward pass: enforce cdf[i] <= cdf[i+1] - 1 (all entries < PROB_TOTAL).
+     * Both passes are needed because the forward pass can push entries above
+     * PROB_TOTAL when many symbols cluster at the same value. */
+    cdf->cdf[nsym] = RANS_PROB_TOTAL;
     for (uint16_t i = 1; i < nsym; i++) {
         if (cdf->cdf[i] <= cdf->cdf[i - 1])
             cdf->cdf[i] = cdf->cdf[i - 1] + 1;
     }
-    /* Clamp last entries if they exceed PROB_TOTAL */
-    if (cdf->cdf[nsym - 1] >= RANS_PROB_TOTAL)
-        cdf->cdf[nsym - 1] = RANS_PROB_TOTAL - 1;
-    cdf->cdf[nsym] = RANS_PROB_TOTAL;
+    for (int i = (int)nsym - 1; i >= 1; i--) {
+        if (cdf->cdf[i] >= cdf->cdf[i + 1])
+            cdf->cdf[i] = cdf->cdf[i + 1] - 1;
+    }
 }
 
 uint16_t rans_cdf_lookup(const RansCDF *cdf, uint16_t cum_val) {

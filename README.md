@@ -4,7 +4,9 @@ A novel video codec built on lapped transforms, perceptual vector quantization, 
 
 ## Results vs H.264
 
-Tested on ffmpeg testsrc (256x256 color bars, 30 frames at 30fps):
+> **Note:** The BD-rate comparison below is from the all-intra v0.3 build (exp-Golomb, no inter prediction). The codec has improved significantly since then — rANS entropy coding (~3x compression), inter-frame prediction (2-6x per-frame reduction), chroma inter, and cross-frame CDF carry. An updated comparison on standard test sequences will be published with the v1.0 CLI tools.
+
+Legacy comparison (all-intra v0.3, ffmpeg testsrc 256x256, 30 frames):
 
 | Plane | Sinter (QP=4) | H.264 (QP=20) | Gap |
 |-------|---------------|----------------|-----|
@@ -13,11 +15,18 @@ Tested on ffmpeg testsrc (256x256 color bars, 30 frames at 30fps):
 | Chroma V | 47.06 dB | 53.47 dB | 6.41 dB |
 | File size | 838 KB | 149 KB | 5.6x |
 
-Luma is within 0.77 dB of H.264. Video is visually comparable on color content.
+**Current state (v0.6):** Tested on ffmpeg testsrc (256x256, 10 frames at 10fps, QP=20):
 
-**v0.4 update:** rANS entropy coding is now fully integrated into the encoder/decoder pipeline. The adaptive rANS coder with 6 CDFs and PARA adaptation replaces the exp-Golomb VLC, providing ~3x compression improvement over the previous bitstream format. Quality is stable across all frame sizes (40 dB at QP=4 from 8x8 to 256x256).
+| Metric | Sinter | H.264 | Gap |
+|--------|--------|-------|-----|
+| Total file size | 22.8 KB | 8.1 KB | 2.8x |
+| Key frame | 9.7 KB | ~3 KB | ~3x |
+| Inter frame avg | 1.5 KB | ~0.5 KB | ~3x |
 
-**v0.5 update:** Inter-frame prediction (P-frames) with integer-pel motion search, median MV prediction, and skip mode. Inter frames are 2-6x smaller than keyframes depending on content motion. 10 adaptive CDFs total (6 intra + 4 inter). Lapping bypassed for inter frames (plain block DCT on residual). All patent-safe (H.263-era techniques only).
+- rANS entropy coding with 10 adaptive CDFs and cross-frame CDF carry
+- Inter prediction (P-frames) with integer-pel motion search, skip mode, chroma MC
+- Inter frames 4-8x smaller than keyframe
+- File size gap vs H.264: **2.8x** (down from 5.6x)
 
 ## Quick Start
 

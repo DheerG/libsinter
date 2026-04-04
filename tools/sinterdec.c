@@ -1,9 +1,12 @@
 /*
  * sinterdec — Sinter Codec Reference Decoder CLI
  *
- * Usage: sinterdec -i input.sntr -o output.yuv
+ * Usage:
+ *   sinterdec -i input.sntr -o output.y4m
+ *   sinterdec -i input.sntr -o output.yuv [--raw]
+ *   sinterdec -i input.sntr -o - | ffplay -f yuv4mpeg -
  *
- * Reads .sntr bitstream, decodes, writes raw YUV 4:2:0 (luma only for v0.3).
+ * Reads .sntr bitstream, decodes, writes Y4M (default) or raw YUV 4:2:0.
  */
 
 #include <stdio.h>
@@ -21,23 +24,23 @@ static uint32_t read32(FILE *f) {
 
 int main(int argc, char **argv) {
     const char *input_path = NULL, *output_path = NULL;
+    int raw_output = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) input_path = argv[++i];
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) output_path = argv[++i];
+        else if (strcmp(argv[i], "--raw") == 0) raw_output = 1;
     }
 
     if (!input_path || !output_path) {
-        fprintf(stderr, "Usage: sinterdec -i input.sntr -o output.yuv\n");
+        fprintf(stderr, "Usage: sinterdec -i input.sntr -o output.y4m\n");
+        fprintf(stderr, "       sinterdec -i input.sntr -o output.yuv --raw\n");
         return 1;
     }
 
     FILE *fin = fopen(input_path, "rb");
-    FILE *fout = fopen(output_path, "wb");
-    if (!fin || !fout) {
-        fprintf(stderr, "Error opening files\n");
-        return 1;
-    }
+    FILE *fout = (strcmp(output_path, "-") == 0) ? stdout : fopen(output_path, "wb");
+    if (!fin || !fout) { fprintf(stderr, "Error opening files\n"); return 1; }
 
     /* Read container header */
     char magic[4];
@@ -53,11 +56,16 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "SNTR v%u: %ux%u, %u frames\n", version, width, height, num_frames);
 
-    size_t frame_size = (size_t)width * height;
-    size_t chroma_size = frame_size / 4;
+    /* Write Y4M header */
+    if (!raw_output) {
+        fprintf(fout, "YUV4MPEG2 W%u H%u F30:1 Ip C420\n", width, height);
+    }
+
+    size_t luma_size = (size_t)width * height;
+    size_t chroma_size = luma_size / 4;
     int chroma_w = (int)width / 2;
-    uint8_t *bitstream = (uint8_t *)malloc(frame_size * 4);
-    uint8_t *output_y = (uint8_t *)malloc(frame_size);
+    uint8_t *bitstream = (uint8_t *)malloc(luma_size * 4);
+    uint8_t *output_y = (uint8_t *)malloc(luma_size);
     uint8_t *output_u = (uint8_t *)calloc(chroma_size, 1);
     uint8_t *output_v = (uint8_t *)calloc(chroma_size, 1);
 
@@ -66,15 +74,17 @@ int main(int argc, char **argv) {
 
     for (uint32_t f = 0; f < num_frames; f++) {
         uint32_t frame_len = read32(fin);
-        if (frame_len == 0 || frame_len > frame_size * 2) {
+        if (frame_len == 0 || frame_len > luma_size * 4) {
             fprintf(stderr, "Invalid frame size at frame %u\n", f);
             break;
         }
 
-        fread(bitstream, 1, frame_len, fin);
+        if (fread(bitstream, 1, frame_len, fin) != frame_len) {
+            fprintf(stderr, "Short read at frame %u\n", f);
+            break;
+        }
 
         int out_w, out_h;
-        /* Reset chroma to neutral before decode (in case decoder doesn't write them) */
         memset(output_u, 128, chroma_size);
         memset(output_v, 128, chroma_size);
 
@@ -86,19 +96,20 @@ int main(int argc, char **argv) {
             break;
         }
 
-        /* Write YUV 4:2:0: luma + chroma */
-        fwrite(output_y, 1, frame_size, fout);
+        /* Write Y4M frame tag or raw data */
+        if (!raw_output)
+            fprintf(fout, "FRAME\n");
+
+        fwrite(output_y, 1, luma_size, fout);
         fwrite(output_u, 1, chroma_size, fout);
         fwrite(output_v, 1, chroma_size, fout);
 
         fprintf(stderr, "Frame %u decoded: %dx%d\n", f, out_w, out_h);
     }
 
-    fclose(fin);
-    fclose(fout);
-    free(bitstream);
-    free(output_y);
-    free(output_u);
-    free(output_v);
+    if (fin) fclose(fin);
+    if (fout != stdout) fclose(fout);
+    free(bitstream); free(output_y); free(output_u); free(output_v);
+    free(ctx.ref_y); free(ctx.ref_u); free(ctx.ref_v); free(ctx.cdf_state);
     return 0;
 }

@@ -103,7 +103,10 @@ static void rans_enc_renorm(RansEncoder *enc, RansState *state, uint16_t freq) {
                          (RANS_RENORM_LO >> RANS_PROB_BITS);
     /* Simplified: max_state = freq << (RENORM_BITS + RENORM_BITS - PROB_BITS)
      * = freq << (16 + 16 - 15) = freq << 17 */
-    max_state = (uint32_t)freq << (RANS_STATE_BITS - RANS_PROB_BITS);
+    /* Use 64-bit to prevent overflow when freq is large */
+    uint64_t max_state64 = (uint64_t)freq << (RANS_STATE_BITS - RANS_PROB_BITS);
+    if (max_state64 > UINT32_MAX) max_state64 = UINT32_MAX; /* clamp: no renorm needed */
+    max_state = (uint32_t)max_state64;
 
     while (*state >= max_state) {
         if (enc->rev_pos > 0) {

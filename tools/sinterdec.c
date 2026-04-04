@@ -54,9 +54,12 @@ int main(int argc, char **argv) {
     fprintf(stderr, "SNTR v%u: %ux%u, %u frames\n", version, width, height, num_frames);
 
     size_t frame_size = (size_t)width * height;
-    uint8_t *bitstream = (uint8_t *)malloc(frame_size * 2);
+    size_t chroma_size = frame_size / 4;
+    int chroma_w = (int)width / 2;
+    uint8_t *bitstream = (uint8_t *)malloc(frame_size * 4);
     uint8_t *output_y = (uint8_t *)malloc(frame_size);
-    uint8_t *chroma_uv = (uint8_t *)calloc(frame_size / 2, 1); /* blank chroma */
+    uint8_t *output_u = (uint8_t *)calloc(chroma_size, 1);
+    uint8_t *output_v = (uint8_t *)calloc(chroma_size, 1);
 
     SntDecoderCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -71,17 +74,22 @@ int main(int argc, char **argv) {
         fread(bitstream, 1, frame_len, fin);
 
         int out_w, out_h;
+        /* Reset chroma to neutral before decode (in case decoder doesn't write them) */
+        memset(output_u, 128, chroma_size);
+        memset(output_v, 128, chroma_size);
+
         int ret = sntd_decode_frame(&ctx, bitstream, frame_len, output_y,
-                                     NULL, NULL, &out_w, &out_h,
-                                     (int)width, 0);
+                                     output_u, output_v, &out_w, &out_h,
+                                     (int)width, chroma_w);
         if (ret != 0) {
             fprintf(stderr, "Decode error at frame %u\n", f);
             break;
         }
 
-        /* Write YUV 4:2:0: luma + blank chroma */
+        /* Write YUV 4:2:0: luma + chroma */
         fwrite(output_y, 1, frame_size, fout);
-        fwrite(chroma_uv, 1, frame_size / 2, fout);
+        fwrite(output_u, 1, chroma_size, fout);
+        fwrite(output_v, 1, chroma_size, fout);
 
         fprintf(stderr, "Frame %u decoded: %dx%d\n", f, out_w, out_h);
     }
@@ -90,6 +98,7 @@ int main(int argc, char **argv) {
     fclose(fout);
     free(bitstream);
     free(output_y);
-    free(chroma_uv);
+    free(output_u);
+    free(output_v);
     return 0;
 }

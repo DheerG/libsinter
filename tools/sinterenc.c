@@ -66,8 +66,12 @@ int main(int argc, char **argv) {
 
     /* Allocate buffers */
     size_t frame_size = (size_t)width * height;
+    size_t chroma_size = frame_size / 4; /* per plane, 4:2:0 */
+    int chroma_w = width / 2;
     uint8_t *input_y = (uint8_t *)malloc(frame_size);
-    uint8_t *bitstream = (uint8_t *)malloc(frame_size * 2); /* generous */
+    uint8_t *input_u = (uint8_t *)malloc(chroma_size);
+    uint8_t *input_v = (uint8_t *)malloc(chroma_size);
+    uint8_t *bitstream = (uint8_t *)malloc(frame_size * 4); /* generous */
 
     SntEncoderCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -81,21 +85,21 @@ int main(int argc, char **argv) {
 
     uint64_t total_bytes = 0;
     for (int f = 0; f < num_frames; f++) {
-        /* Read luma plane (skip chroma for now) */
+        /* Read luma + chroma planes (YUV 4:2:0) */
         size_t read = fread(input_y, 1, frame_size, fin);
         if (read < frame_size) {
             fprintf(stderr, "Short read at frame %d\n", f);
             break;
         }
-        /* Skip chroma planes (4:2:0) */
-        fseek(fin, (long)(frame_size / 2), SEEK_CUR);
+        fread(input_u, 1, chroma_size, fin);
+        fread(input_v, 1, chroma_size, fin);
 
         ctx.header.frame_number = (uint32_t)f;
 
         uint32_t bs_len;
-        int ret = snte_encode_frame(&ctx, input_y, NULL, NULL,
-                                     width, height, width, 0,
-                                     bitstream, (uint32_t)(frame_size * 2), &bs_len);
+        int ret = snte_encode_frame(&ctx, input_y, input_u, input_v,
+                                     width, height, width, chroma_w,
+                                     bitstream, (uint32_t)(frame_size * 4), &bs_len);
         if (ret != 0) {
             fprintf(stderr, "Encode error at frame %d\n", f);
             break;

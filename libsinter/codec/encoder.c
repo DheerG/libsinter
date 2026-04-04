@@ -130,6 +130,14 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     rans_cdf_init_uniform(&cdf_mvx, 256, RANS_ADAPT_RATE_COEFF);
     rans_cdf_init_uniform(&cdf_mvy, 256, RANS_ADAPT_RATE_COEFF);
 
+    /* Cross-frame CDF carry: restore from previous frame for inter */
+    if (is_inter && ctx->cdf_state_valid && ctx->cdf_state) {
+        RansCDF *saved = (RansCDF *)ctx->cdf_state;
+        cdf_dc = saved[0]; cdf_ac = saved[1]; cdf_mode = saved[2];
+        cdf_skip = saved[3]; cdf_gain = saved[4]; cdf_k = saved[5];
+        cdf_inter = saved[6]; cdf_iskip = saved[7]; cdf_mvx = saved[8]; cdf_mvy = saved[9];
+    }
+
     #define REC(cdf, sym) do { \
         rans_cdf_symbol_range(&(cdf), (sym), &ranges[rc].cdf_lo, &ranges[rc].freq); \
         rans_cdf_adapt(&(cdf), (sym)); \
@@ -137,6 +145,10 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     } while(0)
 
     /* ── PHASE 1: Forward pass — record symbols + overflow ─────── */
+    /* Per-block mode flags for chroma inter derivation */
+    int *blk_is_inter = (int *)calloc(total_blocks, sizeof(int));
+    int *blk_is_skip = (int *)calloc(total_blocks, sizeof(int));
+
     int16_t *dc_recon_above = (int16_t *)calloc(blk_cols, sizeof(int16_t));
     int16_t dc_recon_left = 0;
     #define NUM_PRED_AC 4
@@ -238,6 +250,10 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                 } else {
                     block_is_inter = 0;
                 }
+
+                /* Store flags for chroma inter derivation */
+                blk_is_inter[blk_idx] = block_is_inter;
+                blk_is_skip[blk_idx] = block_is_skip;
 
                 /* REC: inter_flag */
                 REC(cdf_inter, block_is_inter ? 1 : 0);
@@ -480,34 +496,88 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     if (!is_inter)
         snt_lap_post_filter_2d_ref(recon, pad_w, pad_h, pad_w, BLK);
 
-    /* Chroma: 4x4 DCT + scalar quantization (same for key and inter) */
+    /* Allocate chroma reference before chroma encoding (encoder stores reconstructed) */
+    if (input_u && input_v) {
+        if (!ctx->ref_u || ctx->ref_w != width || ctx->ref_h != height) {
+            free(ctx->ref_u); free(ctx->ref_v);
+            ctx->ref_u = (uint8_t *)calloc((size_t)cw * ch, 1);
+            ctx->ref_v = (uint8_t *)calloc((size_t)cw * ch, 1);
+        }
+    }
+
+    /* Chroma: 4x4 DCT + scalar quantization, with inter prediction */
     if (input_u && input_v) {
         int cblk_cols = cpad_w / cblk;
-        int cqp = ctx->header.base_qp + ctx->header.chroma_qp_offset;
+        /* Reduce chroma QP offset for inter frames to prevent quantization
+         * cascade (drift). +4 for key frames (no drift), +1 for inter. */
+        int cqp_off = is_inter ? 1 : ctx->header.chroma_qp_offset;
+        int cqp = ctx->header.base_qp + cqp_off;
         if (cqp < 0) cqp = 0; if (cqp > 63) cqp = 63;
         uint16_t cstep = snt_qp_to_step((uint8_t)cqp);
 
-        const uint8_t *chroma_planes[2] = {input_u, input_v};
+        const uint8_t *chroma_in[2] = {input_u, input_v};
+        const uint8_t *chroma_ref[2] = {ctx->ref_u, ctx->ref_v};
         for (int plane = 0; plane < 2; plane++) {
-            const uint8_t *cp = chroma_planes[plane];
+            const uint8_t *cp = chroma_in[plane];
+            const uint8_t *cr = chroma_ref[plane]; /* may be NULL on first frame */
             int16_t c_dc_left = 0;
             int16_t *c_dc_above = (int16_t *)calloc(cblk_cols, sizeof(int16_t));
 
             for (int cby = 0; cby < cpad_h; cby += cblk) {
                 c_dc_left = 0;
                 for (int cbx = 0; cbx < cpad_w; cbx += cblk) {
+                    int ci = cbx / cblk;
+                    int cj = cby / cblk;
+
+                    /* Check co-located luma block's inter/skip status */
+                    int luma_blk_idx = (ci < blk_cols && cj < blk_rows) ?
+                        cj * blk_cols + ci : 0;
+                    int c_is_skip = is_inter && blk_is_skip[luma_blk_idx];
+                    int c_is_inter = is_inter && blk_is_inter[luma_blk_idx];
+
+                    /* Chroma skip: copy from reference (implicit from luma skip) */
+                    if (c_is_skip && cr) {
+                        uint8_t *c_ref_out = (plane == 0) ? ctx->ref_u : ctx->ref_v;
+                        for (int dy = 0; dy < 4; dy++)
+                            for (int dx = 0; dx < 4; dx++) {
+                                int py = cby + dy, px = cbx + dx;
+                                if (py < ch && px < cw && c_ref_out)
+                                    c_ref_out[py*cw+px] = cr[py*cw+px]; /* copy ref to ref */
+                            }
+                        c_dc_left = 0;
+                        c_dc_above[ci] = 0;
+                        continue;
+                    }
+
+                    /* Build 4x4 block input */
                     int16_t cblock[16];
-                    for (int dy = 0; dy < 4; dy++)
-                        for (int dx = 0; dx < 4; dx++) {
-                            int py = cby + dy, px = cbx + dx;
-                            cblock[dy*4+dx] = (py < ch && px < cw) ?
-                                (int16_t)cp[py*stride_uv+px] - 128 : 0;
-                        }
+                    if (c_is_inter && cr) {
+                        /* Chroma inter: residual = cur - mc_ref at luma_mv/2 */
+                        SntMV luma_mv = mv_field[luma_blk_idx];
+                        int cmvx = luma_mv.x / 2, cmvy = luma_mv.y / 2;
+                        for (int dy = 0; dy < 4; dy++)
+                            for (int dx = 0; dx < 4; dx++) {
+                                int py = cby + dy, px = cbx + dx;
+                                int ry = py + cmvy, rx = px + cmvx;
+                                int16_t cur_val = (py < ch && px < cw) ?
+                                    (int16_t)cp[py*stride_uv+px] : 128;
+                                int16_t ref_val = (ry >= 0 && ry < ch && rx >= 0 && rx < cw && cr) ?
+                                    (int16_t)cr[ry*cw+rx] : 128;
+                                cblock[dy*4+dx] = cur_val - ref_val;
+                            }
+                    } else {
+                        /* Intra: center by subtracting 128 */
+                        for (int dy = 0; dy < 4; dy++)
+                            for (int dx = 0; dx < 4; dx++) {
+                                int py = cby + dy, px = cbx + dx;
+                                cblock[dy*4+dx] = (py < ch && px < cw) ?
+                                    (int16_t)cp[py*stride_uv+px] - 128 : 0;
+                            }
+                    }
 
                     int16_t ccoeffs[16];
                     snt_dct_fwd_2d_ref(cblock, 4, 4, ccoeffs);
 
-                    int ci = cbx / cblk;
                     int16_t c_dc_pred = 0;
                     if (cbx > 0 && cby > 0)
                         c_dc_pred = (c_dc_left + c_dc_above[ci] + 1) >> 1;
@@ -526,12 +596,40 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     c_dc_left = cdc_recon;
                     c_dc_above[ci] = cdc_recon;
 
+                    int16_t crecon_coeffs[16];
+                    crecon_coeffs[0] = cdc_recon;
                     for (int i = 1; i < 16; i++) {
                         int16_t ac_level = pvq_quantize_dc(ccoeffs[i], cstep, 1);
                         uint16_t ac_sym = s2u(ac_level);
                         REC(cdf_ac, ac_sym);
                         if (ac_sym == 255)
                             snt_bw_put_sexpgolomb(&ov, ac_level);
+                        crecon_coeffs[i] = pvq_dequantize_dc(ac_level, cstep);
+                    }
+
+                    /* Reconstruct chroma for reference frame */
+                    int16_t crecon_blk[16];
+                    snt_dct_inv_2d_ref(crecon_coeffs, 4, crecon_blk, 4);
+                    uint8_t *c_ref_out = (plane == 0) ? ctx->ref_u : ctx->ref_v;
+                    if (c_ref_out) {
+                        for (int dy = 0; dy < 4; dy++)
+                            for (int dx = 0; dx < 4; dx++) {
+                                int py = cby + dy, px = cbx + dx;
+                                if (py < ch && px < cw) {
+                                    int32_t val = (int32_t)crecon_blk[dy*4+dx];
+                                    if (c_is_inter && cr) {
+                                        SntMV luma_mv = mv_field[luma_blk_idx];
+                                        int cmvx = luma_mv.x / 2, cmvy = luma_mv.y / 2;
+                                        int ry = py + cmvy, rx = px + cmvx;
+                                        int16_t rv = (ry >= 0 && ry < ch && rx >= 0 && rx < cw) ?
+                                            (int16_t)cr[ry*cw+rx] : 128;
+                                        val += rv;
+                                    } else {
+                                        val += 128;
+                                    }
+                                    c_ref_out[py*cw+px] = snt_clip_pixel(val);
+                                }
+                            }
                     }
                 }
             }
@@ -568,6 +666,17 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     snt_bw_byte_align(&bw);
     *bs_len = snt_bw_bytes_written(&bw);
 
+    /* ── Save CDF state for cross-frame carry ─────────────────────── */
+    if (!ctx->cdf_state)
+        ctx->cdf_state = malloc(10 * sizeof(RansCDF));
+    {
+        RansCDF *saved = (RansCDF *)ctx->cdf_state;
+        saved[0] = cdf_dc; saved[1] = cdf_ac; saved[2] = cdf_mode;
+        saved[3] = cdf_skip; saved[4] = cdf_gain; saved[5] = cdf_k;
+        saved[6] = cdf_inter; saved[7] = cdf_iskip; saved[8] = cdf_mvx; saved[9] = cdf_mvy;
+    }
+    ctx->cdf_state_valid = 1;
+
     /* ── Store reconstructed frame as reference ────────────────────── */
     if (!ctx->ref_y || ctx->ref_w != width || ctx->ref_h != height) {
         free(ctx->ref_y);
@@ -578,6 +687,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     for (int y = 0; y < height; y++)
         for (int x = 0; x < width; x++)
             ctx->ref_y[y * width + x] = snt_clip_pixel((int32_t)recon[y * pad_w + x]);
+    /* Chroma reference is stored during chroma encoding (reconstructed, not original) */
     ctx->num_refs = 1;
 
     /* Cleanup */
@@ -586,6 +696,8 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     free(dc_recon_above);
     free(ac_recon_above);
     free(mv_field);
+    free(blk_is_inter);
+    free(blk_is_skip);
     free(ranges);
     free(ov_buf);
     free(rev_buf);

@@ -97,6 +97,14 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     rans_cdf_init_uniform(&cdf_mvx, 256, RANS_ADAPT_RATE_COEFF);
     rans_cdf_init_uniform(&cdf_mvy, 256, RANS_ADAPT_RATE_COEFF);
 
+    /* Cross-frame CDF carry: restore from previous frame for inter */
+    if (is_inter && ctx->cdf_state_valid && ctx->cdf_state) {
+        RansCDF *saved = (RansCDF *)ctx->cdf_state;
+        cdf_dc = saved[0]; cdf_ac = saved[1]; cdf_mode = saved[2];
+        cdf_skip = saved[3]; cdf_gain = saved[4]; cdf_k = saved[5];
+        cdf_inter = saved[6]; cdf_iskip = saved[7]; cdf_mvx = saved[8]; cdf_mvy = saved[9];
+    }
+
     uint16_t _dec_sym;
     #define DEC(cdf) (_dec_sym = rans_dec_symbol(&rdec, &(cdf)), \
         rans_cdf_adapt(&(cdf), _dec_sym), _dec_sym)
@@ -110,8 +118,10 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     int16_t *ac_recon_above = (int16_t *)calloc((size_t)blk_cols * NUM_PRED_AC, sizeof(int16_t));
     int16_t ac_recon_left[NUM_PRED_AC] = {0};
 
-    /* MV field for spatial prediction (inter only) */
+    /* MV field and block flags for chroma inter derivation */
     SntMV *mv_field = (SntMV *)calloc(blk_cols * blk_rows, sizeof(SntMV));
+    int *blk_is_inter = (int *)calloc(blk_cols * blk_rows, sizeof(int));
+    int *blk_is_skip = (int *)calloc(blk_cols * blk_rows, sizeof(int));
 
     #define NUM_BANDS 16
     static const int band_bounds[NUM_BANDS + 1] = {0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,59,63};
@@ -129,10 +139,12 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             if (is_inter) {
                 uint16_t inter_sym = DEC(cdf_inter);
                 block_is_inter = (inter_sym == 1);
+                blk_is_inter[blk_idx] = block_is_inter;
 
                 if (block_is_inter) {
                     uint16_t skip_sym = DEC(cdf_iskip);
                     block_is_skip = (skip_sym == 1);
+                    blk_is_skip[blk_idx] = block_is_skip;
 
                     if (block_is_skip) {
                         /* Copy reference block to recon */
@@ -329,19 +341,23 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         for (int x = 0; x < width; x++)
             output_y[y * stride_y + x] = snt_clip_pixel((int32_t)recon[y * pad_w + x]);
 
-    /* Decode chroma (same as before) */
+    /* Decode chroma with inter prediction support */
     if (chroma_present && output_u && output_v) {
         int cw = width / 2, ch_h = height / 2;
         int cblk = 4;
         int cpad_w = ((cw + cblk - 1) / cblk) * cblk;
         int cpad_h = ((ch_h + cblk - 1) / cblk) * cblk;
         int cblk_cols = cpad_w / cblk;
-        int cqp = ctx->header.base_qp + ctx->header.chroma_qp_offset;
+        /* Reduced chroma QP offset for inter frames (matches encoder) */
+        int cqp_off = is_inter ? 1 : ctx->header.chroma_qp_offset;
+        int cqp = ctx->header.base_qp + cqp_off;
         if (cqp < 0) cqp = 0; if (cqp > 63) cqp = 63;
         uint16_t cstep = snt_qp_to_step((uint8_t)cqp);
 
         uint8_t *chroma_out[2] = {output_u, output_v};
+        const uint8_t *chroma_ref[2] = {ctx->ref_u, ctx->ref_v};
         for (int plane = 0; plane < 2; plane++) {
+            const uint8_t *cr = chroma_ref[plane];
             int16_t c_dc_left = 0;
             int16_t *c_dc_above = (int16_t *)calloc(cblk_cols, sizeof(int16_t));
 
@@ -349,6 +365,27 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 c_dc_left = 0;
                 for (int cbx = 0; cbx < cpad_w; cbx += cblk) {
                     int ci = cbx / cblk;
+                    int cj = cby / cblk;
+
+                    /* Check co-located luma block's inter/skip status */
+                    int luma_blk_idx = (ci < blk_cols && cj < blk_rows) ?
+                        cj * blk_cols + ci : 0;
+                    int c_is_skip = is_inter && blk_is_skip[luma_blk_idx];
+                    int c_is_inter = is_inter && blk_is_inter[luma_blk_idx];
+
+                    /* Chroma skip: copy from reference */
+                    if (c_is_skip && cr) {
+                        SntMV luma_mv = mv_field[luma_blk_idx]; (void)luma_mv;
+                        for (int dy = 0; dy < 4; dy++)
+                            for (int dx = 0; dx < 4; dx++) {
+                                int py = cby + dy, px = cbx + dx;
+                                if (py < ch_h && px < cw)
+                                    chroma_out[plane][py*stride_uv+px] = cr[py*cw+px];
+                            }
+                        c_dc_left = 0;
+                        c_dc_above[ci] = 0;
+                        continue;
+                    }
 
                     int16_t c_dc_pred = 0;
                     if (cbx > 0 && cby > 0)
@@ -382,12 +419,24 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     int16_t cblock[16];
                     snt_dct_inv_2d_ref(ccoeffs, 4, cblock, 4);
 
+                    /* Output: add MC reference for inter, add 128 for intra */
                     for (int dy = 0; dy < 4; dy++)
                         for (int dx = 0; dx < 4; dx++) {
                             int py = cby + dy, px = cbx + dx;
-                            if (py < ch_h && px < cw)
-                                chroma_out[plane][py*stride_uv+px] =
-                                    snt_clip_pixel((int32_t)cblock[dy*4+dx] + 128);
+                            if (py < ch_h && px < cw) {
+                                int32_t val = (int32_t)cblock[dy*4+dx];
+                                if (c_is_inter && cr) {
+                                    SntMV luma_mv = mv_field[luma_blk_idx];
+                                    int cmvx = luma_mv.x / 2, cmvy = luma_mv.y / 2;
+                                    int ry = py + cmvy, rx = px + cmvx;
+                                    int16_t ref_val = (ry >= 0 && ry < ch_h && rx >= 0 && rx < cw) ?
+                                        (int16_t)cr[ry*cw+rx] : 128;
+                                    val += ref_val;
+                                } else {
+                                    val += 128;
+                                }
+                                chroma_out[plane][py*stride_uv+px] = snt_clip_pixel(val);
+                            }
                         }
                 }
             }
@@ -401,22 +450,45 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                         width, height, stride_y, stride_uv);
     }
 
+    /* ── Save CDF state for cross-frame carry ─────────────────────── */
+    if (!ctx->cdf_state)
+        ctx->cdf_state = malloc(10 * sizeof(RansCDF));
+    {
+        RansCDF *saved = (RansCDF *)ctx->cdf_state;
+        saved[0] = cdf_dc; saved[1] = cdf_ac; saved[2] = cdf_mode;
+        saved[3] = cdf_skip; saved[4] = cdf_gain; saved[5] = cdf_k;
+        saved[6] = cdf_inter; saved[7] = cdf_iskip; saved[8] = cdf_mvx; saved[9] = cdf_mvy;
+    }
+    ctx->cdf_state_valid = 1;
+
     /* ── Store reconstructed frame as reference ────────────────────── */
+    int cw_dec = width / 2, ch_dec = height / 2;
     if (!ctx->ref_y || ctx->ref_w != width || ctx->ref_h != height) {
-        free(ctx->ref_y);
+        free(ctx->ref_y); free(ctx->ref_u); free(ctx->ref_v);
         ctx->ref_y = (uint8_t *)malloc((size_t)width * height);
+        ctx->ref_u = (uint8_t *)malloc((size_t)cw_dec * ch_dec);
+        ctx->ref_v = (uint8_t *)malloc((size_t)cw_dec * ch_dec);
         ctx->ref_w = width;
         ctx->ref_h = height;
     }
     for (int y = 0; y < height; y++)
         for (int x = 0; x < width; x++)
             ctx->ref_y[y * width + x] = output_y[y * stride_y + x];
+    if (output_u && output_v && ctx->ref_u && ctx->ref_v) {
+        for (int y = 0; y < ch_dec; y++)
+            for (int x = 0; x < cw_dec; x++) {
+                ctx->ref_u[y * cw_dec + x] = output_u[y * stride_uv + x];
+                ctx->ref_v[y * cw_dec + x] = output_v[y * stride_uv + x];
+            }
+    }
     ctx->num_refs = 1;
 
     free(recon);
     free(dc_recon_above);
     free(ac_recon_above);
     free(mv_field);
+    free(blk_is_inter);
+    free(blk_is_skip);
     free(rans_buf);
     return 0;
 }

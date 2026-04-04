@@ -165,7 +165,9 @@ typedef struct {
     uint8_t            *ref_u;
     uint8_t            *ref_v;
     int                 ref_w, ref_h;
-    /* Tile state, entropy state, etc. added as needed */
+    /* Cross-frame CDF state (opaque blob, managed by encoder) */
+    void               *cdf_state;
+    int                 cdf_state_valid;
 } SntEncoderCtx;
 
 /* ── Decoder context ──────────────────────────────────────────────── */
@@ -179,6 +181,9 @@ typedef struct {
     uint8_t            *ref_u;
     uint8_t            *ref_v;
     int                 ref_w, ref_h;
+    /* Cross-frame CDF state (opaque blob, managed by decoder) */
+    void               *cdf_state;
+    int                 cdf_state_valid;
 } SntDecoderCtx;
 
 /* ── Frame buffer allocation/free ─────────────────────────────────── */

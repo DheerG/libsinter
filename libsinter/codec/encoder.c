@@ -231,8 +231,10 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     snt_bw_put_bits(&ov, ac_level < 0 ? 1 : 0, 1);
                     snt_bw_put_expgolomb(&ov, overflow_val);
                 }
-                /* Store quantized level back for band processing */
-                coeffs[idx] = ac_level;
+                /* Do NOT overwrite coeffs[idx] — band processing needs
+                 * the original prediction-subtracted coefficient, not the
+                 * quantized level. The level is already recorded as a rANS
+                 * symbol above; reconstruction uses it in Pass 3. */
             }
 
             /* Band processing */
@@ -302,11 +304,12 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                         RECORD_SYM(&cdf_gain, gain_lo);
                         RECORD_SYM(&cdf_k, k_lo);
 
-                        /* Raw overflow: gain_hi, k_hi, shape_idx */
+                        /* Raw overflow: gain_hi, k_hi, shape_idx.
+                         * Use exp-Golomb (must match decoder's snt_br_get_expgolomb). */
                         if (code.gain > 255)
-                            snt_bw_put_bits(&ov, (uint32_t)(code.gain - 255), 8);
+                            snt_bw_put_expgolomb(&ov, code.gain);
                         if (code.k > 255)
-                            snt_bw_put_bits(&ov, (uint32_t)(code.k - 255), 8);
+                            snt_bw_put_expgolomb(&ov, (uint32_t)code.k);
 
                         int shape_bits = pvq_shape_bits(n, code.k);
                         if (shape_bits < 1) shape_bits = 1;

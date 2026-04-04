@@ -160,6 +160,11 @@ typedef struct {
     SntFrame           *rec_frame;   /* reconstructed (reference) */
     SntFrame           *ref_frames[4]; /* reference frame buffer */
     uint8_t            num_refs;
+    /* Simple flat reference buffers for inter prediction (no padding) */
+    uint8_t            *ref_y;
+    uint8_t            *ref_u;
+    uint8_t            *ref_v;
+    int                 ref_w, ref_h;
     /* Tile state, entropy state, etc. added as needed */
 } SntEncoderCtx;
 
@@ -169,6 +174,11 @@ typedef struct {
     SntFrame           *rec_frame;
     SntFrame           *ref_frames[4];
     uint8_t            num_refs;
+    /* Simple flat reference buffers for inter prediction (no padding) */
+    uint8_t            *ref_y;
+    uint8_t            *ref_u;
+    uint8_t            *ref_v;
+    int                 ref_w, ref_h;
 } SntDecoderCtx;
 
 /* ── Frame buffer allocation/free ─────────────────────────────────── */

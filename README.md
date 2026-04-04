@@ -17,6 +17,8 @@ Luma is within 0.77 dB of H.264. Video is visually comparable on color content.
 
 **v0.4 update:** rANS entropy coding is now fully integrated into the encoder/decoder pipeline. The adaptive rANS coder with 6 CDFs and PARA adaptation replaces the exp-Golomb VLC, providing ~3x compression improvement over the previous bitstream format. Quality is stable across all frame sizes (40 dB at QP=4 from 8x8 to 256x256).
 
+**v0.5 update:** Inter-frame prediction (P-frames) with integer-pel motion search, median MV prediction, and skip mode. Inter frames are 2-6x smaller than keyframes depending on content motion. 10 adaptive CDFs total (6 intra + 4 inter). Lapping bypassed for inter frames (plain block DCT on residual). All patent-safe (H.263-era techniques only).
+
 ## Quick Start
 
 ```bash
@@ -153,14 +155,15 @@ Decoder reverses each step identically.
 - Hybrid PVQ/scalar preserves texture while keeping gradients clean
 
 **Weaknesses:**
-- File sizes still larger than H.264 (rANS closes the gap but no temporal prediction)
-- Chroma quality 6-7 dB behind H.264
-- All-intra only (no temporal prediction)
+- File sizes still larger than H.264 (inter + rANS narrows gap significantly)
+- Chroma quality 6-7 dB behind H.264, chroma inter not yet implemented
+- No sub-pel motion refinement (integer-pel only)
 - Fixed block sizes (no quad-tree in pipeline)
 - Reference encoder is slow (~100x vs x264)
 
 **Path forward:**
-- Inter-frame prediction (3-5x size reduction for video)
+- Sub-pel motion refinement (half-pel bilinear, ~1 dB gain)
+- Chroma inter prediction (20-30% overall size reduction)
 - Quad-tree partitioning (better content adaptation)
 - SIMD optimization for real-time encoding
 

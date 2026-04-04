@@ -152,32 +152,67 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         for (int x = 0; x < width; x++)
             output_y[y * stride_y + x] = snt_clip_pixel((int32_t)recon[y * pad_w + x]);
 
-    /* Decode chroma */
+    /* Decode chroma: 4x4 DCT + scalar (matches encoder Loop 7 fix) */
     snt_br_byte_align(&br);
     if (!snt_br_eof(&br)) {
         uint32_t chroma_present = snt_br_get_bits(&br, 1);
         if (chroma_present && output_u && output_v) {
             int cw = width / 2, ch = height / 2;
+            int cblk = 4;
+            int cpad_w = ((cw + cblk - 1) / cblk) * cblk;
+            int cpad_h = ((ch + cblk - 1) / cblk) * cblk;
+            int cblk_cols = cpad_w / cblk;
             int cqp = ctx->header.base_qp + ctx->header.chroma_qp_offset;
             if (cqp < 0) cqp = 0; if (cqp > 63) cqp = 63;
             uint16_t cstep = snt_qp_to_step((uint8_t)cqp);
 
-            for (int y = 0; y < ch; y += 4)
-                for (int x = 0; x < cw; x += 4) {
-                    int16_t level = (int16_t)snt_br_get_sexpgolomb(&br);
-                    int16_t dc = pvq_dequantize_dc(level, cstep) + 128;
-                    for (int dy = 0; dy < 4 && y+dy < ch; dy++)
-                        for (int dx = 0; dx < 4 && x+dx < cw; dx++)
-                            output_u[(y+dy)*stride_uv+x+dx] = snt_clip_pixel(dc);
+            uint8_t *chroma_out[2] = {output_u, output_v};
+            for (int plane = 0; plane < 2; plane++) {
+                int16_t c_dc_left = 0;
+                int16_t *c_dc_above = (int16_t *)calloc(cblk_cols, sizeof(int16_t));
+
+                for (int by = 0; by < cpad_h; by += cblk) {
+                    c_dc_left = 0;
+                    for (int bx = 0; bx < cpad_w; bx += cblk) {
+                        int cbx = bx / cblk;
+
+                        /* DC prediction */
+                        int16_t c_dc_pred = 0;
+                        if (bx > 0 && by > 0)
+                            c_dc_pred = (c_dc_left + c_dc_above[cbx] + 1) >> 1;
+                        else if (bx > 0) c_dc_pred = c_dc_left;
+                        else if (by > 0) c_dc_pred = c_dc_above[cbx];
+
+                        /* Read and dequantize DC */
+                        int16_t dc_level = (int16_t)snt_br_get_sexpgolomb(&br);
+                        int16_t dc_recon = pvq_dequantize_dc(dc_level, cstep) + c_dc_pred;
+                        c_dc_left = dc_recon;
+                        c_dc_above[cbx] = dc_recon;
+
+                        /* Read and dequantize 15 AC coefficients */
+                        int16_t ccoeffs[16];
+                        ccoeffs[0] = dc_recon;
+                        for (int i = 1; i < 16; i++) {
+                            int16_t ac_level = (int16_t)snt_br_get_sexpgolomb(&br);
+                            ccoeffs[i] = pvq_dequantize_dc(ac_level, cstep);
+                        }
+
+                        /* Inverse 4x4 DCT */
+                        int16_t cblock[16];
+                        snt_dct_inv_2d_ref(ccoeffs, 4, cblock, 4);
+
+                        /* Write to output (+128 to uncenter) */
+                        for (int dy = 0; dy < 4; dy++)
+                            for (int dx = 0; dx < 4; dx++) {
+                                int py = by + dy, px = bx + dx;
+                                if (py < ch && px < cw)
+                                    chroma_out[plane][py*stride_uv+px] =
+                                        snt_clip_pixel((int32_t)cblock[dy*4+dx] + 128);
+                            }
+                    }
                 }
-            for (int y = 0; y < ch; y += 4)
-                for (int x = 0; x < cw; x += 4) {
-                    int16_t level = (int16_t)snt_br_get_sexpgolomb(&br);
-                    int16_t dc = pvq_dequantize_dc(level, cstep) + 128;
-                    for (int dy = 0; dy < 4 && y+dy < ch; dy++)
-                        for (int dx = 0; dx < 4 && x+dx < cw; dx++)
-                            output_v[(y+dy)*stride_uv+x+dx] = snt_clip_pixel(dc);
-                }
+                free(c_dc_above);
+            }
         }
     }
 

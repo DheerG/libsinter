@@ -215,30 +215,71 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     /* Post-filter */
     snt_lap_post_filter_2d_ref(recon, pad_w, pad_h, pad_w, BLK);
 
-    /* Chroma (simple DC quantization) */
+    /* Chroma: 4x4 DCT + scalar quantization (team consensus: Option B).
+     * No PVQ, no lapping — chroma doesn't need texture preservation
+     * or deblocking at 4:2:0 half-resolution. */
     snt_bw_byte_align(&bw);
     if (input_u && input_v) {
         snt_bw_put_bits(&bw, 1, 1);
         int cw = width / 2, ch = height / 2;
+        int cblk = 4; /* 4x4 chroma blocks */
+        int cpad_w = ((cw + cblk - 1) / cblk) * cblk;
+        int cpad_h = ((ch + cblk - 1) / cblk) * cblk;
+        int cblk_cols = cpad_w / cblk;
         int cqp = ctx->header.base_qp + ctx->header.chroma_qp_offset;
         if (cqp < 0) cqp = 0; if (cqp > 63) cqp = 63;
         uint16_t cstep = snt_qp_to_step((uint8_t)cqp);
-        for (int y = 0; y < ch; y += 4)
-            for (int x = 0; x < cw; x += 4) {
-                int32_t sum = 0; int cnt = 0;
-                for (int dy = 0; dy < 4 && y+dy < ch; dy++)
-                    for (int dx = 0; dx < 4 && x+dx < cw; dx++)
-                        { sum += input_u[(y+dy)*stride_uv+x+dx]; cnt++; }
-                snt_bw_put_sexpgolomb(&bw, pvq_quantize_dc((int16_t)(cnt?sum/cnt-128:0), cstep, 1));
+
+        /* Encode each chroma plane: U then V */
+        const uint8_t *chroma_planes[2] = {input_u, input_v};
+        for (int plane = 0; plane < 2; plane++) {
+            const uint8_t *cp = chroma_planes[plane];
+            int16_t c_dc_left = 0;
+            int16_t *c_dc_above = (int16_t *)calloc(cblk_cols, sizeof(int16_t));
+
+            for (int by = 0; by < cpad_h; by += cblk) {
+                c_dc_left = 0;
+                for (int bx = 0; bx < cpad_w; bx += cblk) {
+                    /* Read 4x4 block, subtract 128 to center */
+                    int16_t cblock[16];
+                    for (int dy = 0; dy < 4; dy++)
+                        for (int dx = 0; dx < 4; dx++) {
+                            int py = by + dy, px = bx + dx;
+                            cblock[dy*4+dx] = (py < ch && px < cw) ?
+                                (int16_t)cp[py*stride_uv+px] - 128 : 0;
+                        }
+
+                    /* Forward 4x4 DCT */
+                    int16_t ccoeffs[16];
+                    snt_dct_fwd_2d_ref(cblock, 4, 4, ccoeffs);
+
+                    /* DC prediction */
+                    int cbx = bx / cblk;
+                    int16_t c_dc_pred = 0;
+                    if (bx > 0 && by > 0)
+                        c_dc_pred = (c_dc_left + c_dc_above[cbx] + 1) >> 1;
+                    else if (bx > 0) c_dc_pred = c_dc_left;
+                    else if (by > 0) c_dc_pred = c_dc_above[cbx];
+
+                    /* Quantize DC residual */
+                    int16_t dc_res = ccoeffs[0] - c_dc_pred;
+                    int16_t dc_level = pvq_quantize_dc(dc_res, cstep, 1);
+                    snt_bw_put_sexpgolomb(&bw, dc_level);
+
+                    /* Reconstruct DC for prediction */
+                    int16_t dc_recon = pvq_dequantize_dc(dc_level, cstep) + c_dc_pred;
+                    c_dc_left = dc_recon;
+                    c_dc_above[cbx] = dc_recon;
+
+                    /* Scalar quantize all 15 AC coefficients */
+                    for (int i = 1; i < 16; i++) {
+                        int16_t ac_level = pvq_quantize_dc(ccoeffs[i], cstep, 1);
+                        snt_bw_put_sexpgolomb(&bw, ac_level);
+                    }
+                }
             }
-        for (int y = 0; y < ch; y += 4)
-            for (int x = 0; x < cw; x += 4) {
-                int32_t sum = 0; int cnt = 0;
-                for (int dy = 0; dy < 4 && y+dy < ch; dy++)
-                    for (int dx = 0; dx < 4 && x+dx < cw; dx++)
-                        { sum += input_v[(y+dy)*stride_uv+x+dx]; cnt++; }
-                snt_bw_put_sexpgolomb(&bw, pvq_quantize_dc((int16_t)(cnt?sum/cnt-128:0), cstep, 1));
-            }
+            free(c_dc_above);
+        }
     } else {
         snt_bw_put_bits(&bw, 0, 1);
     }

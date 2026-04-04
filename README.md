@@ -1,122 +1,177 @@
 # Sinter Video Codec
 
-Sinter is an experimental video codec built on lapped transforms, perceptual vector quantization, and asymmetric numeral systems. It eliminates blocking artifacts structurally (no deblocking filter), preserves texture energy through gain-shape quantization, and decodes faster than arithmetic-coded codecs.
+A novel video codec built on lapped transforms, perceptual vector quantization, and asymmetric numeral systems. Eliminates blocking artifacts structurally — no deblocking filter needed.
 
-**Quality:** 37-40 dB PSNR at QP=4 on test content (competitive with H.264 baseline).
+## Results vs H.264
 
-**Architecture:** Fundamentally different from the H.261 lineage (H.264/H.265/AV1/VVC). No loop filters, no scalar quantization, no pixel-domain angular prediction.
+Tested on ffmpeg testsrc (256x256 color bars, 30 frames at 30fps):
+
+| Plane | Sinter (QP=4) | H.264 (QP=20) | Gap |
+|-------|---------------|----------------|-----|
+| Luma Y | 44.80 dB | 45.58 dB | 0.77 dB |
+| Chroma U | 47.18 dB | 53.91 dB | 6.73 dB |
+| Chroma V | 47.06 dB | 53.47 dB | 6.41 dB |
+| File size | 838 KB | 149 KB | 5.6x |
+
+Luma is within 0.77 dB of H.264. Video is visually comparable on color content. File size gap (5.6x) is from exp-Golomb VLC vs H.264's CABAC — rANS entropy coder is built and tested but not yet in the pipeline.
 
 ## Quick Start
 
 ```bash
-make              # build libsinter.a
-make test         # run 32 tests (transform, PVQ, entropy, round-trip)
+# Build library and tests
+make && make test
 
-# Encode a raw YUV file
-./build/sinterenc -i input.yuv -w 1920 -h 1080 -q 20 -n 1 -o output.sntr
+# Build CLI tools
+gcc -O2 -I libsinter libsinter/sinter.c libsinter/core/transform/*.c \
+  libsinter/core/quantize/pvq.c libsinter/core/quantize/qp_table.c \
+  libsinter/core/quantize/pvq_shape_rans.c libsinter/core/entropy/rans.c \
+  libsinter/core/bitstream/bitstream.c libsinter/core/prediction/*.c \
+  libsinter/core/partition/quadtree.c libsinter/core/grain/grain_synth.c \
+  libsinter/core/tile/tile.c libsinter/perceptual/*.c libsinter/codec/*.c \
+  tools/sinterenc.c -lm -o build/sinterenc
 
-# Decode back to YUV
-./build/sinterdec -i output.sntr -o decoded.yuv
+gcc -O2 -I libsinter libsinter/sinter.c libsinter/core/transform/*.c \
+  libsinter/core/quantize/pvq.c libsinter/core/quantize/qp_table.c \
+  libsinter/core/quantize/pvq_shape_rans.c libsinter/core/entropy/rans.c \
+  libsinter/core/bitstream/bitstream.c libsinter/core/prediction/*.c \
+  libsinter/core/partition/quadtree.c libsinter/core/grain/grain_synth.c \
+  libsinter/core/tile/tile.c libsinter/perceptual/*.c libsinter/codec/*.c \
+  tools/sinterdec.c -lm -o build/sinterdec
 ```
 
-## How It Works
+## Example: Encode, Decode, and Compare vs H.264
+
+```bash
+# Generate a 1-second test video
+ffmpeg -f lavfi -i "testsrc=duration=1:size=256x256:rate=30" \
+  -pix_fmt yuv420p -f rawvideo test_input.yuv
+
+# Encode with Sinter (QP=4 is highest quality)
+./build/sinterenc -i test_input.yuv -w 256 -h 256 -q 4 -n 30 -o test.sntr
+
+# Decode
+./build/sinterdec -i test.sntr -o test_decoded.yuv
+
+# Convert to playable MP4
+ffmpeg -f rawvideo -pix_fmt yuv420p -s 256x256 -r 30 \
+  -i test_decoded.yuv -c:v libx264 -crf 0 sinter_result.mp4
+
+# Encode same source with H.264 for comparison
+ffmpeg -f rawvideo -pix_fmt yuv420p -s 256x256 -r 30 \
+  -i test_input.yuv -c:v libx264 -qp 20 -g 1 h264_result.mp4
+
+# Watch both side by side
+open sinter_result.mp4
+open h264_result.mp4
+```
+
+## Example: Encode Your Own Video
+
+```bash
+# Convert any video to raw YUV
+ffmpeg -i my_video.mp4 -f rawvideo -pix_fmt yuv420p -s 256x256 -t 2 input.yuv
+
+# Count frames (file_size / (256*256*1.5))
+FRAMES=$(python3 -c "import os; print(os.path.getsize('input.yuv') // (256*256*3//2))")
+
+# Encode (QP: 4=best quality, 16=balanced, 32=small file)
+./build/sinterenc -i input.yuv -w 256 -h 256 -q 8 -n $FRAMES -o encoded.sntr
+
+# Decode and play
+./build/sinterdec -i encoded.sntr -o decoded.yuv
+ffmpeg -f rawvideo -pix_fmt yuv420p -s 256x256 -r 30 \
+  -i decoded.yuv -c:v libx264 -crf 0 output.mp4
+open output.mp4
+```
+
+## Example: Measure PSNR
+
+```bash
+# After encoding and decoding, measure quality per plane
+python3 -c "
+import math
+W, H = 256, 256
+fy, fuv = W*H, W*H//4
+
+with open('test_input.yuv', 'rb') as f:
+    oy, ou, ov = list(f.read(fy)), list(f.read(fuv)), list(f.read(fuv))
+with open('test_decoded.yuv', 'rb') as f:
+    dy, du, dv = list(f.read(fy)), list(f.read(fuv)), list(f.read(fuv))
+
+for name, o, d in [('Y', oy, dy), ('U', ou, du), ('V', ov, dv)]:
+    mse = sum((a-b)**2 for a,b in zip(o,d)) / len(o)
+    psnr = 10*math.log10(255**2/mse) if mse > 0 else 99.99
+    print(f'{name}: {psnr:.2f} dB')
+"
+```
+
+## Architecture
 
 ```
-Encoder:  Pixels -> Lapped Pre-Filter -> 8x8 DCT -> DC Prediction
-          -> 16-Band PVQ (gain-shape) -> Bitstream
+Luma Pipeline (8x8 blocks):
+  Input → Lapped Pre-Filter (20% Malvar lifting) → 8x8 DCT (Q14)
+  → DC Prediction (left+above) → AC Prediction (4 lowest coefficients)
+  → Per-band mode decision: PVQ (texture) or Scalar (smooth)
+  → 16 bands × 4 coefficients, energy-concentration threshold
+  → Exp-Golomb VLC → Bitstream
 
-Decoder:  Bitstream -> PVQ Decode -> DC Reconstruct -> Inverse DCT
-          -> Lapped Post-Filter -> Film Grain Synthesis -> Pixels
+Chroma Pipeline (4x4 blocks, YUV420 half-resolution):
+  Input → 4x4 DCT (Q14) → DC Prediction → Scalar Quantization (all 16 coeffs)
+  → Exp-Golomb VLC → Bitstream
+
+Decoder reverses each step identically.
 ```
 
-Three architectural breaks from traditional codecs:
+### What Makes Sinter Different
 
-1. **Lapped transforms** overlap adjacent blocks via lifting-step pre/post filters, structurally preventing blocking artifacts. No deblocking filter needed.
-2. **Perceptual Vector Quantization** decomposes each frequency band into energy (gain) and direction (shape). Preserves texture where scalar quantization destroys it.
-3. **rANS entropy coding** matches arithmetic coding compression at ~2x decode speed. Adaptive CDFs with PARA. (Implemented and tested; pipeline integration in progress.)
+| Feature | H.264/H.265/AV1 | Sinter |
+|---------|-----------------|--------|
+| Blocking | DCT + deblocking filter | Lapped transforms (no filter needed) |
+| Quantization | Per-coefficient scalar | Hybrid: PVQ (texture) or scalar (smooth) |
+| Entropy coding | CABAC/CAVLC | Exp-Golomb VLC (rANS ready, not wired) |
+| Prediction | Pixel-domain angular modes | Frequency-domain coefficient prediction |
+| Patents | Multiple patent pools | All techniques public domain |
+
+### Key Innovations
+
+1. **Hybrid PVQ/Scalar per-band** — the encoder measures energy concentration per frequency band. If one coefficient dominates (>60% of band energy), use scalar quantization (clean gradients). If energy is spread, use PVQ gain-shape (preserve texture). 1 bit per band. This was the single biggest quality improvement: +3.49 dB.
+
+2. **16-band PVQ with 4 dimensions each** — splitting 63 AC coefficients into 16 small bands gives max K=225 per band (vs K=14 monolithic). The 16x improvement in shape resolution was worth +10 dB.
+
+3. **Perceptual skip threshold** — PVQ bands with marginal energy are zeroed rather than coded, preventing PVQ from injecting texture noise into smooth content.
+
+4. **CSF-weighted PVQ** — each band receives a Contrast Sensitivity Function weight that modulates the K parameter. High-frequency bands get fewer pulses (perceptually invisible detail), low-frequency bands get more (perceptually critical detail).
+
+## Honest Assessment
+
+**Strengths:**
+- Near-H.264 luma quality (0.77 dB gap)
+- No blocking artifacts by design
+- Patent-free architecture
+- Hybrid PVQ/scalar preserves texture while keeping gradients clean
+
+**Weaknesses:**
+- 5.6x larger files than H.264 (no adaptive entropy coding)
+- Chroma quality 6-7 dB behind H.264
+- All-intra only (no temporal prediction)
+- Fixed block sizes (no quad-tree in pipeline)
+- Reference encoder is slow (~100x vs x264)
+
+**Path forward:**
+- Wire rANS entropy coding into pipeline (estimated 2-3x size reduction)
+- Inter-frame prediction (3-5x size reduction for video)
+- Quad-tree partitioning (better content adaptation)
+- SIMD optimization for real-time encoding
 
 ## Documentation
 
-- **[Technical Reference](docs/TECHNICAL_REFERENCE.md)** — Complete specification: bitstream format, transform math, PVQ design, perceptual pipeline, entropy coding, container format
-- **[Public API](libsinter/sinter.h)** — 8-function C API with opaque handles
+- **[Technical Reference](docs/TECHNICAL_REFERENCE.md)** — Full specification
+- **[Scoreboard](SCOREBOARD.md)** — Quality improvement tracking
+- **[Public API](libsinter/sinter.h)** — Stable C API (8 functions)
 
-## Project Structure
+## Requirements
 
-```
-libsinter/
-  sinter.h / sinter.c     Public C API
-  core/transform/          Lapped filters (lifting) + Q14 integer DCT (4-32pt)
-  core/quantize/           PVQ gain-shape + DC scalar quant + QP table
-  core/entropy/            Dual interleaved rANS + adaptive CDFs
-  core/bitstream/          Frame header + block data syntax
-  core/prediction/         Freq-domain intra + OBMC inter + motion estimation
-  core/partition/          Quad-tree block partitioning with RDO
-  core/grain/              Film grain AR(3)/AR(4) synthesis
-  core/tile/               Multi-tile with overlap blending
-  codec/                   Encoder + decoder pipelines + rate control
-  perceptual/              CSF weights + PTD metric + activity masking + Butteraugli
-  test/                    4 test suites, 32 tests
-tools/
-  sinterenc.c              CLI encoder (YUV -> .sntr)
-  sinterdec.c              CLI decoder (.sntr -> YUV)
-ffmpeg/
-  libsinter_enc.c          FFmpeg encoder wrapper (reference)
-  libsinter_dec.c          FFmpeg decoder wrapper (reference)
-wasm/
-  build.sh                 Emscripten WASM decoder build
-  sinter_player.html       Browser playback demo
-```
-
-## Quality Results
-
-256x256 diagonal gradient, all-intra, single frame:
-
-| QP | PSNR | Max Error | Bitrate | Compression |
-|----|------|-----------|---------|-------------|
-| 4  | 39.91 dB | 10 | 9.47 bpp | 1.3x |
-| 8  | 36.06 dB | 16 | 8.04 bpp | 1.5x |
-| 12 | 31.18 dB | 23 | 6.44 bpp | 1.9x |
-| 16 | 27.35 dB | 34 | 5.68 bpp | 2.1x |
-| 20 | 24.07 dB | 48 | 4.67 bpp | 2.6x |
-| 28 | 19.17 dB | 87 | 2.75 bpp | 4.4x |
-
-Bitrates are high because the shipped pipeline uses raw bit packing (no entropy coding). With rANS, expect ~2x bitrate reduction at the same quality.
-
-## Key Design Decisions
-
-- **60% Malvar lapping coefficients:** Full-strength Malvar (100%) maximizes decorrelation but the Q14 integer DCT amplifies errors through the post-filter chain. 60% balances deblocking quality with reconstruction precision.
-- **16-band PVQ (4 dims each):** Smaller bands give dramatically higher K values (max K=225 at n=4 vs K=14 at n=63), improving shape resolution by 10+ dB.
-- **Midpoint dequantization:** Reconstructs at the center of each quantization bin, not the lower edge. A textbook fix that every production codec uses.
-- **DC prediction:** Average of left and above reconstructed DC coefficients. Reduces DC residual 10-20x on smooth content.
-
-## Current Limitations
-
-- All-intra only (inter prediction module exists but is not wired in)
-- Fixed 8x8 block grid (quad-tree exists but not integrated)
-- Raw bit packing (rANS validated but not in pipeline — prior integration had bitstream ordering bugs)
-- Chroma is DC-only at 4x4 blocks
-- 8-bit only (10-bit types defined, pipeline not extended)
-- No rate control in pipeline (CRF module exists)
-
-## Ecosystem
-
-- **FFmpeg:** Wrapper files in `ffmpeg/` following libaom pattern. Requires bitstream freeze for upstream submission.
-- **WASM:** `wasm/build.sh` compiles decoder to WebAssembly via Emscripten. `sinter_player.html` demonstrates browser playback.
-- **Container:** `.sntr` IVF-style format with magic `SNTR`, frame-length-prefixed.
-- **pkg-config:** `libsinter.pc.in` template for build system integration.
-
-## Building from Source
-
-Requirements: C11 compiler (GCC or Clang), make, no external dependencies.
-
-```bash
-make                    # static library + archive
-make test               # all 32 tests
-make clean              # remove build artifacts
-```
-
-CLI tools are built separately:
-```bash
-gcc -O2 -I libsinter libsinter/*.c libsinter/**/*.c tools/sinterenc.c -lm -o sinterenc
-gcc -O2 -I libsinter libsinter/*.c libsinter/**/*.c tools/sinterdec.c -lm -o sinterdec
-```
+- C11 compiler (GCC or Clang)
+- make
+- ffmpeg (for testing and format conversion)
+- No external library dependencies

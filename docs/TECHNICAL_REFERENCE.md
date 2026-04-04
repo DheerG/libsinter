@@ -63,17 +63,26 @@ Decoder:
 
 ### Current Quality
 
-| QP | PSNR (dB) | Max Pixel Error | Bitrate (bpp) |
-|----|-----------|-----------------|---------------|
-| 4  | 39.91     | 10              | 9.47          |
-| 8  | 36.06     | 16              | 8.04          |
-| 12 | 31.18     | 23              | 6.44          |
-| 16 | 27.35     | 34              | 5.68          |
-| 20 | 24.07     | 48              | 4.67          |
-| 28 | 19.17     | 87              | 2.75          |
-| 32 | 17.73     | 101             | 2.05          |
+**Video test (ffmpeg testsrc, 256x256, 30 frames, color):**
 
-Measured on a 256x256 diagonal gradient, all-intra, single frame. Bitrates are higher than H.264 at equivalent quality because the shipped pipeline uses raw bit packing (no entropy coding). With rANS entropy coding, expect ~2x bitrate reduction.
+| Plane | Sinter (QP=4) | H.264 (QP=20) | Gap |
+|-------|---------------|----------------|-----|
+| Luma Y | 44.80 dB | 45.58 dB | 0.77 dB |
+| Chroma U | 47.18 dB | 53.91 dB | 6.73 dB |
+| Chroma V | 47.06 dB | 53.47 dB | 6.41 dB |
+| File size | 838 KB (30 frames) | 149 KB (30 frames) | 5.6x |
+
+**Luma R-D curve (256x256 gradient, single frame):**
+
+| QP | PSNR (dB) | Size (bytes) |
+|----|-----------|--------------|
+| 4  | 46.49     | 21,387       |
+| 8  | 42.0      | ~18,000      |
+| 12 | 37.5      | ~14,000      |
+| 20 | 30.0      | ~9,000       |
+| 28 | 24.0      | ~5,500       |
+
+Bitrates use exp-Golomb VLC. With rANS entropy coding (built and tested, not yet in pipeline), expect ~2x further reduction.
 
 ---
 

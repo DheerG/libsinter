@@ -86,7 +86,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
             /* Quantize DC residual (not absolute DC) */
             int16_t dc_residual = coeffs[0] - dc_pred;
             int16_t dc_level = pvq_quantize_dc(dc_residual, step, 1);
-            snt_bw_put_bits(&bw, (uint32_t)(uint16_t)dc_level, 16);
+            snt_bw_put_sexpgolomb(&bw, dc_level); /* VLC: ~2-4 bits for small residuals */
 
             /* Reconstruct DC for prediction of future blocks */
             int16_t dc_recon = pvq_dequantize_dc(dc_level, step) + dc_pred;
@@ -158,7 +158,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     snt_bw_put_bits(&bw, 1, 1); /* mode=1: scalar */
                     for (int i = 0; i < n; i++) {
                         int16_t level = pvq_quantize_dc(band_coeffs[i], eff_step, 1);
-                        snt_bw_put_bits(&bw, (uint32_t)(uint16_t)level, 16);
+                        snt_bw_put_sexpgolomb(&bw, level); /* VLC: ~1-5 bits */
                         band_recon[i] = pvq_dequantize_dc(level, eff_step);
                     }
                 } else {
@@ -169,8 +169,8 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
 
                     snt_bw_put_bits(&bw, code.skip, 1);
                     if (!code.skip) {
-                        snt_bw_put_bits(&bw, code.gain & 0xFFFF, 16);
-                        snt_bw_put_bits(&bw, code.k, 16);
+                        snt_bw_put_expgolomb(&bw, code.gain);
+                        snt_bw_put_expgolomb(&bw, code.k);
                         int shape_bits = pvq_shape_bits(n, code.k);
                         if (shape_bits < 1) shape_bits = 1;
                         if (shape_bits > 64) shape_bits = 64;
@@ -229,7 +229,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                 for (int dy = 0; dy < 4 && y+dy < ch; dy++)
                     for (int dx = 0; dx < 4 && x+dx < cw; dx++)
                         { sum += input_u[(y+dy)*stride_uv+x+dx]; cnt++; }
-                snt_bw_put_bits(&bw, (uint32_t)(uint16_t)pvq_quantize_dc((int16_t)(cnt?sum/cnt-128:0), cstep, 1), 16);
+                snt_bw_put_sexpgolomb(&bw, pvq_quantize_dc((int16_t)(cnt?sum/cnt-128:0), cstep, 1));
             }
         for (int y = 0; y < ch; y += 4)
             for (int x = 0; x < cw; x += 4) {
@@ -237,7 +237,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                 for (int dy = 0; dy < 4 && y+dy < ch; dy++)
                     for (int dx = 0; dx < 4 && x+dx < cw; dx++)
                         { sum += input_v[(y+dy)*stride_uv+x+dx]; cnt++; }
-                snt_bw_put_bits(&bw, (uint32_t)(uint16_t)pvq_quantize_dc((int16_t)(cnt?sum/cnt-128:0), cstep, 1), 16);
+                snt_bw_put_sexpgolomb(&bw, pvq_quantize_dc((int16_t)(cnt?sum/cnt-128:0), cstep, 1));
             }
     } else {
         snt_bw_put_bits(&bw, 0, 1);

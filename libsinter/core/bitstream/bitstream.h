@@ -39,6 +39,16 @@ uint8_t  snt_br_get_byte(SntBitReader *br);
 void snt_br_byte_align(SntBitReader *br);
 int snt_br_eof(const SntBitReader *br);
 
+/* ── Exp-Golomb variable-length coding (unsigned, order 0) ────────── */
+/* Small values use few bits: 0→1bit, 1-2→3bits, 3-6→5bits, etc.
+ * Patent-free: prior art in H.261 (1988). */
+void snt_bw_put_expgolomb(SntBitWriter *bw, uint32_t val);
+uint32_t snt_br_get_expgolomb(SntBitReader *br);
+
+/* Signed exp-Golomb: interleave positive/negative → unsigned */
+void snt_bw_put_sexpgolomb(SntBitWriter *bw, int32_t val);
+int32_t snt_br_get_sexpgolomb(SntBitReader *br);
+
 /* ── Frame header syntax ──────────────────────────────────────────── */
 void snt_write_frame_header(SntBitWriter *bw, const SntFrameHeader *hdr);
 void snt_read_frame_header(SntBitReader *br, SntFrameHeader *hdr);

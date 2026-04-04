@@ -107,6 +107,44 @@ int snt_br_eof(const SntBitReader *br) {
     return br->byte_pos >= br->buf_len;
 }
 
+/* ── Exp-Golomb (unsigned, order 0) ────────────────────────────────── */
+/* Encoding: code+1 in unary-binary: floor(log2(code+1)) zeros, then
+ * the binary representation of code+1. Total bits = 2*floor(log2(code+1))+1.
+ * 0→"1" (1 bit), 1→"010" (3 bits), 2→"011", 3→"00100" (5 bits), etc. */
+
+void snt_bw_put_expgolomb(SntBitWriter *bw, uint32_t val) {
+    uint32_t code = val + 1;
+    int prefix = 0;
+    uint32_t tmp = code;
+    while (tmp > 1) { tmp >>= 1; prefix++; }
+    /* Write prefix zeros */
+    for (int i = 0; i < prefix; i++)
+        snt_bw_put_bits(bw, 0, 1);
+    /* Write code in prefix+1 bits */
+    snt_bw_put_bits(bw, code, prefix + 1);
+}
+
+uint32_t snt_br_get_expgolomb(SntBitReader *br) {
+    int prefix = 0;
+    while (snt_br_get_bits(br, 1) == 0 && prefix < 31)
+        prefix++;
+    if (prefix == 0) return 0;
+    uint32_t suffix = snt_br_get_bits(br, prefix);
+    return ((1u << prefix) | suffix) - 1;
+}
+
+void snt_bw_put_sexpgolomb(SntBitWriter *bw, int32_t val) {
+    /* Map signed → unsigned: 0→0, 1→1, -1→2, 2→3, -2→4, ... */
+    uint32_t uval = (val >= 0) ? (uint32_t)(2 * val) : (uint32_t)(-2 * val - 1);
+    snt_bw_put_expgolomb(bw, uval);
+}
+
+int32_t snt_br_get_sexpgolomb(SntBitReader *br) {
+    uint32_t uval = snt_br_get_expgolomb(br);
+    if (uval % 2 == 0) return (int32_t)(uval / 2);
+    else return -(int32_t)((uval + 1) / 2);
+}
+
 /* ── Frame header ─────────────────────────────────────────────────── */
 
 void snt_write_frame_header(SntBitWriter *bw, const SntFrameHeader *hdr) {

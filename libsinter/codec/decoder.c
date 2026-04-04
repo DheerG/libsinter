@@ -65,7 +65,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 dc_pred = dc_recon_above[bx];
 
             /* DC: read residual, add prediction */
-            int16_t dc_level = (int16_t)(uint16_t)snt_br_get_bits(&br, 16);
+            int16_t dc_level = (int16_t)snt_br_get_sexpgolomb(&br);
             int16_t dc_recon = pvq_dequantize_dc(dc_level, step) + dc_pred;
             recon_coeffs[0] = dc_recon;
             dc_recon_left = dc_recon;
@@ -94,7 +94,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                         if (eff_step > 3072) eff_step = 3072;
                     }
                     for (int i = 0; i < n; i++) {
-                        int16_t level = (int16_t)(uint16_t)snt_br_get_bits(&br, 16);
+                        int16_t level = (int16_t)snt_br_get_sexpgolomb(&br);
                         recon_coeffs[1 + start + i] = pvq_dequantize_dc(level, eff_step);
                     }
                 } else {
@@ -103,8 +103,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     if (!skip) {
                         SntPVQCode code;
                         code.skip = 0;
-                        code.gain = snt_br_get_bits(&br, 16);
-                        code.k = (uint16_t)snt_br_get_bits(&br, 16);
+                        code.gain = snt_br_get_expgolomb(&br);
+                        code.k = (uint16_t)snt_br_get_expgolomb(&br);
                         int shape_bits = pvq_shape_bits(n, code.k);
                         if (shape_bits > 64) shape_bits = 64;
                         if (shape_bits > 32) {
@@ -164,7 +164,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
 
             for (int y = 0; y < ch; y += 4)
                 for (int x = 0; x < cw; x += 4) {
-                    int16_t level = (int16_t)(uint16_t)snt_br_get_bits(&br, 16);
+                    int16_t level = (int16_t)snt_br_get_sexpgolomb(&br);
                     int16_t dc = pvq_dequantize_dc(level, cstep) + 128;
                     for (int dy = 0; dy < 4 && y+dy < ch; dy++)
                         for (int dx = 0; dx < 4 && x+dx < cw; dx++)
@@ -172,7 +172,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 }
             for (int y = 0; y < ch; y += 4)
                 for (int x = 0; x < cw; x += 4) {
-                    int16_t level = (int16_t)(uint16_t)snt_br_get_bits(&br, 16);
+                    int16_t level = (int16_t)snt_br_get_sexpgolomb(&br);
                     int16_t dc = pvq_dequantize_dc(level, cstep) + 128;
                     for (int dy = 0; dy < 4 && y+dy < ch; dy++)
                         for (int dx = 0; dx < 4 && x+dx < cw; dx++)

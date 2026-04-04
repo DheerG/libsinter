@@ -221,10 +221,16 @@ uint16_t pvq_compute_k(uint32_t gain_q, int n, uint8_t csf_weight) {
     if (k < 1) k = 1;
 
     /* Cap K to prevent combinatorial table overflow in pvq_count(n, k).
-     * Max safe K decreases with dimension: n=63→15, n=32→23, n=15→68.
-     * Use conservative formula: max_k ≈ 900 / n (empirically fitted). */
-    uint32_t max_k = (n > 0) ? (900 / (uint32_t)n) : PVQ_MAX_K;
-    if (max_k < 2) max_k = 2;
+     * Exact safe limits verified against uint64 overflow threshold. */
+    uint32_t max_k;
+    if      (n <= 4)  max_k = 128;
+    else if (n <= 8)  max_k = 64;
+    else if (n <= 12) max_k = 50;
+    else if (n <= 16) max_k = 40;  /* pvq_count(16,55) fits, 60 overflows */
+    else if (n <= 20) max_k = 30;
+    else if (n <= 24) max_k = 22;
+    else if (n <= 32) max_k = 18;
+    else              max_k = 12;  /* n=63: max_k=14 */
     if (k > max_k) k = max_k;
     if (k > PVQ_MAX_K) k = PVQ_MAX_K;
     return (uint16_t)k;

@@ -51,3 +51,41 @@ Current:  44.80 dB luma, 47.1 dB chroma, ~3x smaller bitstream
 Total luma improvement: **+37.2 dB**
 Total chroma improvement: **+21.3 dB**
 Total size reduction: **~93%** (from raw 16-bit through exp-Golomb to rANS)
+
+---
+
+## BD-Rate Comparison (v1.0)
+
+**Test sequence:** ffmpeg testsrc, 256x256, 30 frames (1 key + 29 P-frames), 30 fps
+
+### Sinter R-D Data
+
+| QP | Y PSNR (dB) | U PSNR (dB) | V PSNR (dB) | Total Size (bytes) | Bitrate (kbps) |
+|----|-------------|-------------|-------------|-------------------|----------------|
+| 4  | 49.10       | 37.23       | 34.60       | 136,051           | 1,088.4        |
+| 8  | 45.32       | 35.91       | 33.97       | 102,499           | 820.0          |
+| 12 | 40.56       | 33.28       | 32.31       | 75,995            | 608.0          |
+| 16 | 37.29       | 32.46       | 32.49       | 59,684            | 477.5          |
+| 20 | 33.70       | 30.47       | 31.50       | 37,030            | 296.2          |
+| 28 | 28.41       | 25.80       | 27.13       | 13,148            | 105.2          |
+
+### H.264 (libx264) R-D Data
+
+| QP | Y PSNR (dB) | U PSNR (dB) | V PSNR (dB) | Total Size (bytes) | Bitrate (kbps) |
+|----|-------------|-------------|-------------|-------------------|----------------|
+| 4  | 74.59       | 66.17       | 66.25       | 33,533            | 268.3          |
+| 8  | 66.90       | 61.41       | 61.49       | 22,812            | 182.5          |
+| 12 | 62.23       | 58.03       | 58.49       | 16,898            | 135.2          |
+| 16 | 58.83       | 55.34       | 55.88       | 12,827            | 102.6          |
+| 20 | 55.12       | 52.70       | 52.07       | 10,608            | 84.9           |
+| 28 | 48.37       | 46.46       | 45.96       | 7,288             | 58.3           |
+
+### Analysis
+
+**QP scale difference:** Sinter QP and H.264 QP are not comparable at the same numeric value. H.264 QP=28 (48.37 dB) is comparable to Sinter QP=4 (49.10 dB) in luma quality.
+
+**At comparable luma quality (~49 dB):** Sinter QP=4 produces 136 KB vs H.264 QP=28 at 7.3 KB — a ~18.6x size gap. This reflects H.264's mature motion compensation (B-frames, sub-pel, multiple references, CABAC) vs Sinter's integer-pel single-reference P-frames.
+
+**Compression efficiency slope:** Sinter achieves ~20.7 dB dynamic range over its QP sweep (28.4-49.1 dB) with 10.3x bitrate range. H.264 achieves ~26.2 dB range (48.4-74.6 dB) with 4.6x bitrate range. Sinter's R-D curve has steeper quality falloff at higher QP.
+
+**Chroma gap:** Sinter chroma is 15-30 dB behind H.264 at equivalent bitrates, indicating significant room for chroma coding improvement.

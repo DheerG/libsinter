@@ -427,16 +427,14 @@ static double chroma_level_bits(SntCdfSet *cs, int t, int i, int16_t v, int z_kn
     return bits;
 }
 
-/* Code one 4x4 chroma block. v: its coefficients in zigzag order, the DC
- * prediction subtracted. Each level is chosen by RD as in code_luma; then
- * the block is coded (flag 1) or all zero (flag 0), whichever costs
- * least. Emits the flag (model flag) and the levels. out: reconstructed
- * coefficients, zigzag order, DC prediction not added. Returns whether
- * the block is coded. */
-static int code_chroma4(SntCdfSet *cs, SymSink *sink, uint16_t cstep, double lambda, int t,
-                        SntModel *flag, const int16_t *v, int16_t *out) {
-    int16_t lev[16];
-    double sse_coded = 0, sse_zero = 0, bits = 0;
+/* RD choice for one 4x4 chroma block. v: its coefficients in zigzag order,
+ * the DC prediction subtracted. Each level is chosen as in code_luma, then
+ * the block is coded (flag 1) or all zero (flag 0, model flag), whichever
+ * costs least. Writes the levels (all zero if not coded), *sse and *bits
+ * (the flag's included), and returns whether the block is coded. */
+static int chroma_rd(SntCdfSet *cs, uint16_t cstep, double lambda, int t, const SntModel *flag,
+                     const int16_t *v, int16_t *lev, double *sse, double *bits) {
+    double sse_coded = 0, sse_zero = 0, lev_bits = 0;
     int nz = 0;
     for (int i = 0; i < 16; i++) {
         /* The last level is known nonzero if the others are zero */
@@ -451,17 +449,31 @@ static int code_chroma4(SntCdfSet *cs, SymSink *sink, uint16_t cstep, double lam
                 best = e * e + lambda * cb; best_bits = cb; best_sse = e * e; lev[i] = cand[c];
             }
         }
-        bits += best_bits;
+        lev_bits += best_bits;
         sse_coded += best_sse;
         sse_zero += (double)v[i] * v[i];
         nz |= lev[i] != 0;
     }
-    int coded = nz && sse_coded + lambda * (bits + cdf_bits(flag, 1))
+    int coded = nz && sse_coded + lambda * (lev_bits + cdf_bits(flag, 1))
                       < sse_zero + lambda * cdf_bits(flag, 0);
+    if (!coded) memset(lev, 0, 16 * sizeof(int16_t));
+    *sse = coded ? sse_coded : sse_zero;
+    *bits = coded ? lev_bits + cdf_bits(flag, 1) : cdf_bits(flag, 0);
+    return coded;
+}
+
+/* Code one 4x4 chroma block (v as for chroma_rd): emits the flag and the
+ * levels chosen by chroma_rd. out: reconstructed coefficients, zigzag
+ * order, DC prediction not added. Returns whether the block is coded. */
+static int code_chroma4(SntCdfSet *cs, SymSink *sink, uint16_t cstep, double lambda, int t,
+                        SntModel *flag, const int16_t *v, int16_t *out) {
+    int16_t lev[16];
+    double sse, bits;
+    int coded = chroma_rd(cs, cstep, lambda, t, flag, v, lev, &sse, &bits);
     rec(sink, flag, (uint16_t)coded);
     int any = 0;
     for (int i = 0; i < 16; i++) {
-        out[i] = coded ? pvq_dequantize_dc(lev[i], cstep) : 0;
+        out[i] = pvq_dequantize_dc(lev[i], cstep);
         if (!coded) continue;
         SntLevelBin bins[2 * SNT_LEVEL_MAX_CAT + 4];
         int nb = snt_level_bins(lev[i], i == 15 && !any, bins);
@@ -494,6 +506,12 @@ typedef struct {
                                 reconstruction, for intra prediction */
     uint8_t       *coded;    /* per block: coded yet? */
     uint8_t       *luma_nz;  /* per block: any nonzero luma level? (chroma flag context) */
+    /* Chroma, for the cost of each candidate: source planes (NULL without
+     * chroma), their stride and size, references and step */
+    const uint8_t *src_c[2];
+    int            stride_uv, cw, ch;
+    const uint8_t *cref_f[2], *cref_b[2];
+    uint16_t       cstep;
     /* Extra MV candidates for the blocks being decided (encoder decisions):
      * the macroblock's 16x16-searched MVs for its 8x8 blocks, the 8x8
      * blocks' MVs for the 16x16 candidate */
@@ -675,6 +693,64 @@ static double inter_mv_bits(const EncFrame *f, int dir, SntMV mvf, SntMV mvb,
     return b;
 }
 
+/* Chroma part of a candidate's cost for 8x8 luma block (bx, by): its two
+ * 4x4 chroma blocks as the chroma pass will code them, their squared
+ * error + lambda x their bits. The chroma pass follows the luma
+ * decision: skipped blocks are predicted and code nothing; inter blocks
+ * code the residual of the prediction in direction dir at (mvf, mvb);
+ * intra blocks code pixels - 128 with the DC predicted from the
+ * neighbours' DC, here estimated from the source since chroma is coded
+ * after all luma. luma_nz: whether the luma block has a nonzero level
+ * (the coded flags' context). */
+static double chroma_cost(const EncFrame *f, int bx, int by, int kind, int dir,
+                          SntMV mvf, SntMV mvb, int luma_nz) {
+    if (!f->src_c[0]) return 0;
+    int cbx = bx * 4, cby = by * 4, inter = kind != CAND_INTRA, u_coded = 0;
+    double sse = 0, bits = 0;
+    for (int plane = 0; plane < 2; plane++) {
+        const uint8_t *sp = f->src_c[plane];
+        uint8_t pred[16];
+        int16_t blk[16];
+        if (inter)
+            snt_pred_chroma4(f->cref_f[plane], f->cref_b[plane], f->cw, f->ch, cbx, cby, dir,
+                             mvf, mvb, pred);
+        for (int dy = 0; dy < 4; dy++)
+            for (int dx = 0; dx < 4; dx++) {
+                int py = cby + dy, px = cbx + dx;
+                blk[dy * 4 + dx] = (py < f->ch && px < f->cw)
+                    ? (int16_t)(sp[py * f->stride_uv + px] - (inter ? pred[dy * 4 + dx] : 128)) : 0;
+            }
+        if (kind == CAND_SKIP) {
+            for (int k = 0; k < 16; k++) sse += (double)blk[k] * blk[k];
+            continue;
+        }
+        int16_t c[16], v[16], lev[16];
+        snt_dct_fwd_2d_ref(blk, 4, 4, c);
+        for (int i = 0; i < 16; i++) v[i] = c[snt_zigzag4[i]];
+        if (!inter && (cbx > 0 || cby > 0)) {
+            int16_t dcn[2];
+            for (int nb = 0; nb < 2; nb++) {
+                int nx = nb ? cbx : cbx - 4, ny = nb ? cby - 4 : cby;
+                if (nx < 0 || ny < 0) { dcn[nb] = 0; continue; }
+                uint8_t n16[16];
+                for (int k = 0; k < 16; k++)
+                    n16[k] = sp[(ny + k / 4) * f->stride_uv + nx + k % 4];
+                dcn[nb] = snt_pred_dc4c(n16);
+            }
+            v[0] -= cbx > 0 && cby > 0 ? (int16_t)((dcn[0] + dcn[1] + 1) >> 1)
+                                       : (cbx > 0 ? dcn[0] : dcn[1]);
+        }
+        double s1, b1;
+        int pctx = plane == 0 ? 0 : 1 + u_coded;
+        int cc = chroma_rd(f->cs, f->cstep, CHROMA_LAMBDA * f->lambda, inter,
+                           &f->cs->cflag[inter][luma_nz][pctx], v, lev, &s1, &b1);
+        if (plane == 0) u_coded = cc;
+        sse += s1;
+        bits += b1;
+    }
+    return sse + f->lambda * bits;
+}
+
 /* Cost (distortion + lambda * bits) of 8x8 block (bx, by) coded inter in
  * direction d at (mvf, mvb), with its mode flags (agreement class ac) and
  * MV deltas; its reconstruction in rec */
@@ -686,7 +762,7 @@ static double inter8_cost(const EncFrame *f, int bx, int by, const int16_t *src,
     mc_residual(f, bx, by, d, mvf, mvb, src, vw, vh, p, res);
     code_luma(f->cs, NULL, f->step, 1, res, td0, 0, p, &lc);
     memcpy(rec, lc.recon, sizeof(lc.recon));
-    return block_sse(src, lc.recon, vw, vh)
+    return block_sse(src, lc.recon, vw, vh) + chroma_cost(f, bx, by, CAND_INTER, d, mvf, mvb, lc.nz)
          + f->lambda * (cdf_bits(&f->cs->inter[ac], 1) + cdf_bits(&f->cs->iskip[ac], 0)
                         + inter_mv_bits(f, d, mvf, mvb, pf, pb) + lc.bits);
 }
@@ -704,7 +780,7 @@ static double inter16_cost(const EncFrame *f, int bx0, int by0, int mac, int d, 
         load_src(f, bx, by, src, &vw, &vh);
         mc_residual(f, bx, by, d, mvf, mvb, src, vw, vh, p, res);
         code_luma(f->cs, NULL, f->step, 1, res, td0, 0, p, &lc);
-        dist += block_sse(src, lc.recon, vw, vh);
+        dist += block_sse(src, lc.recon, vw, vh) + chroma_cost(f, bx, by, CAND_INTER, d, mvf, mvb, lc.nz);
         bits += lc.bits;
     }
     return dist + f->lambda * (cdf_bits(&f->cs->mbmode[mac], SNT_MB_INTER16) + bits
@@ -750,7 +826,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
         skip_motion(f, bx, by, &sdir, &smf, &smb);
         snt_pred_luma8(f->ref_f, f->ref_b, px0, py0, sdir, smf, smb, p);
         for (int k = 0; k < 64; k++) p16[k] = p[k];
-        double j = block_sse(src, p16, vw, vh)
+        double j = block_sse(src, p16, vw, vh) + chroma_cost(f, bx, by, CAND_SKIP, sdir, smf, smb, 0)
                  + f->lambda * (cdf_bits(&cs->inter[ac], 1) + cdf_bits(&cs->iskip[ac], 1));
         if (j < best_j) {
             best_j = j; bc->kind = CAND_SKIP; bc->dir = sdir; bc->mvf = smf; bc->mvb = smb;
@@ -805,6 +881,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
         }
     }
 
+    double chroma_intra = f->is_inter ? chroma_cost(f, bx, by, CAND_INTRA, 0, zero, zero, 1) : 0;
     for (int m = 0; m < SNT_NUM_IPRED; m++) {
         td_prediction(f, bx, by, m, td_pred);
         LumaCode lc;
@@ -812,6 +889,8 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
         double bits = cdf_bits(&cs->imode[f->is_inter], (uint16_t)m) + lc.bits
                     + (f->is_inter ? cdf_bits(&cs->inter[ac], 0) : 0);
         double j = block_sse(src, lc.recon, vw, vh) + f->lambda * bits;
+        if (f->is_inter)
+            j += chroma_intra;
         if (j < best_j) {
             best_j = j; bc->kind = CAND_INTRA; bc->imode = m; bc->dir = 0;
             bc->mvf = zero; bc->mvb = zero;
@@ -955,7 +1034,7 @@ static double eval_mb16(EncFrame *f, int bx0, int by0, SntMV pf, SntMV pb, SntMV
         load_src(f, bx, by, src, &vw, &vh);
         mc_residual(f, bx, by, sdir, smf, smb, src, vw, vh, p, res);
         for (int k = 0; k < 64; k++) p16[k] = p[k];
-        d_skip += block_sse(src, p16, vw, vh);
+        d_skip += block_sse(src, p16, vw, vh) + chroma_cost(f, bx, by, CAND_SKIP, sdir, smf, smb, 0);
     }
 
     /* At the searched MVs and the other candidates */
@@ -1219,11 +1298,26 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
      * macroblock in Z order (top-left, top-right, bottom-left, bottom-right).
      * P-frames predict from the newest anchor; B-frames forward from the
      * older anchor and backward from the newest. */
+    /* Chroma step and references (the chroma pass below uses them too).
+     * Reduce chroma QP offset for inter frames to prevent quantization
+     * cascade (drift). +4 for key frames (no drift), +1 for inter. */
+    int cqp_off = is_inter ? 1 : ctx->header.chroma_qp_offset;
+    int cqp = fhdr.base_qp + cqp_off;
+    if (cqp < 0) cqp = 0; if (cqp > 63) cqp = 63;
+    uint16_t cstep = snt_qp_to_step((uint8_t)cqp);
+    const uint8_t *chroma_ref[2] = {is_bidi ? ctx->ref_old_u : ctx->ref_u,
+                                     is_bidi ? ctx->ref_old_v : ctx->ref_v};
+    const uint8_t *chroma_ref_b[2] = {is_bidi ? ctx->ref_u : NULL, is_bidi ? ctx->ref_v : NULL};
+    int c_decide = input_u && input_v && is_inter && chroma_ref[0];
+
     EncFrame ef = { ctx, cs, &sink, input_y, work, recon, width, height, pad_w, blk_cols,
                     is_inter, is_bidi,
                     is_bidi ? &sp_old : &sp_new, is_bidi ? &sp_new : NULL, gmf, gmb,
                     step, RD_LAMBDA * (double)step * step, mv_field, mvb_field, blk_dir,
-                    blk_is_inter, blk_is_skip, acdc, coded, luma_nz, {{0, 0}}, {{0, 0}}, 0 };
+                    blk_is_inter, blk_is_skip, acdc, coded, luma_nz,
+                    { c_decide ? input_u : NULL, c_decide ? input_v : NULL }, stride_uv, cw, ch,
+                    { chroma_ref[0], chroma_ref[1] }, { chroma_ref_b[0], chroma_ref_b[1] }, cstep,
+                    {{0, 0}}, {{0, 0}}, 0 };
     int mb_cols = (blk_cols + 1) / 2, mb_rows = (blk_rows + 1) / 2;
     for (int mb = 0; mb < mb_cols * mb_rows; mb++)
         code_macroblock(&ef, mb % mb_cols, mb / mb_cols, blk_rows);
@@ -1247,18 +1341,8 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         chroma_rec[0] = (uint8_t *)calloc((size_t)cw * ch, 1);
         chroma_rec[1] = (uint8_t *)calloc((size_t)cw * ch, 1);
         int cblk_cols = cpad_w / cblk;
-        /* Reduce chroma QP offset for inter frames to prevent quantization
-         * cascade (drift). +4 for key frames (no drift), +1 for inter. */
-        int cqp_off = is_inter ? 1 : ctx->header.chroma_qp_offset;
-        int cqp = fhdr.base_qp + cqp_off;
-        if (cqp < 0) cqp = 0; if (cqp > 63) cqp = 63;
-        uint16_t cstep = snt_qp_to_step((uint8_t)cqp);
-
         const uint8_t *chroma_in[2] = {input_u, input_v};
         uint8_t *u_coded = (uint8_t *)calloc((size_t)cblk_cols * (cpad_h / cblk), 1);
-        const uint8_t *chroma_ref[2] = {is_bidi ? ctx->ref_old_u : ctx->ref_u,
-                                         is_bidi ? ctx->ref_old_v : ctx->ref_v};
-        const uint8_t *chroma_ref_b[2] = {is_bidi ? ctx->ref_u : NULL, is_bidi ? ctx->ref_v : NULL};
         for (int plane = 0; plane < 2; plane++) {
             const uint8_t *cp = chroma_in[plane];
             const uint8_t *cr = chroma_ref[plane]; /* may be NULL on first frame */

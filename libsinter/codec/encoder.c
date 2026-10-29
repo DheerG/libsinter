@@ -924,8 +924,8 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
             }
             free(c_dc_above);
         }
-        snt_deblock_chroma(chroma_rec[0], cw, ch, cw, cstep, is_inter ? blk_is_skip : NULL, mv_field, blk_cols);
-        snt_deblock_chroma(chroma_rec[1], cw, ch, cw, cstep, is_inter ? blk_is_skip : NULL, mv_field, blk_cols);
+        snt_deblock_chroma(chroma_rec[0], cw, ch, cw, cstep, is_inter ? blk_is_skip : NULL, blk_cols);
+        snt_deblock_chroma(chroma_rec[1], cw, ch, cw, cstep, is_inter ? blk_is_skip : NULL, blk_cols);
     }
 
     /* ── Write the range-coded bytes, then the overflow bits ───────── */
@@ -956,7 +956,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         for (int x = 0; x < width; x++)
             rec_y[y * width + x] = snt_clip_pixel((int32_t)recon[y * pad_w + x]);
     snt_deblock_luma(rec_y, width, height, width, step,
-                     is_inter ? blk_is_skip : NULL, mv_field, blk_cols);
+                         is_inter ? blk_is_skip : NULL, blk_cols);
     if (!ctx->last_y || ctx->ref_w != width || ctx->ref_h != height) {
         free(ctx->last_y); free(ctx->last_u); free(ctx->last_v);
         ctx->last_y = (uint8_t *)malloc((size_t)width * height);

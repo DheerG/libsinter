@@ -80,6 +80,7 @@ static void encode_clip(const char *path, int max_frames, int qp) {
     ctx.header.num_tile_cols = 1;
     ctx.header.num_tile_rows = 1;
     ctx.header.chroma_qp_offset = 4;
+    ctx.keyint = KEYINT;
     uint8_t *bs = malloc(ls * 4);
     for (int i = 0; i < no; i++) {
         int d = order[i];

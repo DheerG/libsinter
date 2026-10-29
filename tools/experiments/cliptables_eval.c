@@ -93,6 +93,7 @@ int main(int argc, char **argv) {
         memset(&ectx, 0, sizeof ectx);
         ectx.header.base_qp = (uint8_t)qp;
         ectx.header.chroma_qp_offset = 4;
+        ectx.keyint = keyint;
         if (pass == 1) { ectx.clip_tables = &tables; ectx.clip_tables_send = 1; }
         SntDecoderCtx dctx;
         memset(&dctx, 0, sizeof dctx);

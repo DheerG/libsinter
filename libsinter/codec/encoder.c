@@ -222,6 +222,7 @@ typedef struct {
     int16_t recon[64];         /* reconstructed pixels (prediction block added) */
     int16_t dc_recon;          /* reconstructed DC coefficient */
     double  bits;              /* estimated bits (estimate mode only) */
+    int     nz;                /* any nonzero level (the DC or a coded band) */
 } LumaCode;
 
 /* Code one 8x8 luma block's DC and bands.
@@ -394,6 +395,9 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
                 recon_ac[i] = s_recon[i];
     }
 
+    out->nz = dc_level != 0;
+    for (int b = 0; b < NUM_BANDS; b++) out->nz |= coded[b];
+
     /* Reconstruct coefficients, then pixels */
     out->recon_coeffs[0] = out->dc_recon;
     for (int i = 0; i < 63; i++)
@@ -406,6 +410,65 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
         for (int k = 0; k < 64; k++)
             out->recon[k] += pred[k];
     out->bits = bits;
+}
+
+/* ── Chroma block coding ───────────────────────────────────────────── */
+#ifndef CHROMA_LAMBDA
+#define CHROMA_LAMBDA 0.25
+#endif
+
+/* Bits for a chroma level at zigzag index i, with the models' current
+ * state */
+static double chroma_level_bits(SntCdfSet *cs, int t, int i, int16_t v, int z_known) {
+    SntLevelBin bins[2 * SNT_LEVEL_MAX_CAT + 4];
+    int n = snt_level_bins(v, z_known, bins);
+    double bits = 0;
+    for (int k = 0; k < n; k++) bits += cdf_bits(snt_clevel_model(cs, t, i, &bins[k]), bins[k].bit);
+    return bits;
+}
+
+/* Code one 4x4 chroma block. v: its coefficients in zigzag order, the DC
+ * prediction subtracted. Each level is chosen by RD as in code_luma; then
+ * the block is coded (flag 1) or all zero (flag 0), whichever costs
+ * least. Emits the flag (model flag) and the levels. out: reconstructed
+ * coefficients, zigzag order, DC prediction not added. Returns whether
+ * the block is coded. */
+static int code_chroma4(SntCdfSet *cs, SymSink *sink, uint16_t cstep, double lambda, int t,
+                        SntModel *flag, const int16_t *v, int16_t *out) {
+    int16_t lev[16];
+    double sse_coded = 0, sse_zero = 0, bits = 0;
+    int nz = 0;
+    for (int i = 0; i < 16; i++) {
+        /* The last level is known nonzero if the others are zero */
+        int z_known = i == 15 && !nz;
+        int16_t cand[3];
+        int nc = rd_candidates(pvq_quantize_dc(v[i], cstep, 1), z_known, cand);
+        double best = 1e300, best_bits = 0, best_sse = 0;
+        for (int c = 0; c < nc; c++) {
+            double e = (double)v[i] - pvq_dequantize_dc(cand[c], cstep);
+            double cb = chroma_level_bits(cs, t, i, cand[c], z_known);
+            if (e * e + lambda * cb < best) {
+                best = e * e + lambda * cb; best_bits = cb; best_sse = e * e; lev[i] = cand[c];
+            }
+        }
+        bits += best_bits;
+        sse_coded += best_sse;
+        sse_zero += (double)v[i] * v[i];
+        nz |= lev[i] != 0;
+    }
+    int coded = nz && sse_coded + lambda * (bits + cdf_bits(flag, 1))
+                      < sse_zero + lambda * cdf_bits(flag, 0);
+    rec(sink, flag, (uint16_t)coded);
+    int any = 0;
+    for (int i = 0; i < 16; i++) {
+        out[i] = coded ? pvq_dequantize_dc(lev[i], cstep) : 0;
+        if (!coded) continue;
+        SntLevelBin bins[2 * SNT_LEVEL_MAX_CAT + 4];
+        int nb = snt_level_bins(lev[i], i == 15 && !any, bins);
+        for (int k = 0; k < nb; k++) rec(sink, snt_clevel_model(cs, t, i, &bins[k]), bins[k].bit);
+        any |= lev[i] != 0;
+    }
+    return coded;
 }
 
 /* ── Per-frame luma coding state ───────────────────────────────────── */
@@ -430,6 +493,7 @@ typedef struct {
     int16_t       *acdc;     /* per block: SNT_ACDC_STATE coefficients of the
                                 reconstruction, for intra prediction */
     uint8_t       *coded;    /* per block: coded yet? */
+    uint8_t       *luma_nz;  /* per block: any nonzero luma level? (chroma flag context) */
     /* Extra MV candidates for the blocks being decided (encoder decisions):
      * the macroblock's 16x16-searched MVs for its 8x8 blocks, the 8x8
      * blocks' MVs for the 16x16 candidate */
@@ -802,6 +866,7 @@ static void emit_inter_body(EncFrame *f, int bx, int by, int dir, SntMV mvf, Snt
     memset(td_pred, 0, sizeof(td_pred));
     code_luma(f->cs, f->sink, f->step, 1, res, td_pred, 0, pred, &lc);
     finish_block(f, bx, by, lc.recon, 0, dir, mvf, mvb);
+    f->luma_nz[by * f->blk_cols + bx] = (uint8_t)lc.nz;
 }
 
 static void emit_mvd(EncFrame *f, SntMV mv, SntMV mv_pred) {
@@ -859,6 +924,7 @@ static void emit_block(EncFrame *f, int bx, int by, const BlockChoice *bc) {
     LumaCode lc;
     code_luma(cs, f->sink, f->step, 0, src, td_pred, 1, NULL, &lc);
     finish_block(f, bx, by, lc.recon, 0, 0, (SntMV){0, 0}, (SntMV){0, 0});
+    f->luma_nz[by * f->blk_cols + bx] = (uint8_t)lc.nz;
 }
 
 /* A 16x16 inter candidate */
@@ -1016,9 +1082,12 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
  *     IF coded: FOR i=0..n-1: the level's binary decisions (levels.h);
  *               the last level's Z decision is skipped if the others are 0
  * FOR each chroma plane (U, V):
- *   FOR each 4x4 block:
- *     REC(cdc[ct], s2u(dc_level))
- *     FOR i=1..15: REC(cac[ct][snt_cac_group(i)], s2u(level))
+ *   FOR each 4x4 block not skipped:
+ *     REC(cflag[ct][luma_nz][pctx], coded)  // luma_nz: co-located luma block has a
+ *                                           // nonzero level; pctx: 0 for U, 1 + U's flag for V
+ *     IF coded: FOR i=0..15 (zigzag, DC prediction subtracted from i=0): the
+ *               level's binary decisions (levels.h, chroma models); the
+ *               last level's Z decision is skipped if the others are 0
  */
 
 int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
@@ -1138,6 +1207,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
      * reconstruction, and whether the block is coded yet */
     int16_t *acdc = (int16_t *)calloc((size_t)total_blocks * SNT_ACDC_STATE, sizeof(int16_t));
     uint8_t *coded = (uint8_t *)calloc(total_blocks, 1);
+    uint8_t *luma_nz = (uint8_t *)calloc(total_blocks, 1);
 
     /* MV fields (forward, backward) and prediction directions, for MV
      * prediction, chroma and deblocking */
@@ -1153,7 +1223,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     is_inter, is_bidi,
                     is_bidi ? &sp_old : &sp_new, is_bidi ? &sp_new : NULL, gmf, gmb,
                     step, RD_LAMBDA * (double)step * step, mv_field, mvb_field, blk_dir,
-                    blk_is_inter, blk_is_skip, acdc, coded, {{0, 0}}, {{0, 0}}, 0 };
+                    blk_is_inter, blk_is_skip, acdc, coded, luma_nz, {{0, 0}}, {{0, 0}}, 0 };
     int mb_cols = (blk_cols + 1) / 2, mb_rows = (blk_rows + 1) / 2;
     for (int mb = 0; mb < mb_cols * mb_rows; mb++)
         code_macroblock(&ef, mb % mb_cols, mb / mb_cols, blk_rows);
@@ -1185,6 +1255,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         uint16_t cstep = snt_qp_to_step((uint8_t)cqp);
 
         const uint8_t *chroma_in[2] = {input_u, input_v};
+        uint8_t *u_coded = (uint8_t *)calloc((size_t)cblk_cols * (cpad_h / cblk), 1);
         const uint8_t *chroma_ref[2] = {is_bidi ? ctx->ref_old_u : ctx->ref_u,
                                          is_bidi ? ctx->ref_old_v : ctx->ref_v};
         const uint8_t *chroma_ref_b[2] = {is_bidi ? ctx->ref_u : NULL, is_bidi ? ctx->ref_v : NULL};
@@ -1263,29 +1334,24 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     else if (cbx > 0) c_dc_pred = c_dc_left;
                     else if (cby > 0) c_dc_pred = c_dc_above[ci];
 
-                    int16_t dc_res = ccoeffs[0] - c_dc_pred;
-                    int16_t cdc_level = pvq_quantize_dc(dc_res, cstep, 1);
+                    /* Coded flag (context: block type, luma block coded,
+                     * plane and for V whether U's block is coded), then the
+                     * levels in zigzag order */
+                    int16_t v[16], vrec[16], crecon_coeffs[16];
+                    for (int i = 0; i < 16; i++) v[i] = ccoeffs[snt_zigzag4[i]];
+                    v[0] -= c_dc_pred;
+                    int bi = cj * cblk_cols + ci;
+                    int pctx = plane == 0 ? 0 : 1 + u_coded[bi];
+                    int cc = code_chroma4(cs, &sink, cstep, CHROMA_LAMBDA * RD_LAMBDA * (double)step * step, c_bt,
+                                          &cs->cflag[c_bt][luma_nz[luma_blk_idx]][pctx], v, vrec);
+                    if (plane == 0) u_coded[bi] = (uint8_t)cc;
+                    for (int i = 0; i < 16; i++) crecon_coeffs[snt_zigzag4[i]] = vrec[i];
+                    crecon_coeffs[0] += c_dc_pred;
 
-                    uint16_t cdc_sym = s2u(cdc_level);
-                    REC(cs->cdc[c_bt], cdc_sym);
-                    if (cdc_sym == 255)
-                        snt_bw_put_sexpgolomb(&ov, cdc_level);
-
-                    int16_t cdc_recon = pvq_dequantize_dc(cdc_level, cstep) + c_dc_pred;
+                    int16_t cdc_recon = crecon_coeffs[0];
                     /* Neighbours see the pixel-domain DC (inter: add the prediction's) */
                     c_dc_left = c_bt ? cdc_recon + snt_pred_dc4c(c_mc) : cdc_recon;
                     c_dc_above[ci] = c_dc_left;
-
-                    int16_t crecon_coeffs[16];
-                    crecon_coeffs[0] = cdc_recon;
-                    for (int i = 1; i < 16; i++) {
-                        int16_t ac_level = pvq_quantize_dc(ccoeffs[i], cstep, 1);
-                        uint16_t ac_sym = s2u(ac_level);
-                        REC(cs->cac[c_bt][snt_cac_group(i)], ac_sym);
-                        if (ac_sym == 255)
-                            snt_bw_put_sexpgolomb(&ov, ac_level);
-                        crecon_coeffs[i] = pvq_dequantize_dc(ac_level, cstep);
-                    }
 
                     /* Reconstruct chroma for reference frame */
                     int16_t crecon_blk[16];
@@ -1310,6 +1376,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
             }
             free(c_dc_above);
         }
+        free(u_coded);
         snt_deblock_chroma(chroma_rec[0], cw, ch, cw, cstep, is_inter ? blk_is_skip : NULL, blk_cols);
         snt_deblock_chroma(chroma_rec[1], cw, ch, cw, cstep, is_inter ? blk_is_skip : NULL, blk_cols);
     }
@@ -1396,6 +1463,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     free(recon);
     free(acdc);
     free(coded);
+    free(luma_nz);
     free(mv_field);
     free(mvb_field);
     free(blk_dir);

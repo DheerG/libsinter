@@ -19,4 +19,7 @@ static const uint8_t snt_zigzag8[64] = {
     58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 };
 
+/* snt_zigzag4[k]: the same zigzag on a 4x4 block (chroma) */
+static const uint8_t snt_zigzag4[16] = { 0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15 };
+
 #endif /* SNT_SCAN_H */

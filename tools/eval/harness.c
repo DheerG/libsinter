@@ -13,11 +13,12 @@
  * encoder's reconstruction differs from the decoder's output. ENC_MS and
  * DEC_MS are milliseconds per frame.
  *
- * usage: harness CLIP.y4m QP FRAMES [-k KEYINT] [-b BFRAMES] [-bits FILE]
+ * usage: harness CLIP.y4m QP FRAMES [-k KEYINT] [-b BFRAMES] [-bits FILE] [-o OUT.y4m]
  *        harness -compare SOURCE.y4m DECODED.y4m FRAMES
  *
  * -bits (library built with -DSNT_TRAIN_STATS): write the ideal bits of
  * every model, with the model groups of SntCdfSet, for bits.py.
+ * -o: write the decoded frames, in display order.
  * -compare: the same quality measures for another codec's output, printed
  * as "Y U V SSIM".
  */
@@ -136,16 +137,17 @@ static int compare(const char *src_path, const char *dec_path, int max_frames) {
 int main(int argc, char **argv) {
     if (argc == 5 && !strcmp(argv[1], "-compare")) return compare(argv[2], argv[3], atoi(argv[4]));
     if (argc < 4) {
-        fprintf(stderr, "usage: %s CLIP.y4m QP FRAMES [-k KEYINT] [-b BFRAMES] [-bits FILE]\n"
+        fprintf(stderr, "usage: %s CLIP.y4m QP FRAMES [-k KEYINT] [-b BFRAMES] [-bits FILE] [-o OUT.y4m]\n"
                         "       %s -compare SOURCE.y4m DECODED.y4m FRAMES\n", argv[0], argv[0]);
         return 1;
     }
     int qp = atoi(argv[2]), keyint = 30, bframes = 2;
-    const char *bits_path = NULL;
+    const char *bits_path = NULL, *out_path = NULL;
     for (int i = 4; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "-k")) keyint = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "-b")) bframes = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "-bits")) bits_path = argv[i + 1];
+        else if (!strcmp(argv[i], "-o")) out_path = argv[i + 1];
     }
     int w, h, n;
     uint8_t *src = read_clip(argv[1], atoi(argv[3]), &w, &h, &n);
@@ -179,6 +181,7 @@ int main(int argc, char **argv) {
     memset(&dctx, 0, sizeof dctx);
 
     uint8_t *bs = malloc(ls * 4), *out = malloc(fs);
+    uint8_t *decoded = out_path ? malloc(fs * n) : NULL;  /* display order */
     double q[4] = {0, 0, 0, 0}, enc_ms = 0, dec_ms = 0;
     uint64_t bytes = 20 + 4ull * n, type_bytes[3] = {0, 0, 0};
     size_t mm = 0;
@@ -211,6 +214,18 @@ int main(int argc, char **argv) {
         q[1] += psnr(u, out + ls, cs);
         q[2] += psnr(v, out + ls + cs, cs);
         q[3] += ssim(y, out, w, h);
+        if (decoded) memcpy(decoded + fs * d, out, fs);
+    }
+    if (decoded) {
+        FILE *of = fopen(out_path, "wb");
+        if (!of) return 1;
+        fprintf(of, "YUV4MPEG2 W%d H%d F30000:1001 Ip A1:1 C420jpeg\n", w, h);
+        for (int i = 0; i < n; i++) {
+            fprintf(of, "FRAME\n");
+            fwrite(decoded + fs * i, 1, fs, of);
+        }
+        fclose(of);
+        free(decoded);
     }
     printf("%d %d %llu %llu %llu %llu %.4f %.4f %.4f %.6f %zu %.1f %.2f\n", qp, n,
            (unsigned long long)bytes, (unsigned long long)type_bytes[0],
@@ -225,7 +240,7 @@ int main(int argc, char **argv) {
 #define G(f) fprintf(bf, "group %s %zu %zu\n", #f, offsetof(SntCdfSet, f) / sizeof(SntModel), \
                      sizeof(((SntCdfSet *)0)->f) / sizeof(SntModel))
         G(dc); G(acz); G(acs); G(acg); G(acx); G(acm); G(band); G(imode); G(mbmode); G(bdir);
-        G(inter); G(iskip); G(mvx); G(mvy); G(cdc); G(cac);
+        G(inter); G(iskip); G(mvx); G(mvy); G(cflag); G(cz); G(cs); G(cg); G(cx); G(cm);
 #undef G
         fprintf(bf, "frametypes %llu %llu %llu\n", (unsigned long long)type_bytes[0],
                 (unsigned long long)type_bytes[1], (unsigned long long)type_bytes[2]);

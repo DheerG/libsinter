@@ -16,14 +16,23 @@ This file is the work plan for the `more-compression` branch, the rules for each
 
 ## Measurement
 
-- **Step 0.** The harness of the last round lived in a temporary folder. Put it in `tools/eval/` first:
-  - an in-process encode and decode in sinterenc's GOP structure (key frame every 30, 2 B-frames), with an encoder/decoder mismatch check;
-  - a run script, a BD-rate script and an x264 runner;
-  - the bit breakdown below.
-  Clips go in `clips/` (`*.y4m` is already ignored), downloaded from `https://media.xiph.org/video/derf/y4m/<name>_cif.y4m`.
-- **Tuning:** foreman, mobile and akiyo, first 60 frames, QP 8, 12, 16, 20, 24 and 28. BD-rate is the classic Bjøntegaard cubic fit over the overlapping range. PSNR is the mean of per-frame PSNR; YUV weights Y:U:V as 6:1:1; SSIM is ffmpeg's luma SSIM.
+The harness is in `tools/eval/` (Step 0, done). It reproduces the published ratios against x264 exactly.
+
+```bash
+tools/eval/fetch_clips.sh                 # Xiph CIF clips, first 150 frames, into clips/
+tools/eval/run.sh base HEAD               # tuning points of a commit (or "." for the working tree)
+tools/eval/run.sh new                     # the working tree
+python3 tools/eval/bd.py base new         # BD-rates: Y, YUV, SSIM per clip and mean, mismatches, speed
+BITS=1 tools/eval/run.sh bits             # bit breakdown ...
+python3 tools/eval/bits.py build/eval/bits.bits   # ... by frame type and model group
+tools/eval/x264.sh x264                   # x264 points (crf as a second argument: MB-tree on)
+CLIPS="foreman mobile akiyo bus news" QPS="4 8 12 16 20 24 28 32" FRAMES=150 tools/eval/run.sh full
+python3 tools/eval/bd.py x264 full --ratio
+```
+
+- **Tuning:** foreman, mobile and akiyo, first 60 frames, QP 8, 12, 16, 20, 24 and 28 (run.sh's defaults). BD-rate is the classic Bjøntegaard cubic fit over the overlapping range. PSNR is the mean of per-frame PSNR; YUV weights Y:U:V as 6:1:1; SSIM is luma SSIM computed as ffmpeg does, in dB for the BD-rate.
 - **Reports against x264:** all five clips, 150 frames, Sinter QP 4 to 32 in steps of 4, and x264 `-preset medium -tune psnr -g 30 -qp 16` to `44`. Bus and news are held out: measure them only at the end, never to tune.
-- **Bit breakdown:** build the library with `-DSNT_TRAIN_STATS` and call `snte_bits_dump()` after encoding. It gives the ideal code length of every model, and the header and escape bytes by frame type.
+- **Luma against YUV.** A parameter that moves bits between luma and chroma (lambda, chroma QP) shows a luma gain with a YUV loss, or the reverse. That is a trade, not a gain: keep such a change only if both improve.
 
 ### Where the bits went at the start (main at 38f3a7d, QP 28, 60 frames)
 

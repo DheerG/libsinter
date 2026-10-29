@@ -14,7 +14,7 @@
 #define SNT_CDF_SET_H
 
 #include "../core/entropy/rangecoder.h"
-#include "../core/prediction/intra_spatial.h"
+#include "../core/prediction/intra_acdc.h"
 
 #define SNT_NUM_BANDS   16
 #define SNT_AC_GROUPS    4  /* luma AC contexts: band / 4 */

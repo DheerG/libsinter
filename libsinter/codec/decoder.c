@@ -36,18 +36,38 @@ static int16_t dec_mvd(RansDecoder *rd, RansCDF *cdf, SntBitReader *ovr) {
     return sym == 255 ? (int16_t)snt_br_get_sexpgolomb(ovr) : u2s(sym);
 }
 
+/* Inter predictions, or zeros for a malformed stream that lacks a reference */
+static void dec_pred_luma(const uint8_t *rf, const uint8_t *rb, int w, int h, int x0, int y0,
+                          int dir, SntMV mvf, SntMV mvb, uint8_t *pred) {
+    if (((dir & SNT_DIR_FWD) && !rf) || ((dir & SNT_DIR_BWD) && !rb)) {
+        memset(pred, 0, 64);
+        return;
+    }
+    snt_pred_luma8(rf, rb, w, h, x0, y0, dir, mvf, mvb, pred);
+}
+
+static void dec_pred_chroma(const uint8_t *rf, const uint8_t *rb, int w, int h, int x0, int y0,
+                            int dir, SntMV mvf, SntMV mvb, uint8_t *pred) {
+    if (((dir & SNT_DIR_FWD) && !rf) || ((dir & SNT_DIR_BWD) && !rb)) {
+        memset(pred, 128, 16);
+        return;
+    }
+    snt_pred_chroma4(rf, rb, w, h, x0, y0, dir, mvf, mvb, pred);
+}
+
 /*
  * Symbol consumption order (must match encoder exactly):
  *
  * FOR each 16x16 macroblock (raster):
- *   IF inter frame AND full macroblock: DEC(mbmode); IF INTER16: DEC(mvx, mvy)
+ *   IF inter frame AND full macroblock: DEC(mbmode)
+ *     IF INTER16: [B: DEC(bdir)], then DEC(mvx, mvy) per used direction
  *   FOR each 8x8 block in Z order (SKIP16/INTER16: no per-block mode symbols):
  *   IF inter frame (split macroblock):
  *     DEC(inter) → inter_flag
  *     IF inter_flag:
  *       DEC(iskip) → skip_flag
- *       IF skip: MC prediction at the predicted MV, continue
- *       IF coded: DEC(mvx), DEC(mvy) → MV delta
+ *       IF skip: prediction at the predicted MV(s), continue (B: bi-directional)
+ *       IF coded: [B: DEC(bdir)], then DEC(mvx), DEC(mvy) per used direction
  *   IF intra block: DEC(imode[is_inter_frame]) → mode (SNT_IPRED_*)
  *   DEC(dc[t]) → dc_level (residual for inter, absolute for intra)
  *   FOR band b=0..15: mode[t][b], then ac[t][b/4] or skip[t][b] + gain[t]
@@ -74,7 +94,12 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     int blk_cols = pad_w / BLK;
     int blk_rows = pad_h / BLK;
 
-    int is_inter = (ctx->header.frame_type == SNT_FRAME_INTER);
+    int is_inter = (ctx->header.frame_type != SNT_FRAME_KEY);
+    int is_bidi = (ctx->header.frame_type == SNT_FRAME_BIDI);
+    /* P-frames predict from the newest anchor; B-frames forward from the
+     * older anchor and backward from the newest */
+    const uint8_t *ref_f = is_bidi ? ctx->ref_old_y : ctx->ref_y;
+    const uint8_t *ref_b = is_bidi ? ctx->ref_y : NULL;
     uint16_t step = snt_qp_to_step(ctx->header.base_qp);
 
     /* ── SECTION A: Read fixed header ──────────────────────────────── */
@@ -99,11 +124,16 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     RansDecoder rdec;
     rans_dec_init(&rdec, rans_buf, rans_bytes, 1);
 
-    /* ── Entropy contexts: reset on key frames, carried across inter ── */
+    /* ── Entropy contexts: reset on key frames, carried across inter ──
+     * B-frames keep their own set, carried from B-frame to B-frame. */
     if (!ctx->cdf_state)
         ctx->cdf_state = malloc(sizeof(SntCdfSet));
-    SntCdfSet *cs = (SntCdfSet *)ctx->cdf_state;
-    if (!is_inter || !ctx->cdf_state_valid)
+    if (!ctx->cdf_state_b)
+        ctx->cdf_state_b = malloc(sizeof(SntCdfSet));
+    if (!is_inter)
+        ctx->cdf_state_b_valid = 0;
+    SntCdfSet *cs = (SntCdfSet *)(is_bidi ? ctx->cdf_state_b : ctx->cdf_state);
+    if (!is_inter || !(is_bidi ? ctx->cdf_state_b_valid : ctx->cdf_state_valid))
         snt_cdf_set_init(cs);
 
     uint16_t _dec_sym;
@@ -122,7 +152,9 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     uint8_t *coded = (uint8_t *)calloc(total_blocks_d, 1);
 
     /* MV field and block flags for chroma inter derivation */
-    SntMV *mv_field = (SntMV *)calloc(blk_cols * blk_rows, sizeof(SntMV));
+    SntMV *mv_field = (SntMV *)calloc(blk_cols * blk_rows, sizeof(SntMV));   /* forward MVs */
+    SntMV *mvb_field = (SntMV *)calloc(blk_cols * blk_rows, sizeof(SntMV));  /* backward MVs */
+    uint8_t *blk_dir = (uint8_t *)calloc(blk_cols * blk_rows, 1);            /* SNT_DIR_*, 0 intra */
     int *blk_is_inter = (int *)calloc(blk_cols * blk_rows, sizeof(int));
     int *blk_is_skip = (int *)calloc(blk_cols * blk_rows, sizeof(int));
 
@@ -137,14 +169,25 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         /* Macroblock mode (inter frames, full macroblocks only). The 16x16
          * predictor comes from neighbours outside the macroblock. */
         int bx0 = (mb % mb_cols) * 2, by0 = (mb / mb_cols) * 2;
-        int mb_mode = SNT_MB_SPLIT;
-        SntMV mv_pred16 = {0, 0}, mv16 = {0, 0};
+        int mb_mode = SNT_MB_SPLIT, mb_dir = SNT_DIR_FWD;
+        SntMV mb_mvf = {0, 0}, mb_mvb = {0, 0};
         if (is_inter && bx0 + 1 < blk_cols && by0 + 1 < blk_rows) {
-            mv_pred16 = snt_mv_predict_at(mv_field, coded, blk_cols, bx0, by0);
+            mb_mvf = snt_mv_predict_at(mv_field, coded, blk_cols, bx0, by0);
+            if (is_bidi)
+                mb_mvb = snt_mv_predict_at(mvb_field, coded, blk_cols, bx0, by0);
             mb_mode = DEC(cs->mbmode);
+            /* SKIP16 predicts at the predicted MV(s): bi-directional in B-frames */
+            mb_dir = is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
             if (mb_mode == SNT_MB_INTER16) {
-                mv16.x = dec_mvd(&rdec, &cs->mvx, &ovr) + mv_pred16.x;
-                mv16.y = dec_mvd(&rdec, &cs->mvy, &ovr) + mv_pred16.y;
+                mb_dir = is_bidi ? DEC(cs->bdir) + 1 : SNT_DIR_FWD;
+                if (mb_dir & SNT_DIR_FWD) {
+                    mb_mvf.x += dec_mvd(&rdec, &cs->mvx, &ovr);
+                    mb_mvf.y += dec_mvd(&rdec, &cs->mvy, &ovr);
+                }
+                if (mb_dir & SNT_DIR_BWD) {
+                    mb_mvb.x += dec_mvd(&rdec, &cs->mvx, &ovr);
+                    mb_mvb.y += dec_mvd(&rdec, &cs->mvy, &ovr);
+                }
             }
         }
         for (int z = 0; z < 4; z++) {
@@ -154,7 +197,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             int px0 = bx * BLK, py0 = by * BLK;
             int block_is_inter = 0;
             int block_is_skip = 0;
-            SntMV best_mv = {0, 0};
+            int dir = 0;
+            SntMV best_mv = {0, 0}, best_mvb = {0, 0};
             uint8_t mc_blk[BLK * BLK];  /* MC prediction (skip and inter coded blocks) */
 
             /* ── Inter mode decode ────────────────────────────── */
@@ -162,32 +206,45 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 if (mb_mode == SNT_MB_SPLIT) {
                     block_is_inter = DEC(cs->inter) == 1;
                     if (block_is_inter) {
-                        /* MV prediction from spatial neighbors */
-                        SntMV mv_pred = snt_mv_predict_at(mv_field, coded, blk_cols, bx, by);
+                        /* MV prediction from spatial neighbors; a skip
+                         * block (and an unused direction) takes it as is */
+                        best_mv = snt_mv_predict_at(mv_field, coded, blk_cols, bx, by);
+                        if (is_bidi)
+                            best_mvb = snt_mv_predict_at(mvb_field, coded, blk_cols, bx, by);
                         block_is_skip = DEC(cs->iskip) == 1;
-                        best_mv = mv_pred;  /* skip predicts at mv_pred */
+                        dir = is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
                         if (!block_is_skip) {
-                            best_mv.x = dec_mvd(&rdec, &cs->mvx, &ovr) + mv_pred.x;
-                            best_mv.y = dec_mvd(&rdec, &cs->mvy, &ovr) + mv_pred.y;
+                            if (is_bidi)
+                                dir = DEC(cs->bdir) + 1;
+                            if (dir & SNT_DIR_FWD) {
+                                best_mv.x += dec_mvd(&rdec, &cs->mvx, &ovr);
+                                best_mv.y += dec_mvd(&rdec, &cs->mvy, &ovr);
+                            }
+                            if (dir & SNT_DIR_BWD) {
+                                best_mvb.x += dec_mvd(&rdec, &cs->mvx, &ovr);
+                                best_mvb.y += dec_mvd(&rdec, &cs->mvy, &ovr);
+                            }
                         }
                     }
                 } else {
-                    /* 16x16 skip or inter: every block takes the MB's MV */
+                    /* 16x16 skip or inter: every block takes the MB's MVs */
                     block_is_inter = 1;
                     block_is_skip = (mb_mode == SNT_MB_SKIP16);
-                    best_mv = block_is_skip ? mv_pred16 : mv16;
+                    dir = mb_dir;
+                    best_mv = mb_mvf;
+                    best_mvb = mb_mvb;
                 }
                 blk_is_inter[blk_idx] = block_is_inter;
                 blk_is_skip[blk_idx] = block_is_skip;
-                if (block_is_inter)
+                if (block_is_inter) {
                     mv_field[blk_idx] = best_mv;
+                    mvb_field[blk_idx] = best_mvb;
+                    blk_dir[blk_idx] = (uint8_t)dir;
+                    dec_pred_luma(ref_f, ref_b, width, height, px0, py0, dir, best_mv, best_mvb, mc_blk);
+                }
 
                 if (block_is_skip) {
-                    /* Copy the MC prediction to recon */
-                    if (ctx->ref_y)
-                        snt_mc_luma(ctx->ref_y, width, height, px0, py0, best_mv, BLK, BLK, mc_blk);
-                    else
-                        memset(mc_blk, 0, sizeof(mc_blk));  /* malformed: inter frame, no reference */
+                    /* Copy the prediction to recon */
                     for (int dy = 0; dy < BLK; dy++)
                         for (int dx = 0; dx < BLK; dx++) {
                             int py = py0 + dy, px_v = px0 + dx;
@@ -201,13 +258,6 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     coded[blk_idx] = 1;
                     continue;
                 }
-            }
-
-            if (block_is_inter && !block_is_skip) {
-                if (ctx->ref_y)
-                    snt_mc_luma(ctx->ref_y, width, height, px0, py0, best_mv, BLK, BLK, mc_blk);
-                else
-                    memset(mc_blk, 0, sizeof(mc_blk));  /* malformed: inter frame, no reference */
             }
 
             /* Intra mode; a spatial prediction goes in mc_blk */
@@ -382,9 +432,12 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         uint16_t cstep = snt_qp_to_step((uint8_t)cqp);
 
         uint8_t *chroma_out[2] = {output_u, output_v};
-        const uint8_t *chroma_ref[2] = {ctx->ref_u, ctx->ref_v};
+        const uint8_t *chroma_ref[2] = {is_bidi ? ctx->ref_old_u : ctx->ref_u,
+                                         is_bidi ? ctx->ref_old_v : ctx->ref_v};
+        const uint8_t *chroma_ref_b[2] = {is_bidi ? ctx->ref_u : NULL, is_bidi ? ctx->ref_v : NULL};
         for (int plane = 0; plane < 2; plane++) {
             const uint8_t *cr = chroma_ref[plane];
+            const uint8_t *crb = chroma_ref_b[plane];
             int16_t c_dc_left = 0;
             int16_t *c_dc_above = (int16_t *)calloc(cblk_cols, sizeof(int16_t));
 
@@ -403,7 +456,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     /* Chroma skip: MC prediction at the luma block's MV */
                     if (c_is_skip && cr) {
                         uint8_t c_skip[16];
-                        snt_mc_chroma(cr, cw, ch_h, cbx, cby, mv_field[luma_blk_idx], 4, 4, c_skip);
+                        dec_pred_chroma(cr, crb, cw, ch_h, cbx, cby, blk_dir[luma_blk_idx],
+                                        mv_field[luma_blk_idx], mvb_field[luma_blk_idx], c_skip);
                         for (int dy = 0; dy < 4; dy++)
                             for (int dx = 0; dx < 4; dx++) {
                                 int py = cby + dy, px = cbx + dx;
@@ -448,9 +502,10 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     int16_t cblock[16];
                     snt_dct_inv_2d_ref(ccoeffs, 4, cblock, 4);
 
-                    uint8_t c_mc[16];  /* chroma MC prediction: luma MV as 1/8-pel */
+                    uint8_t c_mc[16];  /* chroma MC prediction: luma MVs as 1/8-pel */
                     if (c_is_inter && cr)
-                        snt_mc_chroma(cr, cw, ch_h, cbx, cby, mv_field[luma_blk_idx], 4, 4, c_mc);
+                        dec_pred_chroma(cr, crb, cw, ch_h, cbx, cby, blk_dir[luma_blk_idx],
+                                        mv_field[luma_blk_idx], mvb_field[luma_blk_idx], c_mc);
 
                     /* Output: add MC reference for inter, add 128 for intra */
                     for (int dy = 0; dy < 4; dy++)
@@ -480,36 +535,47 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                         width, height, stride_y, stride_uv);
     }
 
-    /* CDFs in ctx->cdf_state now carry into the next inter frame */
-    ctx->cdf_state_valid = 1;
+    /* CDFs now carry into the next frame of the same kind */
+    if (is_bidi)
+        ctx->cdf_state_b_valid = 1;
+    else
+        ctx->cdf_state_valid = 1;
 
-    /* ── Store reconstructed frame as reference ────────────────────── */
-    int cw_dec = width / 2, ch_dec = height / 2;
-    if (!ctx->ref_y || ctx->ref_w != width || ctx->ref_h != height) {
-        free(ctx->ref_y); free(ctx->ref_u); free(ctx->ref_v);
+    /* ── Anchors (key and P-frames) become the newest reference; the
+     *    previous newest becomes the older one. B-frames are not stored. ── */
+    if (!is_bidi) {
+        int cw_dec = width / 2, ch_dec = height / 2;
+        free(ctx->ref_old_y); free(ctx->ref_old_u); free(ctx->ref_old_v);
+        int same_size = ctx->ref_w == width && ctx->ref_h == height;
+        ctx->ref_old_y = same_size ? ctx->ref_y : NULL;
+        ctx->ref_old_u = same_size ? ctx->ref_u : NULL;
+        ctx->ref_old_v = same_size ? ctx->ref_v : NULL;
+        if (!same_size) { free(ctx->ref_y); free(ctx->ref_u); free(ctx->ref_v); }
         ctx->ref_y = (uint8_t *)malloc((size_t)width * height);
-        ctx->ref_u = (uint8_t *)malloc((size_t)cw_dec * ch_dec);
-        ctx->ref_v = (uint8_t *)malloc((size_t)cw_dec * ch_dec);
+        ctx->ref_u = (uint8_t *)calloc((size_t)cw_dec * ch_dec, 1);
+        ctx->ref_v = (uint8_t *)calloc((size_t)cw_dec * ch_dec, 1);
         ctx->ref_w = width;
         ctx->ref_h = height;
+        for (int y = 0; y < height; y++)
+            for (int x = 0; x < width; x++)
+                ctx->ref_y[y * width + x] = output_y[y * stride_y + x];
+        if (output_u && output_v) {
+            for (int y = 0; y < ch_dec; y++)
+                for (int x = 0; x < cw_dec; x++) {
+                    ctx->ref_u[y * cw_dec + x] = output_u[y * stride_uv + x];
+                    ctx->ref_v[y * cw_dec + x] = output_v[y * stride_uv + x];
+                }
+        }
+        ctx->num_refs = 1;
     }
-    for (int y = 0; y < height; y++)
-        for (int x = 0; x < width; x++)
-            ctx->ref_y[y * width + x] = output_y[y * stride_y + x];
-    if (output_u && output_v && ctx->ref_u && ctx->ref_v) {
-        for (int y = 0; y < ch_dec; y++)
-            for (int x = 0; x < cw_dec; x++) {
-                ctx->ref_u[y * cw_dec + x] = output_u[y * stride_uv + x];
-                ctx->ref_v[y * cw_dec + x] = output_v[y * stride_uv + x];
-            }
-    }
-    ctx->num_refs = 1;
 
     free(recon);
     free(dc_pix);
     free(ac_state);
     free(coded);
     free(mv_field);
+    free(mvb_field);
+    free(blk_dir);
     free(blk_is_inter);
     free(blk_is_skip);
     free(rans_buf);

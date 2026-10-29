@@ -23,6 +23,19 @@ void snt_mc_luma(const uint8_t *ref, int w, int h, int x0, int y0,
 void snt_mc_chroma(const uint8_t *ref, int w, int h, int x0, int y0,
                    SntMV mv, int bw, int bh, uint8_t *dst);
 
+/* Inter prediction directions: forward (past reference), backward
+ * (future reference, B-frames), or the rounded average of both. */
+enum { SNT_DIR_FWD = 1, SNT_DIR_BWD = 2, SNT_DIR_BI = 3 };
+
+/* Predict the 8x8 luma block at (x0, y0) in direction dir: forward from
+ * ref_f at mvf, backward from ref_b at mvb, or (a + b + 1) >> 1. */
+void snt_pred_luma8(const uint8_t *ref_f, const uint8_t *ref_b, int w, int h,
+                    int x0, int y0, int dir, SntMV mvf, SntMV mvb, uint8_t *pred);
+
+/* The same for a 4x4 chroma block, with the luma MVs read as 1/8-pel */
+void snt_pred_chroma4(const uint8_t *ref_f, const uint8_t *ref_b, int w, int h,
+                      int x0, int y0, int dir, SntMV mvf, SntMV mvb, uint8_t *pred);
+
 /* DC of an 8x8 prediction block on the scale of the 8x8 orthonormal DCT's
  * DC coefficient (sum / 8). Neighbouring blocks predict their DC from it. */
 static inline int16_t snt_pred_dc8(const uint8_t *blk) {

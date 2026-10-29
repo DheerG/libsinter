@@ -168,6 +168,15 @@ typedef struct {
     /* Cross-frame CDF state (opaque blob, managed by encoder) */
     void               *cdf_state;
     int                 cdf_state_valid;
+    /* B-frames: the caller sets code_bidi to code the next frame as a
+     * B-frame, predicted from the older anchor (ref_old_*) and the newest
+     * (ref_*). B-frames are not references and keep their own CDFs. */
+    int                 code_bidi;
+    uint8_t            *ref_old_y, *ref_old_u, *ref_old_v;
+    void               *cdf_state_b;
+    int                 cdf_state_b_valid;
+    /* Reconstruction of the last coded frame (any type), for checking */
+    uint8_t            *last_y, *last_u, *last_v;
 } SntEncoderCtx;
 
 /* ── Decoder context ──────────────────────────────────────────────── */
@@ -184,6 +193,10 @@ typedef struct {
     /* Cross-frame CDF state (opaque blob, managed by decoder) */
     void               *cdf_state;
     int                 cdf_state_valid;
+    /* B-frames: older anchor and B-frame CDFs (see SntEncoderCtx) */
+    uint8_t            *ref_old_y, *ref_old_u, *ref_old_v;
+    void               *cdf_state_b;
+    int                 cdf_state_b_valid;
 } SntDecoderCtx;
 
 /* ── Frame buffer allocation/free ─────────────────────────────────── */

@@ -3,7 +3,7 @@
  * Implements bitstream syntax elements.
  *
  * Frame header layout:
- *   [32] width  [32] height  [1] frame_type  [6] base_qp
+ *   [32] width  [32] height  [2] frame_type  [6] base_qp
  *   [4] num_tile_cols  [4] num_tile_rows  [1] dual_rans
  *   [8] chroma_qp_offset (signed)  [32] frame_number
  *   [1] grain_enabled  [grain params if enabled]
@@ -150,7 +150,7 @@ int32_t snt_br_get_sexpgolomb(SntBitReader *br) {
 void snt_write_frame_header(SntBitWriter *bw, const SntFrameHeader *hdr) {
     snt_bw_put_bits(bw, hdr->width, 32);
     snt_bw_put_bits(bw, hdr->height, 32);
-    snt_bw_put_bits(bw, hdr->frame_type, 1);
+    snt_bw_put_bits(bw, hdr->frame_type, 2);
     snt_bw_put_bits(bw, hdr->base_qp, 6);
     snt_bw_put_bits(bw, hdr->num_tile_cols, 4);
     snt_bw_put_bits(bw, hdr->num_tile_rows, 4);
@@ -167,7 +167,7 @@ void snt_write_frame_header(SntBitWriter *bw, const SntFrameHeader *hdr) {
 void snt_read_frame_header(SntBitReader *br, SntFrameHeader *hdr) {
     hdr->width = snt_br_get_bits(br, 32);
     hdr->height = snt_br_get_bits(br, 32);
-    hdr->frame_type = (SntFrameType)snt_br_get_bits(br, 1);
+    hdr->frame_type = (SntFrameType)snt_br_get_bits(br, 2);
     hdr->base_qp = (uint8_t)snt_br_get_bits(br, 6);
     hdr->num_tile_cols = (uint8_t)snt_br_get_bits(br, 4);
     hdr->num_tile_rows = (uint8_t)snt_br_get_bits(br, 4);

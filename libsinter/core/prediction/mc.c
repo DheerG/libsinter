@@ -80,3 +80,33 @@ void snt_mc_chroma(const uint8_t *ref, int w, int h, int x0, int y0,
                                          (8 - fx) * fy * c + fx * fy * d + 32) >> 6);
         }
 }
+
+void snt_pred_luma8(const uint8_t *ref_f, const uint8_t *ref_b, int w, int h,
+                    int x0, int y0, int dir, SntMV mvf, SntMV mvb, uint8_t *pred) {
+    if (dir == SNT_DIR_BWD) {
+        snt_mc_luma(ref_b, w, h, x0, y0, mvb, 8, 8, pred);
+        return;
+    }
+    snt_mc_luma(ref_f, w, h, x0, y0, mvf, 8, 8, pred);
+    if (dir == SNT_DIR_BI) {
+        uint8_t b[64];
+        snt_mc_luma(ref_b, w, h, x0, y0, mvb, 8, 8, b);
+        for (int i = 0; i < 64; i++)
+            pred[i] = (uint8_t)((pred[i] + b[i] + 1) >> 1);
+    }
+}
+
+void snt_pred_chroma4(const uint8_t *ref_f, const uint8_t *ref_b, int w, int h,
+                      int x0, int y0, int dir, SntMV mvf, SntMV mvb, uint8_t *pred) {
+    if (dir == SNT_DIR_BWD) {
+        snt_mc_chroma(ref_b, w, h, x0, y0, mvb, 4, 4, pred);
+        return;
+    }
+    snt_mc_chroma(ref_f, w, h, x0, y0, mvf, 4, 4, pred);
+    if (dir == SNT_DIR_BI) {
+        uint8_t b[16];
+        snt_mc_chroma(ref_b, w, h, x0, y0, mvb, 4, 4, b);
+        for (int i = 0; i < 16; i++)
+            pred[i] = (uint8_t)((pred[i] + b[i] + 1) >> 1);
+    }
+}

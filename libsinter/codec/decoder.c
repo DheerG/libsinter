@@ -109,6 +109,22 @@ static int16_t dec_level(SntRangeDec *rd, SntCdfSet *cs, int t, int k, int pc, i
     return (int16_t)(neg ? -mag : mag);
 }
 
+/* A chroma level at zigzag index i (levels.h, chroma models) */
+static int16_t dec_clevel(SntRangeDec *rd, SntCdfSet *cs, int t, int i, int z_known) {
+    if (!z_known && !snt_rc_decode_sym(rd, &cs->cz[t][i])) return 0;
+    int neg = snt_rc_decode_sym(rd, &cs->cs[t]);
+    if (!snt_rc_decode_sym(rd, &cs->cg[t][i])) return (int16_t)(neg ? -1 : 1);
+    int c = 1;
+    while (c < SNT_LEVEL_MAX_CAT && snt_rc_decode_sym(rd, &cs->cx[t][i > 0][c - 1]))
+        c++;
+    uint32_t a1 = 1;
+    for (int k = c - 2; k >= 0; k--)
+        a1 = (a1 << 1) | (uint32_t)snt_rc_decode_sym(rd, &cs->cm[t][c]);
+    int32_t mag = (int32_t)a1 + 1;
+    if (mag > 32767) mag = 32767;  /* damaged stream */
+    return (int16_t)(neg ? -mag : mag);
+}
+
 /* Inter predictions, or zeros for a malformed stream that lacks a reference */
 static void dec_pred_luma(const SntSplinePlane *rf, const SntSplinePlane *rb, int x0, int y0,
                           int dir, SntMV mvf, SntMV mvb, uint8_t *pred) {
@@ -144,7 +160,8 @@ static void dec_pred_chroma(const uint8_t *rf, const uint8_t *rb, int w, int h, 
  *   IF intra block: DEC(imode[is_inter_frame]) → mode (SNT_IPRED_*, intra_acdc.h)
  *   DEC(dc[t]) → dc_level (residual for inter, absolute for intra)
  *   FOR band b=0..15: band[t][b][nz], then (if coded) ac[t][b/4] per level
- * FOR each chroma plane: cdc[ct], then cac[ct][snt_cac_group(i)]
+ * FOR each chroma plane, each 4x4 block not skipped: cflag[ct][luma_nz][pctx],
+ *   then (if coded) 16 levels in zigzag order (chroma models)
  * (contexts: see cdf_set.h and the encoder's symbol-order comment)
  */
 
@@ -246,6 +263,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
      * reconstruction (intra_acdc.h), and whether the block is coded yet */
     int16_t *acdc = (int16_t *)calloc((size_t)total_blocks_d * SNT_ACDC_STATE, sizeof(int16_t));
     uint8_t *coded = (uint8_t *)calloc(total_blocks_d, 1);
+    uint8_t *luma_nz = (uint8_t *)calloc(total_blocks_d, 1);  /* any nonzero luma level? */
 
     /* MV field and block flags for chroma inter derivation */
     SntMV *mv_field = (SntMV *)calloc(blk_cols * blk_rows, sizeof(SntMV));   /* forward MVs */
@@ -434,6 +452,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 snt_pred_classes(pdct, step, snt_zigzag8, band_bounds, NUM_BANDS, kcls, bcls);
             }
             int prev_nz = dc_level != 0;
+            luma_nz[blk_idx] = dc_level != 0;
             int16_t lv[64] = {0};  /* levels so far, zigzag order */
             lv[0] = dc_level;
             for (int b = 0; b < NUM_BANDS; b++) {
@@ -454,6 +473,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     recon_coeffs[snt_zigzag8[1 + start + i]] = pvq_dequantize_dc(level, step);
                 }
                 prev_nz = coded;
+                luma_nz[blk_idx] |= coded;
             }
 
             /* Add back the intra AC prediction (first row or column) */
@@ -505,6 +525,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         uint16_t cstep = snt_qp_to_step((uint8_t)cqp);
 
         uint8_t *chroma_out[2] = {output_u, output_v};
+        uint8_t *u_coded = (uint8_t *)calloc((size_t)cblk_cols * (cpad_h / cblk), 1);
         const uint8_t *chroma_ref[2] = {is_bidi ? ctx->ref_old_u : ctx->ref_u,
                                          is_bidi ? ctx->ref_old_v : ctx->ref_v};
         const uint8_t *chroma_ref_b[2] = {is_bidi ? ctx->ref_u : NULL, is_bidi ? ctx->ref_v : NULL};
@@ -557,29 +578,25 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     else if (cbx > 0) c_dc_pred = c_dc_left;
                     else if (cby > 0) c_dc_pred = c_dc_above[ci];
 
-                    uint16_t cdc_sym = DEC(cs->cdc[c_bt]);
-                    int16_t cdc_level;
-                    if (cdc_sym == 255)
-                        cdc_level = (int16_t)snt_br_get_sexpgolomb(&ovr);
-                    else
-                        cdc_level = u2s(cdc_sym);
-
-                    int16_t cdc_recon = pvq_dequantize_dc(cdc_level, cstep) + c_dc_pred;
+                    /* Coded flag, then the levels in zigzag order */
+                    int bi = cj * cblk_cols + ci;
+                    int pctx = plane == 0 ? 0 : 1 + u_coded[bi];
+                    int cc = DEC(cs->cflag[c_bt][luma_nz[luma_blk_idx]][pctx]);
+                    if (plane == 0) u_coded[bi] = (uint8_t)cc;
+                    int16_t ccoeffs[16] = {0};
+                    if (cc) {
+                        int any = 0;
+                        for (int i = 0; i < 16; i++) {
+                            int16_t level = dec_clevel(&rdec, cs, c_bt, i, i == 15 && !any);
+                            ccoeffs[snt_zigzag4[i]] = pvq_dequantize_dc(level, cstep);
+                            any |= level != 0;
+                        }
+                    }
+                    ccoeffs[0] += c_dc_pred;
+                    int16_t cdc_recon = ccoeffs[0];
                     /* Neighbours see the pixel-domain DC (inter: add the prediction's) */
                     c_dc_left = c_bt ? cdc_recon + snt_pred_dc4c(c_mc) : cdc_recon;
                     c_dc_above[ci] = c_dc_left;
-
-                    int16_t ccoeffs[16];
-                    ccoeffs[0] = cdc_recon;
-                    for (int i = 1; i < 16; i++) {
-                        uint16_t ac_sym = DEC(cs->cac[c_bt][snt_cac_group(i)]);
-                        int16_t ac_level;
-                        if (ac_sym == 255)
-                            ac_level = (int16_t)snt_br_get_sexpgolomb(&ovr);
-                        else
-                            ac_level = u2s(ac_sym);
-                        ccoeffs[i] = pvq_dequantize_dc(ac_level, cstep);
-                    }
 
                     int16_t cblock[16];
                     snt_dct_inv_2d_ref(ccoeffs, 4, cblock, 4);
@@ -602,6 +619,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             }
             free(c_dc_above);
         }
+        free(u_coded);
         snt_deblock_chroma(output_u, cw, ch_h, stride_uv, cstep, is_inter ? blk_is_skip : NULL, blk_cols);
         snt_deblock_chroma(output_v, cw, ch_h, stride_uv, cstep, is_inter ? blk_is_skip : NULL, blk_cols);
     }
@@ -648,6 +666,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     free(recon);
     free(acdc);
     free(coded);
+    free(luma_nz);
     free(mv_field);
     free(mvb_field);
     free(blk_dir);

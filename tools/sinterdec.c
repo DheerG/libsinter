@@ -68,8 +68,8 @@ int main(int argc, char **argv) {
     uint32_t num_frames = read32(fin);
 
     fprintf(stderr, "SNTR v%u: %ux%u, %u frames\n", version, width, height, num_frames);
-    if (version != 4) {
-        fprintf(stderr, "Unsupported .sntr version %u (this decoder reads version 4)\n", version);
+    if (version != 5) {
+        fprintf(stderr, "Unsupported .sntr version %u (this decoder reads version 5)\n", version);
         return 1;
     }
 

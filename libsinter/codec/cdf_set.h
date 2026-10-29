@@ -20,7 +20,6 @@
 #include "levels.h"
 
 #define SNT_NUM_BANDS   16
-#define SNT_CAC_GROUPS   3  /* chroma AC contexts: by frequency, see snt_cac_group */
 
 /* Prediction agreement (novel tool 4, docs/NOVEL.md): before a block's
  * mode is read, the decoder forms two predictions it could make from the
@@ -59,16 +58,14 @@ typedef struct {
     SntModel inter[SNT_AGREE_CLASSES];   /* inter-frame block: inter (1) or intra, by agreement */
     SntModel iskip[SNT_AGREE_CLASSES];   /* inter block: skipped (1) or coded, by agreement */
     SntModel mvx, mvy;                   /* MV deltas */
-    SntModel cdc[2];                   /* chroma DC residual, by block type */
-    SntModel cac[2][SNT_CAC_GROUPS];   /* chroma AC level */
+    /* Chroma 4x4 blocks: a coded flag, then the 16 levels in zigzag order,
+     * DC first, as binary decisions (levels.h), by block type */
+    SntModel cflag[2][2][3];           /* coded (1) or all zero, by luma block coded,
+                                          plane (U; V after an uncoded U; V after a coded U) */
+    SntModel cz[2][16], cs[2], cg[2][16];   /* Z, S, G; Z and G by zigzag index */
+    SntModel cx[2][2][SNT_LEVEL_MAX_CAT];   /* X: category, by DC or AC */
+    SntModel cm[2][SNT_LEVEL_MAX_CAT + 1];  /* M: magnitude bits, by category */
 } SntCdfSet;
-
-/* Chroma 4x4 AC context from raster index 1..15: low (x+y <= 1),
- * mid (x+y <= 3), high. */
-static inline int snt_cac_group(int i) {
-    int f = (i & 3) + (i >> 2);
-    return f <= 1 ? 0 : (f <= 3 ? 1 : 2);
-}
 
 /* Number of models in a set: the struct holds nothing else */
 #define SNT_NUM_MODELS ((int)(sizeof(SntCdfSet) / sizeof(SntModel)))
@@ -88,7 +85,6 @@ static inline void snt_cdf_set_init_uniform(SntCdfSet *s) {
     for (int t = 0; t < 2; t++) {
         snt_model_init(&s->dc[t], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
         snt_model_init(&s->imode[t], SNT_NUM_IPRED, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
-        snt_model_init(&s->cdc[t], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
         for (int k = 0; k < 64; k++) {
             for (int p = 0; p < SNT_PRED_CLASSES; p++)
                 snt_model_init(&s->acz[t][k][p], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
@@ -101,8 +97,19 @@ static inline void snt_cdf_set_init_uniform(SntCdfSet *s) {
                 snt_model_init(&s->acx[t][h][i], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         for (int c = 0; c <= SNT_LEVEL_MAX_CAT; c++)
             snt_model_init(&s->acm[t][c], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
-        for (int g = 0; g < SNT_CAC_GROUPS; g++)
-            snt_model_init(&s->cac[t][g], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
+        for (int l = 0; l < 2; l++)
+            for (int c = 0; c < 3; c++)
+                snt_model_init(&s->cflag[t][l][c], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+        for (int k = 0; k < 16; k++) {
+            snt_model_init(&s->cz[t][k], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+            snt_model_init(&s->cg[t][k], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+        }
+        snt_model_init(&s->cs[t], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+        for (int i = 0; i < SNT_LEVEL_MAX_CAT; i++)
+            for (int h = 0; h < 2; h++)
+                snt_model_init(&s->cx[t][h][i], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+        for (int c = 0; c <= SNT_LEVEL_MAX_CAT; c++)
+            snt_model_init(&s->cm[t][c], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         for (int b = 0; b < SNT_NUM_BANDS; b++) {
             for (int z = 0; z < 2; z++)
                 for (int p = 0; p < SNT_PRED_CLASSES; p++)
@@ -165,6 +172,17 @@ static inline SntModel *snt_level_model(SntCdfSet *s, int t, int k, int pc, cons
     case 2:  return &s->acg[t][k][pc];
     case 3:  return &s->acx[t][k > SNT_LEVEL_KLOW][b->sub];
     default: return &s->acm[t][b->sub];
+    }
+}
+
+/* Model for decision b of a chroma level at zigzag index i (levels.h) */
+static inline SntModel *snt_clevel_model(SntCdfSet *s, int t, int i, const SntLevelBin *b) {
+    switch (b->kind) {
+    case 0:  return &s->cz[t][i];
+    case 1:  return &s->cs[t];
+    case 2:  return &s->cg[t][i];
+    case 3:  return &s->cx[t][i > 0][b->sub];
+    default: return &s->cm[t][b->sub];
     }
 }
 

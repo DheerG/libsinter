@@ -53,7 +53,7 @@ Left to right: the source, Sinter (QP 20), and x264 at the same file size. Frame
 - **Inter prediction**: quarter-pel motion compensation through a quintic B-spline of each reference frame (luma) and 1/8-pel bilinear (chroma), **overlapped** with the neighbours' motion (H.263 Annex F's OBMC), H.263's median vector prediction
 - **Up to three references** for P-frames: the newest anchor, the one before it, and the GOP's key frame as a long-term reference (H.263 Annex U)
 - **B-frames**: two between anchor frames by default, each block predicted forward, backward, from the average of both, or in **direct mode** with vectors scaled from the anchor's (MPEG-4 Part 2), in closed GOPs
-- **Decisions by trial encoding**: each candidate (skip, inter at several candidate vectors, intra; 16x16 or 8x8) is coded without emitting it, chroma included, and the lowest distortion + lambda x bits wins; the best vector is then refined at quarter-pel steps
+- **Decisions by trial encoding**: each candidate (skip, inter at several candidate vectors, intra; 16x16 or 8x8) is coded without emitting it, chroma included, and the lowest distortion + lambda x bits wins; the best vector is then refined at quarter-pel steps. [docs/ENCODER.md](docs/ENCODER.md) describes these and the encoder's other decision methods, with their measured gains
 - **RD-optimized quantization**: each level chosen by distortion + lambda x bits, then the bands coded or zeroed together by a Viterbi pass (Ramchandran & Vetterli 1994; Wen, Luttrell & Villasenor 2000)
 - **QP by GOP position**: anchors with few frames after them in the GOP are coded coarser (dependent quantization, Ramchandran, Ortega & Vetterli 1994)
 - **In-loop deblocking filter** (H.263 Annex J) on luma and chroma block edges

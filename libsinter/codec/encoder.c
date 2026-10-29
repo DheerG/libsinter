@@ -166,6 +166,9 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
 
     int16_t recon_ac[63];
     memset(recon_ac, 0, sizeof(recon_ac));
+    /* Band flag context: is the previous band (for band 0, the DC level)
+     * nonzero? Zero bands come in runs. */
+    int prev_nz = dc_level != 0;
     for (int b = 0; b < NUM_BANDS; b++) {
         int start = band_bounds[b];
         int n = band_bounds[b + 1] - start;
@@ -187,11 +190,13 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
             if (eff_step > 3072) eff_step = 3072;
         }
         int16_t s_level[16], s_recon[16];
-        double s_bits = cdf_bits(&cs->mode[t][b], 1);
+        double s_bits = cdf_bits(&cs->mode[t][b][prev_nz], 1);
+        int s_nz = 0;
         for (int i = 0; i < n; i++) {
             s_level[i] = pvq_quantize_dc(band_coeffs[i], eff_step, 1);
             s_recon[i] = pvq_dequantize_dc(s_level[i], eff_step);
             s_bits += level_bits(&cs->ac[t][b / 4], s_level[i]);
+            s_nz |= s_level[i] != 0;
         }
 
         /* PVQ candidate */
@@ -200,8 +205,8 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
         pvq_encode(band_coeffs, n, step, 1, band_csf, &code, p_recon);
         uint16_t gain_sym = (code.gain > 255) ? 255 : (uint16_t)code.gain;
         int shape_bits = 0;
-        double p_bits = cdf_bits(&cs->mode[t][b], 0)
-                      + cdf_bits(&cs->skip[t][b], code.skip ? 1 : 0);
+        double p_bits = cdf_bits(&cs->mode[t][b][prev_nz], 0)
+                      + cdf_bits(&cs->skip[t][b][prev_nz], code.skip ? 1 : 0);
         if (!code.skip) {
             /* K = pvq_compute_k(gain, n, band_csf): the decoder
              * has all three inputs, so K is not transmitted. */
@@ -222,7 +227,7 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
         if (!sink) {
             bits += use_scalar ? s_bits : p_bits;
         } else {
-            rec(sink, &cs->mode[t][b], use_scalar ? 1 : 0);
+            rec(sink, &cs->mode[t][b][prev_nz], use_scalar ? 1 : 0);
             if (use_scalar) {
                 for (int i = 0; i < n; i++) {
                     uint16_t ac_sym = s2u(s_level[i]);
@@ -231,7 +236,7 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
                         snt_bw_put_sexpgolomb(sink->ov, s_level[i]);
                 }
             } else {
-                rec(sink, &cs->skip[t][b], code.skip ? 1 : 0);
+                rec(sink, &cs->skip[t][b][prev_nz], code.skip ? 1 : 0);
                 if (!code.skip) {
                     rec(sink, &cs->gain[t], gain_sym);
                     if (gain_sym == 255)
@@ -245,6 +250,7 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
                 }
             }
         }
+        prev_nz = use_scalar ? s_nz : !code.skip;
         for (int i = 0; i < n; i++)
             recon_ac[start + i] = band_recon[i];
     }
@@ -704,9 +710,9 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
  *   REC(dc[t], s2u(dc_level))       // DC of residual (inter) or pixels (intra)
  *   // Low-AC prediction subtracted before band processing (key frames only)
  *   FOR band b=0..15:
- *     REC(mode[t][b], mode)
+ *     REC(mode[t][b][nz], mode)       // nz: previous band (band 0: DC level) nonzero
  *     IF scalar: FOR i=0..n-1: REC(ac[t][b/4], s2u(level))
- *     IF PVQ:    REC(skip[t][b], skip)
+ *     IF PVQ:    REC(skip[t][b][nz], skip)
  *                IF !skip: REC(gain[t], min(gain,255))
  *                          (K is not sent: decoder derives it with pvq_compute_k)
  * FOR each chroma plane (U, V):

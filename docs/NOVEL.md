@@ -1,6 +1,6 @@
 # Novel tools
 
-Phase 3 of the clean-format work tried tools of Sinter's own design. Each entry gives the idea, why it should help, the search for the same idea in patents and papers, and the measured result. A new tool is kept only if the search finds no patent or application with the same idea. The searches are checks for obvious collisions, not patent clearance.
+Phase 3 of the clean-format work tried tools of Sinter's own design; the more-compression branch added tool 5. Each entry gives the idea, why it should help, the search for the same idea in patents and papers, and the measured result. A new tool is kept only if the search finds no patent or application with the same idea. The searches are checks for obvious collisions, not patent clearance.
 
 BD-rates are luma (and YUV), mean of foreman, mobile and akiyo (Xiph CIF, 60 frames, 2 B-frames), against the codec just before the change.
 
@@ -63,3 +63,23 @@ Chosen from a measured breakdown of where the bits go: at QP 28 the macroblock m
 No patent or application found that selects the models for mode or skip flags from the agreement of two decoder-side predictions.
 
 **Result.** Kept. -0.6% (-0.5%): foreman -0.6%, mobile -0.2%, akiyo -0.9%. Thresholds twice as coarse (step/4, step) were worse (-0.5%). The decoder forms two 8x8 predictions per flag decision; it still decodes a CIF frame in 3-6 ms.
+
+**Later search (more-compression branch).** A search for item 5 below found an older patent closer to this tool than the ones above: Fujitsu's [US9078006B2](https://patents.google.com/patent/US9078006B2/en), "Video encoder and video decoder" (priority 2010-01-08), which selects the entropy code table for the prediction error signal from the difference between two motion-compensated predictions, so that no table index is sent. It applies the agreement of two predictions to the residual, not to mode flags, and Google Patents lists it as expired (fee related). The tool stays.
+
+## 5. Prediction agreement for MV deltas (kept)
+
+Chosen from the bit breakdown after MV deltas became binary decisions (docs/EXPERIMENTS.md, item 5): at QP 28 the MV deltas still took 15-22% of foreman's, mobile's and bus's bits.
+
+**Idea.** The agreement class of tool 4, which the decoder has already formed for the block's mode flags, also selects the models of the zero and "above one" decisions of each MV-delta component. Nothing extra is sent and nothing extra is computed.
+
+**Why it should help.** When the two predictions agree, the motion around the block is consistent and the block's own MV is likely close to its predictor: a zero or small delta.
+
+**Search.**
+- "patent motion vector difference entropy coding context selected based on difference between two motion compensated predictions decoder side": closest [US9078006](https://patents.google.com/patent/US9078006B2/en) (Fujitsu, above: code tables for the prediction error, expired), [US9930371](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/9930371) (context-adaptive coding of MVD bins, contexts not from predictions).
+- "patent context modeling motion vector difference based on similarity of candidate motion vector predictors CABAC context index mvd": closest Canon's [US11528502](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/11528502) family and [US11856186](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/11856186) (contexts for the MV predictor index from neighbours' indexes).
+- '"motion vector difference" context "predicted blocks" similarity probability model selection patent video': closest Google's [US10142652B2](https://patents.google.com/patent/US10142652B2/en) (priority 2016, active: the context for an MV residual from the magnitude of the reference MV's residual, i.e. the neighbours' deltas, not predictions), [US12720101](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/12720101) (MVD hypotheses chosen by comparing two predicted blocks: a derivation, not a context).
+- "patent context for coding motion vector difference determined by template matching cost or bilateral matching cost decoder side": decoder-side MV refinement only ([US10911768](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/10911768), [EP3342167B1](https://data.epo.org/gpi/EP3342167B1)).
+
+No patent or application found that selects the models for MV-delta decisions from the agreement of two decoder-side predictions.
+
+**Result.** Kept. -0.35% luma, -0.31% YUV against the same binary MV deltas without it (untrained tables on both sides); with the MV binarization, item 5 as a whole saved -0.64% (-0.59%) with retrained tables.

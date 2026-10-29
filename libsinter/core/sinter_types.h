@@ -175,6 +175,8 @@ typedef struct {
     uint8_t            *ref_old_y, *ref_old_u, *ref_old_v;
     void               *cdf_state_b;
     int                 cdf_state_b_valid;
+    /* Cubic B-spline coefficients of ref_y and ref_old_y (spline.h) */
+    int32_t            *ref_coef, *ref_old_coef;
     /* Reconstruction of the last coded frame (any type), for checking */
     uint8_t            *last_y, *last_u, *last_v;
 } SntEncoderCtx;
@@ -197,6 +199,8 @@ typedef struct {
     uint8_t            *ref_old_y, *ref_old_u, *ref_old_v;
     void               *cdf_state_b;
     int                 cdf_state_b_valid;
+    /* Cubic B-spline coefficients of ref_y and ref_old_y (spline.h) */
+    int32_t            *ref_coef, *ref_old_coef;
 } SntDecoderCtx;
 
 /* ── Frame buffer allocation/free ─────────────────────────────────── */

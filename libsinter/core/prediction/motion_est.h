@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 #include "../sinter_types.h"
+#include "spline.h"
 
 /* Full-search integer-pel motion estimation.
  * Searches [-search_range, +search_range] (plus the predicted MV) for the
@@ -29,10 +30,10 @@ int snte_mvd_bits(int d);
 
 /* Refine mv to quarter-pel: a half-pel step, then a quarter-pel step,
  * each trying the 8 neighbours under SAD + lambda * bits(mv - pred), with
- * predictions from snt_mc_luma. cur and ref are frame_w x frame_h planes
- * with stride frame_w. All MVs in quarter-pel units. Returns the refined
+ * predictions from snt_mc_luma. cur is a frame_w x frame_h plane with
+ * stride frame_w. All MVs in quarter-pel units. Returns the refined
  * MV; *sad_out (if non-NULL) receives its SAD. */
-SntMV snte_subpel_refine(const uint8_t *cur, const uint8_t *ref,
+SntMV snte_subpel_refine(const uint8_t *cur, const SntSplinePlane *ref,
                           int frame_w, int frame_h, int bx, int by,
                           int blk_size, SntMV mv, SntMV pred,
                           double lambda, uint32_t *sad_out);

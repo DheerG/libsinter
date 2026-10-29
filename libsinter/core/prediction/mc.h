@@ -10,12 +10,13 @@
 
 #include <stdint.h>
 #include "../sinter_types.h"
+#include "spline.h"
 
 #define SNT_MC_MAX_BLK 16  /* largest block these functions predict */
 
 /* Predict a bw x bh luma block whose top-left is (x0, y0), displaced by
- * mv (quarter-pel). ref: w x h plane, stride w. dst: stride bw. */
-void snt_mc_luma(const uint8_t *ref, int w, int h, int x0, int y0,
+ * mv (quarter-pel), from the B-spline of ref. dst: stride bw. */
+void snt_mc_luma(const SntSplinePlane *ref, int x0, int y0,
                  SntMV mv, int bw, int bh, uint8_t *dst);
 
 /* Predict a bw x bh chroma block at (x0, y0), displaced by mv (1/8-pel).
@@ -29,7 +30,7 @@ enum { SNT_DIR_FWD = 1, SNT_DIR_BWD = 2, SNT_DIR_BI = 3 };
 
 /* Predict the 8x8 luma block at (x0, y0) in direction dir: forward from
  * ref_f at mvf, backward from ref_b at mvb, or (a + b + 1) >> 1. */
-void snt_pred_luma8(const uint8_t *ref_f, const uint8_t *ref_b, int w, int h,
+void snt_pred_luma8(const SntSplinePlane *ref_f, const SntSplinePlane *ref_b,
                     int x0, int y0, int dir, SntMV mvf, SntMV mvb, uint8_t *pred);
 
 /* The same for a 4x4 chroma block, with the luma MVs read as 1/8-pel */

@@ -243,5 +243,6 @@ done:
     free(ctx.ref_y); free(ctx.ref_u); free(ctx.ref_v); free(ctx.cdf_state);
     free(ctx.ref_old_y); free(ctx.ref_old_u); free(ctx.ref_old_v); free(ctx.cdf_state_b);
     free(ctx.last_y); free(ctx.last_u); free(ctx.last_v);
+    free(ctx.ref_coef); free(ctx.ref_old_coef);
     return 0;
 }

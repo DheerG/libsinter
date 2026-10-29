@@ -22,6 +22,19 @@
 #define SNT_NUM_BANDS   16
 #define SNT_CAC_GROUPS   3  /* chroma AC contexts: by frequency, see snt_cac_group */
 
+/* Prediction agreement (novel tool 4, docs/NOVEL.md): before a block's
+ * mode is read, the decoder forms two predictions it could make from the
+ * references alone (P-frames: the skip prediction and the prediction at
+ * the median MV predictor; B-frames: forward at the forward predictor and
+ * backward at the backward predictor) and classes their mean absolute
+ * difference against the quantizer step: below step/8, below step/2,
+ * above. The class selects the mode models. */
+#define SNT_AGREE_CLASSES 3
+static inline int snt_agree_class(uint32_t sad, int npix, uint16_t step) {
+    uint64_t s8 = 8ull * sad, s2 = 2ull * sad, ns = (uint64_t)npix * step;
+    return s8 < ns ? 0 : (s2 < ns ? 1 : 2);
+}
+
 /* Macroblock modes in inter frames (full 16x16 macroblocks only) */
 enum {
     SNT_MB_SPLIT   = 0,  /* four 8x8 blocks, each with its own mode */
@@ -41,9 +54,11 @@ typedef struct {
     SntModel band[2][SNT_NUM_BANDS][2][SNT_PRED_CLASSES];  /* band coded (1) or all zero (0);
                                           by previous band nonzero, prediction class */
     SntModel imode[2];                 /* intra mode, by frame type (0 key, 1 inter) */
-    SntModel mbmode;                   /* macroblock mode (SNT_MB_*) */
+    SntModel mbmode[SNT_AGREE_CLASSES];  /* macroblock mode (SNT_MB_*), by prediction agreement */
     SntModel bdir;                     /* B-frame prediction direction - 1 (SNT_DIR_*) */
-    SntModel inter, iskip, mvx, mvy;   /* inter-frame block modes and MV deltas */
+    SntModel inter[SNT_AGREE_CLASSES];   /* inter-frame block: inter (1) or intra, by agreement */
+    SntModel iskip[SNT_AGREE_CLASSES];   /* inter block: skipped (1) or coded, by agreement */
+    SntModel mvx, mvy;                   /* MV deltas */
     SntModel cdc[2];                   /* chroma DC residual, by block type */
     SntModel cac[2][SNT_CAC_GROUPS];   /* chroma AC level */
 } SntCdfSet;
@@ -94,10 +109,12 @@ static inline void snt_cdf_set_init_uniform(SntCdfSet *s) {
                     snt_model_init(&s->band[t][b][z][p], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         }
     }
-    snt_model_init(&s->mbmode, SNT_NUM_MB_MODES, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+    for (int a = 0; a < SNT_AGREE_CLASSES; a++) {
+        snt_model_init(&s->mbmode[a], SNT_NUM_MB_MODES, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+        snt_model_init(&s->inter[a], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+        snt_model_init(&s->iskip[a], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+    }
     snt_model_init(&s->bdir, 3, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
-    snt_model_init(&s->inter, 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
-    snt_model_init(&s->iskip, 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
     snt_model_init(&s->mvx, 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
     snt_model_init(&s->mvy, 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
 }

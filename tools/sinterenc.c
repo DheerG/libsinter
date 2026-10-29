@@ -2,19 +2,24 @@
  * sinterenc — Sinter Codec Reference Encoder CLI
  *
  * Usage:
- *   sinterenc -i input.y4m -o output.sntr [-q QP] [-k KEYINT]
+ *   sinterenc -i input.y4m -o output.sntr [-q QP] [-k KEYINT] [-b BFRAMES]
  *   sinterenc -i input.yuv -w WIDTH -h HEIGHT -o output.sntr [-q QP] [-n FRAMES] [-k KEYINT]
  *   cat input.y4m | sinterenc -o output.sntr [-q QP]
  *
  * Reads Y4M (auto-detected) or raw YUV 4:2:0, encodes, writes .sntr container.
  *
+ * GOP structure: a key frame every KEYINT frames (closed GOPs), and up to
+ * BFRAMES B-frames (default 2) between anchor frames. The last frame of
+ * each GOP is an anchor, so no B-frame predicts across a key frame.
+ *
  * .sntr container format:
  *   [4] magic "SNTR"
- *   [4] version (2)
+ *   [4] version (3)
  *   [4] width
  *   [4] height
  *   [4] num_frames
- *   Per frame:
+ *   Per frame, in decode order (each frame header carries its display
+ *   number; decoders reorder):
  *     [4] frame_size (bytes)
  *     [frame_size] encoded frame data
  */
@@ -82,6 +87,7 @@ int main(int argc, char **argv) {
     uint8_t qp = 20;
     int num_frames = 0; /* 0 = read until EOF */
     int keyint = 30;
+    int bframes = 2;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) input_path = argv[++i];
@@ -91,10 +97,11 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-q") == 0 && i + 1 < argc) qp = (uint8_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) num_frames = atoi(argv[++i]);
         else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) keyint = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) bframes = atoi(argv[++i]);
     }
 
     if (!output_path) {
-        fprintf(stderr, "Usage: sinterenc -i input.y4m -o output.sntr [-q QP] [-k KEYINT]\n");
+        fprintf(stderr, "Usage: sinterenc -i input.y4m -o output.sntr [-q QP] [-k KEYINT] [-b BFRAMES]\n");
         fprintf(stderr, "       sinterenc -i input.yuv -w W -h H -o output.sntr [-q QP] [-n N]\n");
         return 1;
     }
@@ -115,6 +122,9 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (keyint < 1) keyint = 1;
+    if (bframes < 0) bframes = 0;
+
     if (width <= 0 || height <= 0) {
         fprintf(stderr, "Error: width/height not specified and no Y4M header found\n");
         return 1;
@@ -125,10 +135,12 @@ int main(int argc, char **argv) {
 
     size_t luma_size = (size_t)width * height;
     size_t chroma_size = luma_size / 4;
+    size_t frame_size = luma_size + 2 * chroma_size;
     int chroma_w = width / 2;
-    uint8_t *input_y = (uint8_t *)malloc(luma_size);
-    uint8_t *input_u = (uint8_t *)malloc(chroma_size);
-    uint8_t *input_v = (uint8_t *)malloc(chroma_size);
+    /* One GOP of input frames, encoded in coding order once read */
+    uint8_t *gop = (uint8_t *)malloc(frame_size * (size_t)keyint);
+    int *order = (int *)malloc(sizeof(int) * (size_t)keyint);
+    int *is_b = (int *)malloc(sizeof(int) * (size_t)keyint);
     uint8_t *bitstream = (uint8_t *)malloc(luma_size * 4);
 
     SntEncoderCtx ctx;
@@ -144,7 +156,7 @@ int main(int argc, char **argv) {
     /* Write container header (placeholder num_frames, updated at end) */
     long header_pos = 0;
     fwrite("SNTR", 1, 4, fout);
-    write32(fout, 2); /* version */
+    write32(fout, 3); /* version */
     write32(fout, (uint32_t)width);
     write32(fout, (uint32_t)height);
     header_pos = ftell(fout);
@@ -153,44 +165,67 @@ int main(int argc, char **argv) {
     uint64_t total_bytes = 0;
     int frames_encoded = 0;
 
-    for (int f = 0; num_frames == 0 || f < num_frames; f++) {
-        int got_frame;
-        if (is_y4m) {
-            got_frame = read_y4m_frame(fin, input_y, input_u, input_v, width, height);
-        } else {
-            got_frame = (fread(input_y, 1, luma_size, fin) == luma_size);
-            if (got_frame) {
-                fread(input_u, 1, chroma_size, fin);
-                fread(input_v, 1, chroma_size, fin);
+    for (int gop_start = 0; num_frames == 0 || gop_start < num_frames; gop_start += keyint) {
+        /* Read up to one GOP */
+        int len = 0;
+        while (len < keyint && (num_frames == 0 || gop_start + len < num_frames)) {
+            uint8_t *y = gop + frame_size * len, *u = y + luma_size, *v = u + chroma_size;
+            int got_frame;
+            if (is_y4m) {
+                got_frame = read_y4m_frame(fin, y, u, v, width, height);
+            } else {
+                got_frame = (fread(y, 1, luma_size, fin) == luma_size);
+                if (got_frame) {
+                    fread(u, 1, chroma_size, fin);
+                    fread(v, 1, chroma_size, fin);
+                }
             }
+            if (!got_frame) break;
+            len++;
         }
-        if (!got_frame) break;
+        if (len == 0) break;
 
-        ctx.header.frame_number = (uint32_t)f;
-
-        /* Force keyframe at interval or on first frame */
-        if (f % keyint == 0) {
-            ctx.num_refs = 0;
-            ctx.cdf_state_valid = 0;
-        }
-
-        uint32_t bs_len;
-        int ret = snte_encode_frame(&ctx, input_y, input_u, input_v,
-                                     width, height, width, chroma_w,
-                                     bitstream, (uint32_t)(luma_size * 4), &bs_len);
-        if (ret != 0) {
-            fprintf(stderr, "Encode error at frame %d\n", f);
-            break;
+        /* Coding order: the key frame, then each anchor followed by the
+         * B-frames before it in display order */
+        int n = 0, prev = 0;
+        order[n] = 0; is_b[n++] = 0;
+        while (prev < len - 1) {
+            int next = prev + bframes + 1 < len - 1 ? prev + bframes + 1 : len - 1;
+            order[n] = next; is_b[n++] = 0;
+            for (int b = prev + 1; b < next; b++) { order[n] = b; is_b[n++] = 1; }
+            prev = next;
         }
 
-        write32(fout, bs_len);
-        fwrite(bitstream, 1, bs_len, fout);
-        total_bytes += bs_len;
-        frames_encoded++;
+        for (int i = 0; i < n; i++) {
+            int f = gop_start + order[i];
+            uint8_t *y = gop + frame_size * order[i], *u = y + luma_size, *v = u + chroma_size;
+            if (order[i] == 0) {
+                ctx.num_refs = 0;  /* key frame */
+                ctx.cdf_state_valid = 0;
+            }
+            ctx.code_bidi = is_b[i];
+            ctx.header.frame_number = (uint32_t)f;
 
-        const char *type = (f % keyint == 0) ? "I" : "P";
-        fprintf(stderr, "Frame %d [%s]: %u bytes\n", f, type, bs_len);
+            uint32_t bs_len;
+            int ret = snte_encode_frame(&ctx, y, u, v, width, height, width, chroma_w,
+                                         bitstream, (uint32_t)(luma_size * 4), &bs_len);
+            if (ret != 0) {
+                fprintf(stderr, "Encode error at frame %d\n", f);
+                goto done;
+            }
+
+            write32(fout, bs_len);
+            fwrite(bitstream, 1, bs_len, fout);
+            total_bytes += bs_len;
+            frames_encoded++;
+
+            const char *type = ctx.header.frame_type == SNT_FRAME_KEY ? "I" :
+                               ctx.header.frame_type == SNT_FRAME_BIDI ? "B" : "P";
+            fprintf(stderr, "Frame %d [%s]: %u bytes\n", f, type, bs_len);
+        }
+        if (len < keyint) break;
     }
+done:
 
     /* Update num_frames in header */
     fseek(fout, header_pos, SEEK_SET);
@@ -204,7 +239,9 @@ int main(int argc, char **argv) {
 
     if (fin != stdin) fclose(fin);
     fclose(fout);
-    free(input_y); free(input_u); free(input_v); free(bitstream);
+    free(gop); free(order); free(is_b); free(bitstream);
     free(ctx.ref_y); free(ctx.ref_u); free(ctx.ref_v); free(ctx.cdf_state);
+    free(ctx.ref_old_y); free(ctx.ref_old_u); free(ctx.ref_old_v); free(ctx.cdf_state_b);
+    free(ctx.last_y); free(ctx.last_u); free(ctx.last_v);
     return 0;
 }

@@ -36,6 +36,7 @@ typedef struct {
     RansCDF gain[2];                  /* PVQ gain */
     RansCDF imode[2];                 /* intra mode, by frame type (0 key, 1 inter) */
     RansCDF mbmode;                   /* macroblock mode (SNT_MB_*) */
+    RansCDF bdir;                     /* B-frame prediction direction - 1 (SNT_DIR_*) */
     RansCDF inter, iskip, mvx, mvy;   /* inter-frame block modes and MV deltas */
     RansCDF cdc[2];                   /* chroma DC residual, by block type */
     RansCDF cac[2][SNT_CAC_GROUPS];   /* chroma AC level */
@@ -64,6 +65,7 @@ static inline void snt_cdf_set_init(SntCdfSet *s) {
         }
     }
     rans_cdf_init_uniform(&s->mbmode, SNT_NUM_MB_MODES, RANS_ADAPT_RATE_MODE);
+    rans_cdf_init_uniform(&s->bdir, 3, RANS_ADAPT_RATE_MODE);
     rans_cdf_init_uniform(&s->inter,  2, RANS_ADAPT_RATE_MODE);
     rans_cdf_init_uniform(&s->iskip,  2, RANS_ADAPT_RATE_MODE);
     rans_cdf_init_uniform(&s->mvx,  256, RANS_ADAPT_RATE_COEFF);

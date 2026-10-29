@@ -65,7 +65,7 @@ static inline int snt_mix_stretch16(uint16_t p16) { return snt_stretch_tab[p16 >
 /* kind 0: Z (model acz), 1: G (model acg) */
 static inline void snt_mix_prepare(SntMixState *ms, SntCdfSet *cs, int kind, int t, int k,
                                    int band, int pc, int nzprev, SntMixBin *b) {
-    b->m0 = kind == 0 ? &cs->acz[t][k][pc] : &cs->acg[t][k][pc];
+    b->m0 = kind == 0 ? &cs->acz[t][k][pc][nzprev] : &cs->acg[t][k][pc][nzprev];
     b->s1 = &ms->p1[kind][t][k];
     b->s2 = &ms->p2[kind][t][k][pc][nzprev];
     b->s3 = &ms->p3[kind][t][band][pc][nzprev];

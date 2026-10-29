@@ -104,13 +104,13 @@ static int dec_mixed(SntRangeDec *rd, SntCdfSet *cs, int kind, int t, int k, int
 #define DEC_Z(rd, cs, t, k, pc) dec_mixed(rd, cs, 0, t, k, band, pc, nzprev)
 #define DEC_G(rd, cs, t, k, pc) dec_mixed(rd, cs, 1, t, k, band, pc, nzprev)
 #else
-#define DEC_Z(rd, cs, t, k, pc) snt_rc_decode_sym(rd, &(cs)->acz[t][k][pc])
-#define DEC_G(rd, cs, t, k, pc) snt_rc_decode_sym(rd, &(cs)->acg[t][k][pc])
+#define DEC_Z(rd, cs, t, k, pc) snt_rc_decode_sym(rd, &(cs)->acz[t][k][pc][nzprev])
+#define DEC_G(rd, cs, t, k, pc) snt_rc_decode_sym(rd, &(cs)->acg[t][k][pc][nzprev])
 #endif
 
 static int16_t dec_level(SntRangeDec *rd, SntCdfSet *cs, int t, int k, int pc, int z_known,
                          int band, int nzprev) {
-    (void)band; (void)nzprev;
+    (void)band;
     if (!z_known && !DEC_Z(rd, cs, t, k, pc)) return 0;
     int neg = snt_rc_decode_sym(rd, &cs->acs[t]);
     if (!DEC_G(rd, cs, t, k, pc)) return (int16_t)(neg ? -1 : 1);

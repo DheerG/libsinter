@@ -107,9 +107,9 @@ static double ac_level_bits(SntCdfSet *cs, int t, int k, int pc, int16_t v, int 
             continue;
         }
 #endif
-        bits += cdf_bits(snt_level_model(cs, t, k, pc, &bins[i]), bins[i].bit);
+        bits += cdf_bits(snt_level_model(cs, t, k, pc, nzprev, &bins[i]), bins[i].bit);
     }
-    (void)band; (void)nzprev;
+    (void)band;
     return bits;
 }
 
@@ -393,7 +393,7 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t, int da
                             continue;
                         }
 #endif
-                        rec(sink, snt_level_model(cs, t, k, kcls[k], &bins[j]), bins[j].bit);
+                        rec(sink, snt_level_model(cs, t, k, kcls[k], nz_prev2(lv, k), &bins[j]), bins[j].bit);
                     }
                     any |= s_level[i] != 0;
                     lv[k] = s_level[i];

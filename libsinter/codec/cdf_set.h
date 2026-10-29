@@ -52,9 +52,11 @@ typedef struct {
     SntModel dx[2][SNT_LEVEL_MAX_CAT];       /* X: category */
     SntModel dm[2][SNT_LEVEL_MAX_CAT + 1];   /* M: magnitude bits, by category */
     /* luma AC levels as binary decisions (levels.h), by block type */
-    SntModel acz[2][64][SNT_PRED_CLASSES];  /* Z: nonzero?, by zigzag index, prediction class */
+    /* Z and G also by how many of the two previous levels in zigzag order
+     * are nonzero (0-2) */
+    SntModel acz[2][64][SNT_PRED_CLASSES][3];  /* Z: nonzero?, by zigzag index, prediction class */
     SntModel acs[2];                   /* S: negative? */
-    SntModel acg[2][64][SNT_PRED_CLASSES];  /* G: |v| > 1?, by zigzag index, prediction class */
+    SntModel acg[2][64][SNT_PRED_CLASSES][3];  /* G: |v| > 1?, by zigzag index, prediction class */
     SntModel acx[2][2][SNT_LEVEL_MAX_CAT];      /* X: category, by low/high index */
     SntModel acm[2][SNT_LEVEL_MAX_CAT + 1];     /* M: magnitude bits, by category */
     SntModel band[2][SNT_NUM_BANDS][2][SNT_PRED_CLASSES];  /* band coded (1) or all zero (0);
@@ -114,9 +116,11 @@ static inline void snt_cdf_set_init_uniform(SntCdfSet *s) {
             snt_model_init(&s->imode[t][d], SNT_NUM_IPRED, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         for (int k = 0; k < 64; k++) {
             for (int p = 0; p < SNT_PRED_CLASSES; p++)
-                snt_model_init(&s->acz[t][k][p], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+                for (int n = 0; n < 3; n++)
+                    snt_model_init(&s->acz[t][k][p][n], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
             for (int p = 0; p < SNT_PRED_CLASSES; p++)
-                snt_model_init(&s->acg[t][k][p], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+                for (int n = 0; n < 3; n++)
+                    snt_model_init(&s->acg[t][k][p][n], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         }
         snt_model_init(&s->acs[t], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         for (int i = 0; i < SNT_LEVEL_MAX_CAT; i++)
@@ -207,11 +211,12 @@ static inline void snt_cdf_set_init(SntCdfSet *s, int set, int qp) {
 
 /* Model for decision b of a luma AC level at zigzag index k with
  * prediction class pc (levels.h) */
-static inline SntModel *snt_level_model(SntCdfSet *s, int t, int k, int pc, const SntLevelBin *b) {
+static inline SntModel *snt_level_model(SntCdfSet *s, int t, int k, int pc, int nzp,
+                                        const SntLevelBin *b) {
     switch (b->kind) {
-    case 0:  return &s->acz[t][k][pc];
+    case 0:  return &s->acz[t][k][pc][nzp];
     case 1:  return &s->acs[t];
-    case 2:  return &s->acg[t][k][pc];
+    case 2:  return &s->acg[t][k][pc][nzp];
     case 3:  return &s->acx[t][k > SNT_LEVEL_KLOW][b->sub];
     default: return &s->acm[t][b->sub];
     }

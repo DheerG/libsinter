@@ -65,7 +65,7 @@ static void dec_pred_chroma(const uint8_t *rf, const uint8_t *rb, int w, int h, 
  *     DEC(inter) → inter_flag
  *     IF inter_flag:
  *       DEC(iskip) → skip_flag
- *       IF skip: prediction at the predicted MV(s), continue (B: bi-directional)
+ *       IF skip: prediction at zero motion, continue (B: bi-directional)
  *       IF coded: [B: DEC(bdir)], then DEC(mvx), DEC(mvy) per used direction
  *   IF intra block: DEC(imode[is_inter_frame]) → mode (SNT_IPRED_*)
  *   DEC(dc[t]) → dc_level (residual for inter, absolute for intra)
@@ -178,8 +178,12 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             if (is_bidi)
                 mb_mvb = snt_mv_predict_at(mvb_field, coded, blk_cols, bx0, by0);
             mb_mode = DEC(cs->mbmode);
-            /* SKIP16 predicts at the predicted MV(s): bi-directional in B-frames */
+            /* SKIP16 predicts at zero motion: bi-directional in B-frames */
             mb_dir = is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
+            if (mb_mode == SNT_MB_SKIP16) {
+                mb_mvf = (SntMV){0, 0};
+                mb_mvb = (SntMV){0, 0};
+            }
             if (mb_mode == SNT_MB_INTER16) {
                 mb_dir = is_bidi ? DEC(cs->bdir) + 1 : SNT_DIR_FWD;
                 if (mb_dir & SNT_DIR_FWD) {
@@ -208,14 +212,15 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 if (mb_mode == SNT_MB_SPLIT) {
                     block_is_inter = DEC(cs->inter) == 1;
                     if (block_is_inter) {
-                        /* MV prediction from spatial neighbors; a skip
-                         * block (and an unused direction) takes it as is */
-                        best_mv = snt_mv_predict_at(mv_field, coded, blk_cols, bx, by);
-                        if (is_bidi)
-                            best_mvb = snt_mv_predict_at(mvb_field, coded, blk_cols, bx, by);
+                        /* A skip block predicts at zero motion; a coded
+                         * block's MVs are coded against the median of its
+                         * neighbours' (an unused direction keeps it) */
                         block_is_skip = DEC(cs->iskip) == 1;
                         dir = is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
                         if (!block_is_skip) {
+                            best_mv = snt_mv_predict_at(mv_field, coded, blk_cols, bx, by);
+                            if (is_bidi)
+                                best_mvb = snt_mv_predict_at(mvb_field, coded, blk_cols, bx, by);
                             if (is_bidi)
                                 dir = DEC(cs->bdir) + 1;
                             if (dir & SNT_DIR_FWD) {

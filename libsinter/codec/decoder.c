@@ -329,7 +329,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 sad += agree_sad8(ref_f, ref_b, bx0 + (z & 1), by0 + (z >> 1), is_bidi,
                                   sdir, smf, smb, mb_mvf, mb_mvb);
             mac = snt_agree_class(sad, 256, step);
-            mb_mode = DEC(cs->mbmode[mac]);
+            mb_mode = DEC(cs->mbmode[snt_flag_context(mac, bx0 > 0 && blk_is_skip[by0 * blk_cols + bx0 - 1],
+                                                      by0 > 0 && blk_is_skip[(by0 - 1) * blk_cols + bx0])]);
             /* SKIP16 predicts with the global motion: bi-directional in
              * B-frames */
             mb_dir = is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
@@ -369,12 +370,14 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                         pb = snt_mv_predict_at(mvb_field, blk_cols, bx, by);
                     int ac = snt_agree_class(agree_sad8(ref_f, ref_b, bx, by, is_bidi,
                                                         sdir, smf, smb, pf, pb), 64, step);
-                    block_is_inter = DEC(cs->inter[ac]) == 1;
+                    int fc = snt_flag_context(ac, bx > 0 && blk_is_skip[blk_idx - 1],
+                                              by > 0 && blk_is_skip[blk_idx - blk_cols]);
+                    block_is_inter = DEC(cs->inter[fc]) == 1;
                     if (block_is_inter) {
                         /* A skip block predicts with the global motion; a
                          * coded block's MVs are coded against the median of
                          * its neighbours' (an unused direction's MV is zero) */
-                        block_is_skip = DEC(cs->iskip[ac]) == 1;
+                        block_is_skip = DEC(cs->iskip[fc]) == 1;
                         dir = is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
                         if (block_is_skip)
                             skip_motion(blk_dir, mv_field, mvb_field, blk_cols, bx, by, is_bidi,

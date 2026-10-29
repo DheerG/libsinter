@@ -3,15 +3,21 @@
  * Two-pass: forward record + reverse rANS encode.
  * Inter spec: team consensus (Jim/Timothy/Gary/Monty/Jens-Rainer).
  *
- * Key frames: lapped transform pipeline (pre/post filter + DCT)
- * Inter frames: no lapping, MC prediction + residual coding
+ * Key frames: 8x8 block DCT with DC/low-AC prediction
+ * Inter frames: MC prediction + residual coding
+ *
+ * Lapping (core/transform/lapping.c) is not applied. Its lifting network
+ * has no butterfly/scaling stage, so it is not DC-preserving: a flat 128
+ * image comes out with a +/-11 sawtooth at every block edge, which the DCT
+ * then has to code. Disabling it saved 25-41% of intra bytes and gained
+ * 2.5-3.3 dB PSNR. Re-enable only with a proper TDLT (e.g. Daala's
+ * od_pre_filter); PSNR does not measure the blocking this lets through.
  */
 
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
 #include "encoder.h"
-#include "../core/transform/lapping.h"
 #include "../core/transform/dct.h"
 #include "../core/quantize/pvq.h"
 #include "../core/quantize/qp_table.h"
@@ -51,7 +57,8 @@ typedef struct { uint16_t cdf_lo; uint16_t freq; } SymRange;
  *     REC(cdf_mode, mode)
  *     IF scalar: FOR i=0..n-1: REC(cdf_ac, s2u(level))
  *     IF PVQ:    REC(cdf_skip, skip)
- *                IF !skip: REC(cdf_gain, min(gain,255)), REC(cdf_k, min(k,255))
+ *                IF !skip: REC(cdf_gain, min(gain,255))
+ *                          (K is not sent: decoder derives it with pvq_compute_k)
  * FOR each chroma plane (U, V):
  *   FOR each 4x4 block:
  *     REC(cdf_dc, s2u(dc_level))
@@ -90,10 +97,6 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         for (int x = 0; x < width; x++)
             work[y * pad_w + x] = (int16_t)input_y[y * stride_y + x];
 
-    /* KEY ONLY: lapping pre-filter */
-    if (!is_inter)
-        snt_lap_pre_filter_2d_ref(work, pad_w, pad_h, pad_w, BLK);
-
     /* ── SECTION A: Fixed header ──────────────────────────────────── */
     snt_bw_byte_align(&bw);
     snt_bw_put_bits(&bw, (uint32_t)total_blocks, 16);
@@ -116,15 +119,14 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     SntBitWriter ov;
     snt_bw_init(&ov, ov_buf, ov_cap);
 
-    /* ── Init 10 CDFs (6 existing + 4 inter) ─────────────────────── */
-    RansCDF cdf_dc, cdf_ac, cdf_mode, cdf_skip, cdf_gain, cdf_k;
+    /* ── Init 9 CDFs (5 intra + 4 inter) ──────────────────────────── */
+    RansCDF cdf_dc, cdf_ac, cdf_mode, cdf_skip, cdf_gain;
     RansCDF cdf_inter, cdf_iskip, cdf_mvx, cdf_mvy;
     rans_cdf_init_uniform(&cdf_dc,   256, RANS_ADAPT_RATE_COEFF);
     rans_cdf_init_uniform(&cdf_ac,   256, RANS_ADAPT_RATE_COEFF);
     rans_cdf_init_uniform(&cdf_mode,   2, RANS_ADAPT_RATE_MODE);
     rans_cdf_init_uniform(&cdf_skip,   2, RANS_ADAPT_RATE_MODE);
     rans_cdf_init_uniform(&cdf_gain, 256, RANS_ADAPT_RATE_COEFF);
-    rans_cdf_init_uniform(&cdf_k,    256, RANS_ADAPT_RATE_COEFF);
     rans_cdf_init_uniform(&cdf_inter,  2, RANS_ADAPT_RATE_MODE);
     rans_cdf_init_uniform(&cdf_iskip,  2, RANS_ADAPT_RATE_MODE);
     rans_cdf_init_uniform(&cdf_mvx, 256, RANS_ADAPT_RATE_COEFF);
@@ -134,8 +136,8 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     if (is_inter && ctx->cdf_state_valid && ctx->cdf_state) {
         RansCDF *saved = (RansCDF *)ctx->cdf_state;
         cdf_dc = saved[0]; cdf_ac = saved[1]; cdf_mode = saved[2];
-        cdf_skip = saved[3]; cdf_gain = saved[4]; cdf_k = saved[5];
-        cdf_inter = saved[6]; cdf_iskip = saved[7]; cdf_mvx = saved[8]; cdf_mvy = saved[9];
+        cdf_skip = saved[3]; cdf_gain = saved[4];
+        cdf_inter = saved[5]; cdf_iskip = saved[6]; cdf_mvx = saved[7]; cdf_mvy = saved[8];
     }
 
     #define REC(cdf, sym) do { \
@@ -427,11 +429,8 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                         if (gain_sym == 255)
                             snt_bw_put_expgolomb(&ov, code.gain);
 
-                        uint16_t k_sym = (code.k > 255) ? 255 : (uint16_t)code.k;
-                        REC(cdf_k, k_sym);
-                        if (k_sym == 255)
-                            snt_bw_put_expgolomb(&ov, (uint32_t)code.k);
-
+                        /* K = pvq_compute_k(gain, n, band_csf): the decoder
+                         * has all three inputs, so K is not transmitted. */
                         int shape_bits = pvq_shape_bits(n, code.k);
                         if (shape_bits < 1) shape_bits = 1;
                         if (shape_bits > 64) shape_bits = 64;
@@ -492,11 +491,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         memset(ac_recon_left, 0, sizeof(ac_recon_left));
     }
 
-    /* KEY ONLY: lapping post-filter */
-    if (!is_inter)
-        snt_lap_post_filter_2d_ref(recon, pad_w, pad_h, pad_w, BLK);
-
-    /* Allocate chroma reference before chroma encoding (encoder stores reconstructed) */
+    /* Ensure a chroma reference exists to predict from (zero-filled on the first frame) */
     if (input_u && input_v) {
         if (!ctx->ref_u || ctx->ref_w != width || ctx->ref_h != height) {
             free(ctx->ref_u); free(ctx->ref_v);
@@ -505,8 +500,14 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         }
     }
 
-    /* Chroma: 4x4 DCT + scalar quantization, with inter prediction */
+    /* Chroma: 4x4 DCT + scalar quantization, with inter prediction.
+     * Reconstruct into fresh buffers and swap them in at the end. Writing
+     * into ctx->ref_u/v while predicting from them lets MVs that point
+     * up/left read current-frame pixels the decoder never sees, which was
+     * the real cause of the chroma "drift". */
     if (input_u && input_v) {
+        uint8_t *chroma_rec[2] = {(uint8_t *)calloc((size_t)cw * ch, 1),
+                                  (uint8_t *)calloc((size_t)cw * ch, 1)};
         int cblk_cols = cpad_w / cblk;
         /* Reduce chroma QP offset for inter frames to prevent quantization
          * cascade (drift). +4 for key frames (no drift), +1 for inter. */
@@ -537,12 +538,12 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
 
                     /* Chroma skip: copy from reference (implicit from luma skip) */
                     if (c_is_skip && cr) {
-                        uint8_t *c_ref_out = (plane == 0) ? ctx->ref_u : ctx->ref_v;
+                        uint8_t *c_ref_out = chroma_rec[plane];
                         for (int dy = 0; dy < 4; dy++)
                             for (int dx = 0; dx < 4; dx++) {
                                 int py = cby + dy, px = cbx + dx;
                                 if (py < ch && px < cw && c_ref_out)
-                                    c_ref_out[py*cw+px] = cr[py*cw+px]; /* copy ref to ref */
+                                    c_ref_out[py*cw+px] = cr[py*cw+px];
                             }
                         c_dc_left = 0;
                         c_dc_above[ci] = 0;
@@ -610,7 +611,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     /* Reconstruct chroma for reference frame */
                     int16_t crecon_blk[16];
                     snt_dct_inv_2d_ref(crecon_coeffs, 4, crecon_blk, 4);
-                    uint8_t *c_ref_out = (plane == 0) ? ctx->ref_u : ctx->ref_v;
+                    uint8_t *c_ref_out = chroma_rec[plane];
                     if (c_ref_out) {
                         for (int dy = 0; dy < 4; dy++)
                             for (int dx = 0; dx < 4; dx++) {
@@ -635,6 +636,10 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
             }
             free(c_dc_above);
         }
+        free(ctx->ref_u);
+        free(ctx->ref_v);
+        ctx->ref_u = chroma_rec[0];
+        ctx->ref_v = chroma_rec[1];
     }
 
     /* ── PHASE 2: Reverse rANS encode ──────────────────────────────── */
@@ -668,12 +673,12 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
 
     /* ── Save CDF state for cross-frame carry ─────────────────────── */
     if (!ctx->cdf_state)
-        ctx->cdf_state = malloc(10 * sizeof(RansCDF));
+        ctx->cdf_state = malloc(9 * sizeof(RansCDF));
     {
         RansCDF *saved = (RansCDF *)ctx->cdf_state;
         saved[0] = cdf_dc; saved[1] = cdf_ac; saved[2] = cdf_mode;
-        saved[3] = cdf_skip; saved[4] = cdf_gain; saved[5] = cdf_k;
-        saved[6] = cdf_inter; saved[7] = cdf_iskip; saved[8] = cdf_mvx; saved[9] = cdf_mvy;
+        saved[3] = cdf_skip; saved[4] = cdf_gain;
+        saved[5] = cdf_inter; saved[6] = cdf_iskip; saved[7] = cdf_mvx; saved[8] = cdf_mvy;
     }
     ctx->cdf_state_valid = 1;
 

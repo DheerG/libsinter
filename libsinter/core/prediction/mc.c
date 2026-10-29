@@ -3,7 +3,10 @@
  *
  * Luma: cubic B-spline interpolation at quarter-pel positions (spline.c).
  *
- * Chroma: bilinear interpolation at 1/8-pel positions.
+ * Chroma: bilinear interpolation at 1/8-pel positions, as in MPEG-4
+ * Part 2's sprite and global motion warping (1999), which interpolates
+ * bilinearly at up to 1/16 sample. The chroma vector is the luma vector
+ * halved, kept at 1/8-sample precision. See PROVENANCE.md.
  */
 
 #include "mc.h"

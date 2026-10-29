@@ -57,6 +57,17 @@ static SntMixState *cur_mix;
  * 5 and 6 tried). */
 #define B_QP_OFFSET 4
 
+/* Dependent quantization across the GOP (K. Ramchandran, A. Ortega and
+ * M. Vetterli, "Bit allocation for dependent quantization with
+ * applications to multiresolution and MPEG video coders", IEEE TIP 3(5),
+ * 1994): an anchor's errors propagate to the frames after it in its closed
+ * GOP, so an anchor with few frames left after it is coded coarser, one QP
+ * step per entry below that the number of frames left doesn't exceed: +1
+ * with 8 or fewer, +2 with 2 or fewer, +3 for the GOP's last frame.
+ * Chosen by BD-rate (1-3 steps, thresholds 0 to 14 tried); finer early
+ * anchors were worse. Needs the caller's keyint (SntEncoderCtx). */
+static const int gop_qp_steps[] = { 8, 2, 0 };
+
 /* Global motion estimation counts a block as predicted well enough to
  * skip when its SSE is below GM_SKIP_SSE * lambda */
 #ifndef GM_SKIP_SSE
@@ -1408,6 +1419,13 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         fhdr.base_qp = fhdr.base_qp > KEY_QP_OFFSET ? fhdr.base_qp - KEY_QP_OFFSET : 0;
     if (is_bidi)
         fhdr.base_qp = fhdr.base_qp + B_QP_OFFSET < 63 ? fhdr.base_qp + B_QP_OFFSET : 63;
+    /* Anchors with few frames left after them in the GOP are coded coarser
+     * (dependent quantization, see GOP_QP_STEPS) */
+    if (is_inter && !is_bidi && ctx->keyint > 0) {
+        int remain = ctx->keyint - 1 - (int)(fhdr.frame_number - fhdr.key_frame_number);
+        for (int k = 0; k < (int)(sizeof(gop_qp_steps) / sizeof(gop_qp_steps[0])); k++)
+            if (remain <= gop_qp_steps[k] && fhdr.base_qp < 63) fhdr.base_qp++;
+    }
 
     uint16_t step = snt_qp_to_step(fhdr.base_qp);
     pred_cache_gen++;  /* new references: the cached predictions are stale */

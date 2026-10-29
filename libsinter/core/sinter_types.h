@@ -197,6 +197,9 @@ typedef struct {
     SntMV              *anchor_mv;
     uint8_t            *anchor_dir;
     uint32_t            anchor_num, anchor_old_num;
+    /* The caller's key frame interval (0: unknown), for the encoder's QP
+     * choice by GOP position */
+    int                 keyint;
 } SntEncoderCtx;
 
 /* ── Decoder context ──────────────────────────────────────────────── */

@@ -150,6 +150,7 @@ int main(int argc, char **argv) {
     ctx.header.num_tile_cols = 1;
     ctx.header.num_tile_rows = 1;
     ctx.header.chroma_qp_offset = 4;
+    ctx.keyint = keyint;
     ctx.psy_cfg.alpha = 0.5f;
     ctx.psy_cfg.qp_clamp = 6;
 

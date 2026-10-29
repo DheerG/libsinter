@@ -1,19 +1,19 @@
 /*
  * Sinter Codec — Entropy-coding context set (normative)
  *
- * Every adaptive CDF used by the frame syntax lives in one struct, so the
+ * Every adaptive model used by the frame syntax lives in one struct, so the
  * encoder and decoder initialize it identically. It is kept in the codec
  * context: reset on key frames, carried across inter frames.
  *
  * Contexts separate symbols whose statistics differ: block type (0 = intra,
- * 1 = inter residual), band index, and luma vs chroma. One shared CDF has to
- * average distributions that have little in common; with separate CDFs, the
- * mode/skip flags of mostly-empty bands become nearly free.
+ * 1 = inter residual), band index, and luma vs chroma. One shared model has
+ * to average distributions that have little in common; with separate models,
+ * the mode/skip flags of mostly-empty bands become nearly free.
  */
 #ifndef SNT_CDF_SET_H
 #define SNT_CDF_SET_H
 
-#include "../core/entropy/rans.h"
+#include "../core/entropy/rangecoder.h"
 #include "../core/prediction/intra_spatial.h"
 
 #define SNT_NUM_BANDS   16
@@ -29,17 +29,17 @@ enum {
 };
 
 typedef struct {
-    RansCDF dc[2];                    /* luma DC residual, by block type */
-    RansCDF ac[2][SNT_AC_GROUPS];     /* luma scalar AC level */
-    RansCDF mode[2][SNT_NUM_BANDS][2];  /* band mode: 0 = PVQ, 1 = scalar; by previous band nonzero */
-    RansCDF skip[2][SNT_NUM_BANDS][2];  /* PVQ band skip; by previous band nonzero */
-    RansCDF gain[2];                  /* PVQ gain */
-    RansCDF imode[2];                 /* intra mode, by frame type (0 key, 1 inter) */
-    RansCDF mbmode;                   /* macroblock mode (SNT_MB_*) */
-    RansCDF bdir;                     /* B-frame prediction direction - 1 (SNT_DIR_*) */
-    RansCDF inter, iskip, mvx, mvy;   /* inter-frame block modes and MV deltas */
-    RansCDF cdc[2];                   /* chroma DC residual, by block type */
-    RansCDF cac[2][SNT_CAC_GROUPS];   /* chroma AC level */
+    SntModel dc[2];                    /* luma DC residual, by block type */
+    SntModel ac[2][SNT_AC_GROUPS];     /* luma scalar AC level */
+    SntModel mode[2][SNT_NUM_BANDS][2];  /* band mode: 0 = PVQ, 1 = scalar; by previous band nonzero */
+    SntModel skip[2][SNT_NUM_BANDS][2];  /* PVQ band skip; by previous band nonzero */
+    SntModel gain[2];                  /* PVQ gain */
+    SntModel imode[2];                 /* intra mode, by frame type (0 key, 1 inter) */
+    SntModel mbmode;                   /* macroblock mode (SNT_MB_*) */
+    SntModel bdir;                     /* B-frame prediction direction - 1 (SNT_DIR_*) */
+    SntModel inter, iskip, mvx, mvy;   /* inter-frame block modes and MV deltas */
+    SntModel cdc[2];                   /* chroma DC residual, by block type */
+    SntModel cac[2][SNT_CAC_GROUPS];   /* chroma AC level */
 } SntCdfSet;
 
 /* Chroma 4x4 AC context from raster index 1..15: low (x+y <= 1),
@@ -51,27 +51,27 @@ static inline int snt_cac_group(int i) {
 
 static inline void snt_cdf_set_init(SntCdfSet *s) {
     for (int t = 0; t < 2; t++) {
-        rans_cdf_init_uniform(&s->dc[t],   256, RANS_ADAPT_RATE_COEFF);
-        rans_cdf_init_uniform(&s->gain[t], 256, RANS_ADAPT_RATE_COEFF);
-        rans_cdf_init_uniform(&s->imode[t], SNT_NUM_IPRED, RANS_ADAPT_RATE_MODE);
-        rans_cdf_init_uniform(&s->cdc[t],  256, RANS_ADAPT_RATE_COEFF);
+        snt_model_init(&s->dc[t], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
+        snt_model_init(&s->gain[t], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
+        snt_model_init(&s->imode[t], SNT_NUM_IPRED, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+        snt_model_init(&s->cdc[t], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
         for (int g = 0; g < SNT_AC_GROUPS; g++)
-            rans_cdf_init_uniform(&s->ac[t][g], 256, RANS_ADAPT_RATE_COEFF);
+            snt_model_init(&s->ac[t][g], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
         for (int g = 0; g < SNT_CAC_GROUPS; g++)
-            rans_cdf_init_uniform(&s->cac[t][g], 256, RANS_ADAPT_RATE_COEFF);
+            snt_model_init(&s->cac[t][g], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
         for (int b = 0; b < SNT_NUM_BANDS; b++) {
             for (int z = 0; z < 2; z++) {
-                rans_cdf_init_uniform(&s->mode[t][b][z], 2, RANS_ADAPT_RATE_MODE);
-                rans_cdf_init_uniform(&s->skip[t][b][z], 2, RANS_ADAPT_RATE_MODE);
+                snt_model_init(&s->mode[t][b][z], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+                snt_model_init(&s->skip[t][b][z], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
             }
         }
     }
-    rans_cdf_init_uniform(&s->mbmode, SNT_NUM_MB_MODES, RANS_ADAPT_RATE_MODE);
-    rans_cdf_init_uniform(&s->bdir, 3, RANS_ADAPT_RATE_MODE);
-    rans_cdf_init_uniform(&s->inter,  2, RANS_ADAPT_RATE_MODE);
-    rans_cdf_init_uniform(&s->iskip,  2, RANS_ADAPT_RATE_MODE);
-    rans_cdf_init_uniform(&s->mvx,  256, RANS_ADAPT_RATE_COEFF);
-    rans_cdf_init_uniform(&s->mvy,  256, RANS_ADAPT_RATE_COEFF);
+    snt_model_init(&s->mbmode, SNT_NUM_MB_MODES, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+    snt_model_init(&s->bdir, 3, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+    snt_model_init(&s->inter, 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+    snt_model_init(&s->iskip, 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+    snt_model_init(&s->mvx, 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
+    snt_model_init(&s->mvy, 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
 }
 
 #endif /* SNT_CDF_SET_H */

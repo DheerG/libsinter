@@ -1,6 +1,5 @@
 /*
- * Sinter Codec — Encoder with rANS entropy coding + inter prediction
- * Two-pass: forward record + reverse rANS encode.
+ * Sinter Codec — Encoder with range coding + inter prediction
  * Inter spec: team consensus (Jim/Timothy/Gary/Monty/Jens-Rainer).
  *
  * Key frames: 8x8 block DCT with DC/low-AC prediction
@@ -24,7 +23,7 @@
 #include "../core/quantize/pvq.h"
 #include "../core/quantize/qp_table.h"
 #include "../core/bitstream/bitstream.h"
-#include "../core/entropy/rans.h"
+#include "../core/entropy/rangecoder.h"
 #include "../core/prediction/motion_est.h"
 #include "../core/prediction/mc.h"
 #include "../core/filter/deblock.h"
@@ -54,11 +53,9 @@ static inline uint16_t s2u(int16_t v) {
  * 5 and 6 tried). */
 #define B_QP_OFFSET 4
 
-/* Ideal cost in bits of coding sym with cdf in its current state. */
-static double cdf_bits(const RansCDF *cdf, uint16_t sym) {
-    uint16_t lo, freq;
-    rans_cdf_symbol_range(cdf, sym, &lo, &freq);
-    return -log2((double)freq / RANS_PROB_TOTAL);
+/* Ideal cost in bits of coding sym with model m in its current state. */
+static double cdf_bits(const SntModel *m, uint16_t sym) {
+    return -log2((double)m->freq[sym] / m->total);
 }
 
 /* Length of the order-0 exp-Golomb code for v. */
@@ -69,7 +66,7 @@ static int expgolomb_len(uint32_t v) {
 }
 
 /* Bits for a signed level: rANS symbol, plus overflow bits on escape. */
-static double level_bits(const RansCDF *cdf, int16_t level) {
+static double level_bits(const SntModel *cdf, int16_t level) {
     uint16_t sym = s2u(level);
     double bits = cdf_bits(cdf, sym);
     if (sym == 255)
@@ -98,21 +95,16 @@ static double block_sse(const int16_t *src, const int16_t *rec, int vw, int vh) 
     return sse;
 }
 
-/* ── Symbol recording ──────────────────────────────────────────────── */
-typedef struct { uint16_t cdf_lo; uint16_t freq; } SymRange;
-
-/* Forward-pass symbol sink: records each symbol's rANS range, adapts its
- * CDF, and holds the overflow bit writer for escapes and PVQ shapes. */
+/* ── Symbol output ─────────────────────────────────────────────────── */
+/* Symbol sink: the range coder (each symbol adapts its model), and the
+ * overflow bit writer for escapes and PVQ shapes. */
 typedef struct {
-    SymRange     *ranges;
-    uint32_t      rc;
+    SntRangeEnc  *rc;
     SntBitWriter *ov;
 } SymSink;
 
-static void rec(SymSink *s, RansCDF *cdf, uint16_t sym) {
-    rans_cdf_symbol_range(cdf, sym, &s->ranges[s->rc].cdf_lo, &s->ranges[s->rc].freq);
-    rans_cdf_adapt(cdf, sym);
-    s->rc++;
+static void rec(SymSink *s, SntModel *m, uint16_t sym) {
+    snt_rc_encode_sym(s->rc, m, sym);
 }
 
 /* ── Luma block coding ─────────────────────────────────────────────── */
@@ -135,8 +127,8 @@ typedef struct {
  *   plus the low AC when td_ac. pred: prediction block added back on
  *   reconstruction (NULL for transform-domain intra).
  * t: context block type (0 intra, 1 inter).
- * With a sink, symbols are emitted and CDFs adapt as they go. Without
- * one, nothing is emitted, the CDFs are untouched, and out->bits
+ * With a sink, symbols are emitted and models adapt as they go. Without
+ * one, nothing is emitted, the models are untouched, and out->bits
  * estimates the cost from their current state. */
 static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
                       const int16_t *dct_in, const int16_t *td_pred, int td_ac,
@@ -766,15 +758,15 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     snt_bw_put_bits(&bw, (input_u && input_v) ? 1u : 0u, 1);
     snt_bw_byte_align(&bw);
 
-    /* ── Allocate rANS working buffers ────────────────────────────── */
+    /* ── Range coder and overflow buffers ──────────────────────────── */
     int cw = width / 2, ch = height / 2;
     int cblk = 4;
     int cpad_w = ((cw + cblk - 1) / cblk) * cblk;
     int cpad_h = ((ch + cblk - 1) / cblk) * cblk;
-    int chroma_blocks = (input_u && input_v) ? 2 * (cpad_w / cblk) * (cpad_h / cblk) : 0;
 
-    uint32_t max_ranges = (uint32_t)(total_blocks * 85 + chroma_blocks * 16 + 256);
-    SymRange *ranges = (SymRange *)malloc(max_ranges * sizeof(SymRange));
+    uint8_t *rc_buf = (uint8_t *)malloc(bs_capacity);
+    SntRangeEnc renc;
+    snt_rc_enc_init(&renc, rc_buf, bs_capacity);
 
     uint32_t ov_cap = (uint32_t)(total_blocks * 128 + 4096);
     uint8_t *ov_buf = (uint8_t *)malloc(ov_cap);
@@ -793,10 +785,9 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     if (!is_inter || !(is_bidi ? ctx->cdf_state_b_valid : ctx->cdf_state_valid))
         snt_cdf_set_init(cs);
 
-    SymSink sink = { ranges, 0, &ov };
+    SymSink sink = { &renc, &ov };
     #define REC(cdf, sym) rec(&sink, &(cdf), (sym))
 
-    /* ── PHASE 1: Forward pass — record symbols + overflow ─────── */
     /* Per-block mode flags for chroma inter derivation */
     int *blk_is_inter = (int *)calloc(total_blocks, sizeof(int));
     int *blk_is_skip = (int *)calloc(total_blocks, sizeof(int));
@@ -982,26 +973,11 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         snt_deblock_chroma(chroma_rec[1], cw, ch, cw, cstep, is_inter ? blk_is_skip : NULL, mv_field, blk_cols);
     }
 
-    /* ── PHASE 2: Reverse rANS encode ──────────────────────────────── */
-    uint32_t rev_cap = sink.rc * 2 + 64;
-    uint16_t *rev_buf = (uint16_t *)malloc(rev_cap * sizeof(uint16_t));
-    RansEncoder renc;
-    rans_enc_init(&renc, rev_buf, rev_cap, 1);
-
-    for (int32_t i = (int32_t)sink.rc - 1; i >= 0; i--)
-        rans_enc_put(&renc, ranges[i].cdf_lo, ranges[i].freq, (uint32_t)i);
-    rans_enc_flush(&renc);
-
-    /* ── PHASE 3: Write to output bitstream ────────────────────────── */
-    uint32_t rans_words;
-    const uint16_t *rans_data = rans_enc_data(&renc, &rans_words);
-    uint32_t rans_bytes = rans_words * 2;
-
-    snt_bw_put_bits(&bw, rans_bytes, 32);
-    for (uint32_t i = 0; i < rans_words; i++) {
-        snt_bw_put_byte(&bw, (uint8_t)(rans_data[i] & 0xFF));
-        snt_bw_put_byte(&bw, (uint8_t)(rans_data[i] >> 8));
-    }
+    /* ── Write the range-coded bytes, then the overflow bits ───────── */
+    uint32_t rc_bytes = snt_rc_enc_finish(&renc);
+    snt_bw_put_bits(&bw, rc_bytes, 32);
+    for (uint32_t i = 0; i < rc_bytes; i++)
+        snt_bw_put_byte(&bw, rc_buf[i]);
 
     snt_bw_byte_align(&ov);
     uint32_t ov_len = snt_bw_bytes_written(&ov);
@@ -1011,7 +987,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     snt_bw_byte_align(&bw);
     *bs_len = snt_bw_bytes_written(&bw);
 
-    /* CDFs now carry into the next frame of the same kind */
+    /* Models now carry into the next frame of the same kind */
     if (is_bidi)
         ctx->cdf_state_b_valid = 1;
     else
@@ -1069,8 +1045,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     free(blk_dir);
     free(blk_is_inter);
     free(blk_is_skip);
-    free(ranges);
+    free(rc_buf);
     free(ov_buf);
-    free(rev_buf);
     return 0;
 }

@@ -1,5 +1,5 @@
 /*
- * Sinter Codec — rANS Entropy Coder
+ * Sinter Codec — rANS Entropy Coder (not used: the format uses rangecoder.c)
  * See rans.c for implementation details.
  */
 #ifndef SNT_RANS_H

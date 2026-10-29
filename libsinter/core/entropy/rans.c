@@ -1,5 +1,5 @@
 /*
- * Sinter Codec — rANS Entropy Coder
+ * Sinter Codec — rANS Entropy Coder (not used: the format uses rangecoder.c)
  * Implements Section 1.3: Entropy Coding
  *
  * Range Asymmetric Numeral Systems (rANS) with:

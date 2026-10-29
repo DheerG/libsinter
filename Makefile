@@ -12,7 +12,7 @@ CORE_SRC = \
 	$(SRC_DIR)/core/transform/dct.c \
 	$(SRC_DIR)/core/quantize/pvq.c \
 	$(SRC_DIR)/core/quantize/qp_table.c \
-	$(SRC_DIR)/core/entropy/rans.c \
+	$(SRC_DIR)/core/entropy/rangecoder.c \
 	$(SRC_DIR)/core/bitstream/bitstream.c \
 	$(SRC_DIR)/core/prediction/intra.c \
 	$(SRC_DIR)/core/prediction/obmc.c \

@@ -1,5 +1,5 @@
 /*
- * Sinter Codec — Decoder with rANS entropy coding + inter prediction
+ * Sinter Codec — Decoder with range coding + inter prediction
  * Mirrors encoder symbol order exactly.
  * No lapping post-filter: the encoder does not pre-filter (see encoder.c).
  */
@@ -14,7 +14,7 @@
 #include "../core/quantize/pvq.h"
 #include "../core/quantize/qp_table.h"
 #include "../core/bitstream/bitstream.h"
-#include "../core/entropy/rans.h"
+#include "../core/entropy/rangecoder.h"
 #include "../core/prediction/motion_est.h"
 #include "../core/prediction/mc.h"
 #include "../core/filter/deblock.h"
@@ -30,9 +30,8 @@ static inline int16_t u2s(uint16_t s) {
 }
 
 /* Decode one MV-delta component (escape: signed exp-Golomb overflow) */
-static int16_t dec_mvd(RansDecoder *rd, RansCDF *cdf, SntBitReader *ovr) {
-    uint16_t sym = rans_dec_symbol(rd, cdf);
-    rans_cdf_adapt(cdf, sym);
+static int16_t dec_mvd(SntRangeDec *rd, SntModel *cdf, SntBitReader *ovr) {
+    uint16_t sym = (uint16_t)snt_rc_decode_sym(rd, cdf);
     return sym == 255 ? (int16_t)snt_br_get_sexpgolomb(ovr) : u2s(sym);
 }
 
@@ -109,20 +108,21 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     uint32_t chroma_present = snt_br_get_bits(&br, 1);
     snt_br_byte_align(&br);
 
-    /* ── SECTION B: Read rANS payload ──────────────────────────────── */
-    uint32_t rans_bytes = snt_br_get_bits(&br, 32);
-    uint8_t *rans_buf = (uint8_t *)malloc(rans_bytes + 4);
-    for (uint32_t i = 0; i < rans_bytes; i++)
-        rans_buf[i] = snt_br_get_byte(&br);
+    /* ── SECTION B: Read the range-coded payload ───────────────────── */
+    uint32_t rc_bytes = snt_br_get_bits(&br, 32);
+    if (rc_bytes > bs_len) rc_bytes = bs_len;  /* damaged stream */
+    uint8_t *rc_buf = (uint8_t *)malloc(rc_bytes + 4);
+    for (uint32_t i = 0; i < rc_bytes; i++)
+        rc_buf[i] = snt_br_get_byte(&br);
 
     /* ── SECTION C: Overflow reader ────────────────────────────────── */
     uint32_t ov_start = br.byte_pos;
     SntBitReader ovr;
     snt_br_init(&ovr, bitstream + ov_start, bs_len - ov_start);
 
-    /* ── Init rANS decoder ─────────────────────────────────────────── */
-    RansDecoder rdec;
-    rans_dec_init(&rdec, rans_buf, rans_bytes, 1);
+    /* ── Init range decoder ────────────────────────────────────────── */
+    SntRangeDec rdec;
+    snt_rc_dec_init(&rdec, rc_buf, rc_bytes);
 
     /* ── Entropy contexts: reset on key frames, carried across inter ──
      * B-frames keep their own set, carried from B-frame to B-frame. */
@@ -136,9 +136,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     if (!is_inter || !(is_bidi ? ctx->cdf_state_b_valid : ctx->cdf_state_valid))
         snt_cdf_set_init(cs);
 
-    uint16_t _dec_sym;
-    #define DEC(cdf) (_dec_sym = rans_dec_symbol(&rdec, &(cdf)), \
-        rans_cdf_adapt(&(cdf), _dec_sym), _dec_sym)
+    #define DEC(m) ((uint16_t)snt_rc_decode_sym(&rdec, &(m)))
 
     /* ── Decode luma blocks ────────────────────────────────────────── */
     int16_t *recon = (int16_t *)calloc((size_t)pad_w * pad_h, sizeof(int16_t));
@@ -545,7 +543,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                         width, height, stride_y, stride_uv);
     }
 
-    /* CDFs now carry into the next frame of the same kind */
+    /* Models now carry into the next frame of the same kind */
     if (is_bidi)
         ctx->cdf_state_b_valid = 1;
     else
@@ -588,6 +586,6 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     free(blk_dir);
     free(blk_is_inter);
     free(blk_is_skip);
-    free(rans_buf);
+    free(rc_buf);
     return 0;
 }

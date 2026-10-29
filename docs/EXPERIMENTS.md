@@ -2,6 +2,8 @@
 
 This file is the work plan for the `more-compression` branch, the rules for each experiment, and a log of every experiment tried, kept or dropped. Read the log before trying an idea: if it is there, either skip it or change the shape that failed and say why.
 
+**Outcome.** Every item of the queue is kept or dropped, and the last three experiments from the bit breakdown each saved under 0.5%, so the plan is done. Against `main` (38f3a7d), on the tuning clips at 60 frames: luma BD-rate -23.0%, YUV -22.6%, SSIM -27.0% (the full-length results against x264 are in the README). Kept: items 1-9 and 11, the frame-level part of 13, and five context changes from the bit breakdown. Dropped: 10 and 12 after measuring their upper bounds, 13b for patent risk, 14 after measuring it.
+
 ## Rules
 
 - **Sources.** A format tool (anything the decoder runs) follows [PROVENANCE.md](../PROVENANCE.md): it comes from a publication before 2004, never from H.264/AVC, its drafts or a later codec (VP8 onward, Daala, AV1), or it is new and a patent search is recorded in [NOVEL.md](NOVEL.md) before it is kept. Encoder-only methods can be patented too, so each one also needs a pre-2004 source in its commit, or a recorded search. If a search finds the same idea in a patent or application, drop or redesign it.

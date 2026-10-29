@@ -38,6 +38,24 @@ void snt_pred_luma8(const SntSplinePlane *ref_f, const SntSplinePlane *ref_b,
                     const SntSplinePlane *ref_2,
                     int x0, int y0, int dir, SntMV mvf, SntMV mvb, uint8_t *pred);
 
+/* Motion of a block, for overlapped prediction */
+typedef struct {
+    int   dir;
+    SntMV mvf, mvb;
+} SntMotion;
+
+/* Overlapped block motion compensation (ITU-T H.263 Annex F.3): the 8x8
+ * luma prediction of motion cur, with its top half blended with the
+ * prediction at the motion of the block above and its left half with the
+ * prediction at the motion of the block to the left, by Annex F's weights
+ * H0, H1 and H2 (eighths). The bottom and right halves use cur for the
+ * remote prediction, as Annex F does for blocks in the macroblock below:
+ * every motion used is decoded before the block. Callers pass cur for a
+ * neighbour that is intra or outside the frame (Annex F). */
+void snt_pred_luma8_obmc(const SntSplinePlane *ref_f, const SntSplinePlane *ref_b,
+                         const SntSplinePlane *ref_2, int x0, int y0, SntMotion cur,
+                         SntMotion above, SntMotion left, uint8_t *pred);
+
 /* Sum of absolute differences between two predictions of the 8x8 luma
  * block at (x0, y0): direction dira with MVs (af, ab), and dirb with
  * (bf, bb) */

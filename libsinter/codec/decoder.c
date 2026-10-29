@@ -167,16 +167,21 @@ static int dec_ref(SntRangeDec *rd, SntCdfSet *cs, int three, int left_dir) {
     return SNT_DIR_REF1;
 }
 
-/* Inter predictions, or zeros for a malformed stream that lacks a reference */
+/* Inter predictions (luma overlapped with the above and left blocks'
+ * motion, snt_pred_luma8_obmc), or zeros for a malformed stream that lacks
+ * a reference */
 static void dec_pred_luma(const SntSplinePlane *rf, const SntSplinePlane *rb,
                           const SntSplinePlane *r2, int x0, int y0,
-                          int dir, SntMV mvf, SntMV mvb, uint8_t *pred) {
-    if (((dir & SNT_DIR_FWD) && !rf->coef) || ((dir & (SNT_DIR_BWD | SNT_DIR_REF1)) && !rb->coef) ||
-        ((dir & SNT_DIR_REF2) && !r2->coef)) {
-        memset(pred, 0, 64);
-        return;
+                          SntMotion cur, SntMotion above, SntMotion left, uint8_t *pred) {
+    for (int k = 0; k < 3; k++) {
+        int dir = (k == 0 ? cur : k == 1 ? above : left).dir;
+        if (((dir & SNT_DIR_FWD) && !rf->coef) || ((dir & (SNT_DIR_BWD | SNT_DIR_REF1)) && !rb->coef) ||
+            ((dir & SNT_DIR_REF2) && !r2->coef)) {
+            memset(pred, 0, 64);
+            return;
+        }
     }
-    snt_pred_luma8(rf, rb, r2, x0, y0, dir, mvf, mvb, pred);
+    snt_pred_luma8_obmc(rf, rb, r2, x0, y0, cur, above, left, pred);
 }
 
 static void dec_pred_chroma(const uint8_t *rf, const uint8_t *rb, const uint8_t *r2, int w, int h,
@@ -438,7 +443,14 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     mv_field[blk_idx] = best_mv;
                     mvb_field[blk_idx] = best_mvb;
                     blk_dir[blk_idx] = (uint8_t)dir;
-                    dec_pred_luma(ref_f, ref_b, ref_2, px0, py0, dir, best_mv, best_mvb, mc_blk);
+                    /* Overlapped with the motion of the inter blocks above
+                     * and to the left (an intra or missing neighbour counts
+                     * as this block's motion) */
+                    SntMotion cur = { dir, best_mv, best_mvb }, am = cur, lm = cur;
+                    int ai = blk_idx - blk_cols, li = blk_idx - 1;
+                    if (by > 0 && blk_dir[ai]) am = (SntMotion){ blk_dir[ai], mv_field[ai], mvb_field[ai] };
+                    if (bx > 0 && blk_dir[li]) lm = (SntMotion){ blk_dir[li], mv_field[li], mvb_field[li] };
+                    dec_pred_luma(ref_f, ref_b, ref_2, px0, py0, cur, am, lm, mc_blk);
                 }
 
                 if (block_is_skip) {

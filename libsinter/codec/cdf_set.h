@@ -62,7 +62,11 @@ typedef struct {
     SntModel bdir;                     /* B-frame prediction direction - 1 (SNT_DIR_*) */
     SntModel inter[SNT_AGREE_CLASSES];   /* inter-frame block: inter (1) or intra, by agreement */
     SntModel iskip[SNT_AGREE_CLASSES];   /* inter block: skipped (1) or coded, by agreement */
-    SntModel mvx, mvy;                   /* MV deltas */
+    /* MV deltas as binary decisions (levels.h), by component (x, y); Z and G
+     * also by block size (8x8, 16x16) and, for y, whether x's delta is zero */
+    SntModel vz[2][2][2][SNT_AGREE_CLASSES], vs[2], vg[2][2][2][SNT_AGREE_CLASSES];
+    SntModel vx[2][SNT_LEVEL_MAX_CAT];       /* X: category */
+    SntModel vm[2][SNT_LEVEL_MAX_CAT + 1];   /* M: magnitude bits, by category */
     /* Chroma 4x4 blocks: a coded flag, then the 16 levels in zigzag order,
      * DC first, as binary decisions (levels.h), by block type */
     SntModel cflag[2][2][3];           /* coded (1) or all zero, by luma block coded,
@@ -136,8 +140,19 @@ static inline void snt_cdf_set_init_uniform(SntCdfSet *s) {
         snt_model_init(&s->iskip[a], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
     }
     snt_model_init(&s->bdir, 3, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
-    snt_model_init(&s->mvx, 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
-    snt_model_init(&s->mvy, 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
+    for (int c = 0; c < 2; c++) {
+        for (int z = 0; z < 2; z++)
+            for (int x = 0; x < 2; x++)
+                for (int a = 0; a < SNT_AGREE_CLASSES; a++) {
+                    snt_model_init(&s->vz[c][z][x][a], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+                    snt_model_init(&s->vg[c][z][x][a], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+                }
+        snt_model_init(&s->vs[c], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+        for (int i = 0; i < SNT_LEVEL_MAX_CAT; i++)
+            snt_model_init(&s->vx[c][i], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+        for (int i = 0; i <= SNT_LEVEL_MAX_CAT; i++)
+            snt_model_init(&s->vm[c][i], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+    }
 }
 
 #ifndef SNT_NO_TRAINED_TABLES
@@ -213,6 +228,19 @@ static inline SntModel *snt_dclevel_model(SntCdfSet *s, int t, int da, int16_t v
     case 2:  return &s->dg[t][da][v < 0];
     case 3:  return &s->dx[t][b->sub];
     default: return &s->dm[t][b->sub];
+    }
+}
+
+/* Model for decision b of an MV-delta component c (0 x, 1 y) of a block of
+ * size16 (0 8x8, 1 16x16); xz: for y, whether x's delta is zero */
+static inline SntModel *snt_mvd_model(SntCdfSet *s, int c, int size16, int xz, int ac,
+                                      const SntLevelBin *b) {
+    switch (b->kind) {
+    case 0:  return &s->vz[c][size16][xz][ac];
+    case 1:  return &s->vs[c];
+    case 2:  return &s->vg[c][size16][xz][ac];
+    case 3:  return &s->vx[c][b->sub];
+    default: return &s->vm[c][b->sub];
     }
 }
 

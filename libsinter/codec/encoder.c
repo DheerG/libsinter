@@ -42,12 +42,6 @@ static SntMixState *cur_mix;
 
 #define BLK 8
 
-/* ── Zigzag signed-to-unsigned mapping ────────────────────────────── */
-static inline uint16_t s2u(int16_t v) {
-    uint32_t u = (v >= 0) ? (uint32_t)(2 * v) : (uint32_t)(-2 * v - 1);
-    return (u > 254) ? 255 : (uint16_t)u;
-}
-
 /* ── Rate estimates for encoder decisions (non-normative) ──────────── */
 #ifndef RD_LAMBDA
 #define RD_LAMBDA 0.14  /* lambda = RD_LAMBDA * step^2 (orthonormal DCT, SSE) */
@@ -72,22 +66,6 @@ static inline uint16_t s2u(int16_t v) {
 /* Ideal cost in bits of coding sym with model m in its current state. */
 static double cdf_bits(const SntModel *m, uint16_t sym) {
     return -log2((double)m->freq[sym] / m->total);
-}
-
-/* Length of the order-0 exp-Golomb code for v. */
-static int expgolomb_len(uint32_t v) {
-    int prefix = 0;
-    for (uint32_t c = v + 1; c > 1; c >>= 1) prefix++;
-    return 2 * prefix + 1;
-}
-
-/* Bits for a signed level: rANS symbol, plus overflow bits on escape. */
-static double level_bits(const SntModel *cdf, int16_t level) {
-    uint16_t sym = s2u(level);
-    double bits = cdf_bits(cdf, sym);
-    if (sym == 255)
-        bits += expgolomb_len(level >= 0 ? 2u * level : (uint32_t)(-2 * level - 1));
-    return bits;
 }
 
 /* Bits for a luma AC level at zigzag index k, coded as binary decisions
@@ -162,11 +140,9 @@ static double block_sse(const int16_t *src, const int16_t *rec, int vw, int vh) 
 }
 
 /* ── Symbol output ─────────────────────────────────────────────────── */
-/* Symbol sink: the range coder (each symbol adapts its model), and the
- * overflow bit writer for escapes and PVQ shapes. */
+/* Symbol sink: the range coder (each symbol adapts its model) */
 typedef struct {
     SntRangeEnc  *rc;
-    SntBitWriter *ov;
 #ifdef SNT_TRAIN_STATS
     SntModel     *base;   /* first model of the set in use */
     uint32_t    (*hist)[256];
@@ -203,7 +179,7 @@ void snte_train_dump(FILE *f) {
 
 #ifdef SNT_TRAIN_STATS
 /* Ideal cost in bits of every coded symbol, by model set and model; and
- * bytes outside the range coder (headers, escapes) by frame type */
+ * bytes outside the range coder (headers) by frame type */
 static double train_bits[2][SNT_NUM_MODELS];
 static double train_other[3];
 void snte_bits_dump(FILE *f) {
@@ -702,14 +678,28 @@ static void mv_cand_best(int d, double j, SntMV mvf, SntMV mvb, double *jdir,
     if (d == SNT_DIR_BWD && j < jdir[1]) { jdir[1] = j; cb[ncand] = mvb; }
 }
 
+/* Bits for an MV delta d of a block of size16 (0 8x8, 1 16x16), with the
+ * models' current state */
+static double mvd_bits(SntCdfSet *cs, int size16, int ac, SntMV d) {
+    SntLevelBin bins[2 * SNT_LEVEL_MAX_CAT + 4];
+    double bits = 0;
+    for (int c = 0; c < 2; c++) {
+        int16_t v = c ? d.y : d.x;
+        int n = snt_level_bins(v, 0, bins);
+        for (int i = 0; i < n; i++)
+            bits += cdf_bits(snt_mvd_model(cs, c, size16, c && d.x == 0, ac, &bins[i]), bins[i].bit);
+    }
+    return bits;
+}
+
 /* Bits for an inter block's direction (B-frames) and MV deltas */
-static double inter_mv_bits(const EncFrame *f, int dir, SntMV mvf, SntMV mvb,
+static double inter_mv_bits(const EncFrame *f, int size16, int ac, int dir, SntMV mvf, SntMV mvb,
                             SntMV pf, SntMV pb) {
     double b = f->is_bidi ? cdf_bits(&f->cs->bdir, (uint16_t)(dir - 1)) : 0;
     if (dir & SNT_DIR_FWD)
-        b += level_bits(&f->cs->mvx, mvf.x - pf.x) + level_bits(&f->cs->mvy, mvf.y - pf.y);
+        b += mvd_bits(f->cs, size16, ac, (SntMV){ (int16_t)(mvf.x - pf.x), (int16_t)(mvf.y - pf.y) });
     if (dir & SNT_DIR_BWD)
-        b += level_bits(&f->cs->mvx, mvb.x - pb.x) + level_bits(&f->cs->mvy, mvb.y - pb.y);
+        b += mvd_bits(f->cs, size16, ac, (SntMV){ (int16_t)(mvb.x - pb.x), (int16_t)(mvb.y - pb.y) });
     return b;
 }
 
@@ -786,7 +776,7 @@ static double inter8_cost(const EncFrame *f, int bx, int by, const int16_t *src,
     *dc_level = lc.dc_level;
     return block_sse(src, lc.recon, vw, vh) + chroma_cost(f, bx, by, CAND_INTER, d, mvf, mvb, lc.nz)
          + f->lambda * (cdf_bits(&f->cs->inter[ac], 1) + cdf_bits(&f->cs->iskip[ac], 0)
-                        + inter_mv_bits(f, d, mvf, mvb, pf, pb) + lc.bits);
+                        + inter_mv_bits(f, 0, ac, d, mvf, mvb, pf, pb) + lc.bits);
 }
 
 /* The same for the macroblock whose top-left block is (bx0, by0), coded
@@ -814,7 +804,7 @@ static double inter16_cost(const EncFrame *f, int bx0, int by0, int mac, int d, 
         bits += lc.bits;
     }
     return dist + f->lambda * (cdf_bits(&f->cs->mbmode[mac], SNT_MB_INTER16) + bits
-                               + inter_mv_bits(f, d, mvf, mvb, pf, pb));
+                               + inter_mv_bits(f, 1, mac, d, mvf, mvb, pf, pb));
 }
 
 /* Neighbour k (0-7) of mv at a quarter sample */
@@ -983,21 +973,23 @@ static void emit_inter_body(EncFrame *f, int bx, int by, int dir, SntMV mvf, Snt
     f->dc_lev[by * f->blk_cols + bx] = lc.dc_level;
 }
 
-static void emit_mvd(EncFrame *f, SntMV mv, SntMV mv_pred) {
-    int16_t mvd_x = mv.x - mv_pred.x, mvd_y = mv.y - mv_pred.y;
-    uint16_t sx = s2u(mvd_x), sy = s2u(mvd_y);
-    rec(f->sink, &f->cs->mvx, sx);
-    if (sx == 255) snt_bw_put_sexpgolomb(f->sink->ov, mvd_x);
-    rec(f->sink, &f->cs->mvy, sy);
-    if (sy == 255) snt_bw_put_sexpgolomb(f->sink->ov, mvd_y);
+static void emit_mvd(EncFrame *f, int size16, int ac, SntMV mv, SntMV mv_pred) {
+    SntMV d = { (int16_t)(mv.x - mv_pred.x), (int16_t)(mv.y - mv_pred.y) };
+    SntLevelBin bins[2 * SNT_LEVEL_MAX_CAT + 4];
+    for (int c = 0; c < 2; c++) {
+        int n = snt_level_bins(c ? d.y : d.x, 0, bins);
+        for (int i = 0; i < n; i++)
+            rec(f->sink, snt_mvd_model(f->cs, c, size16, c && d.x == 0, ac, &bins[i]), bins[i].bit);
+    }
 }
 
 /* Emit an inter block's direction (B-frames) and MV deltas */
-static void emit_inter_mvs(EncFrame *f, int dir, SntMV mvf, SntMV mvb, SntMV pf, SntMV pb) {
+static void emit_inter_mvs(EncFrame *f, int size16, int ac, int dir, SntMV mvf, SntMV mvb,
+                           SntMV pf, SntMV pb) {
     if (f->is_bidi)
         rec(f->sink, &f->cs->bdir, (uint16_t)(dir - 1));
-    if (dir & SNT_DIR_FWD) emit_mvd(f, mvf, pf);
-    if (dir & SNT_DIR_BWD) emit_mvd(f, mvb, pb);
+    if (dir & SNT_DIR_FWD) emit_mvd(f, size16, ac, mvf, pf);
+    if (dir & SNT_DIR_BWD) emit_mvd(f, size16, ac, mvb, pb);
 }
 
 /* Emit one 8x8 block in its chosen mode, with its mode symbols */
@@ -1022,7 +1014,7 @@ static void emit_block(EncFrame *f, int bx, int by, const BlockChoice *bc) {
                 SntMV zero = {0, 0};
                 SntMV mvf = (bc->dir & SNT_DIR_FWD) ? bc->mvf : zero;
                 SntMV mvb = (bc->dir & SNT_DIR_BWD) ? bc->mvb : zero;
-                emit_inter_mvs(f, bc->dir, mvf, mvb, pf, pb);
+                emit_inter_mvs(f, 0, ac, bc->dir, mvf, mvb, pf, pb);
                 emit_inter_body(f, bx, by, bc->dir, mvf, mvb, 0);
             }
             return;
@@ -1158,7 +1150,7 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
         for (int z = 0; z < 4; z++)
             emit_inter_body(f, bx0 + (z & 1), by0 + (z >> 1), sdir, smf, smb, 1);
     } else {
-        emit_inter_mvs(f, m16.dir, m16.mvf, m16.mvb, pf, pb);
+        emit_inter_mvs(f, 1, mac, m16.dir, m16.mvf, m16.mvb, pf, pb);
         for (int z = 0; z < 4; z++)
             emit_inter_body(f, bx0 + (z & 1), by0 + (z >> 1), m16.dir, m16.mvf, m16.mvb, 0);
     }
@@ -1174,7 +1166,7 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
  *   IF inter frame AND all four 8x8 blocks inside the frame:
  *     REC(mbmode, m)                // SNT_MB_SPLIT / SKIP16 / INTER16
  *     IF SKIP16:  (all four blocks: MC prediction with the global motion)
- *     IF INTER16: [B: REC(bdir, dir - 1)], REC(mvx, mvy) per used direction,
+ *     IF INTER16: [B: REC(bdir, dir - 1)], MV delta per used direction (below),
  *                 then FOR each 8x8 block in Z order:
  *                 DC + bands as an inter-coded block (below)
  *   FOR each 8x8 block in Z order (split macroblocks only):
@@ -1187,7 +1179,8 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
  *       IF coded:
  *         [B-frame: REC(bdir, dir - 1)]
  *         FOR each used direction (forward, then backward):
- *           REC(mvx, s2u(mvd_x)), REC(mvy, s2u(mvd_y))
+ *           MV delta: x, then y, each as binary decisions (levels.h, MV
+ *           models by component, block size and for y whether x is zero)
  *   IF intra block: REC(imode[is_inter_frame], mode)  // SNT_IPRED_* (intra_acdc.h)
  *   DC level's binary decisions (levels.h, DC models; Z, S, G by the left
  *     and above blocks' DC levels, snt_dc_context)  // residual (inter) or pixels (intra)
@@ -1268,10 +1261,6 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     SntRangeEnc renc;
     snt_rc_enc_init(&renc, rc_buf, bs_capacity);
 
-    uint32_t ov_cap = (uint32_t)(total_blocks * 128 + 4096);
-    uint8_t *ov_buf = (uint8_t *)malloc(ov_cap);
-    SntBitWriter ov;
-    snt_bw_init(&ov, ov_buf, ov_cap);
 
     /* ── Entropy contexts: reset on key frames, carried across inter ──
      * B-frames keep their own set, carried from B-frame to B-frame. */
@@ -1309,9 +1298,9 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     int set_id = is_bidi ? SNT_SET_B : SNT_SET_P;
     if (!is_inter || !(is_bidi ? ctx->cdf_state_b_valid : ctx->cdf_state_valid))
         train_cls[set_id] = snt_model_class(fhdr.base_qp);
-    SymSink sink = { &renc, &ov, (SntModel *)cs, train_hist[set_id][train_cls[set_id]], set_id };
+    SymSink sink = { &renc, (SntModel *)cs, train_hist[set_id][train_cls[set_id]], set_id };
 #else
-    SymSink sink = { &renc, &ov };
+    SymSink sink = { &renc };
 #endif
     #define REC(cdf, sym) rec(&sink, &(cdf), (sym))
 
@@ -1503,11 +1492,9 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         snt_deblock_chroma(chroma_rec[1], cw, ch, cw, cstep, is_inter ? blk_is_skip : NULL, blk_cols);
     }
 
-    /* ── Frame: header, overflow bits, then the range-coded bytes up to
-     *    the end of the frame ───────────────────────────────────────── */
+    /* ── Frame: header, then the range-coded bytes up to the end of the
+     *    frame ──────────────────────────────────────────────────────── */
     uint32_t rc_bytes = snt_rc_enc_finish(&renc);
-    snt_bw_byte_align(&ov);
-    uint32_t ov_len = snt_bw_bytes_written(&ov);
 
     snt_write_frame_header(&bw, &fhdr);
     snt_bw_put_bits(&bw, (input_u && input_v) ? 1u : 0u, 1);
@@ -1519,10 +1506,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         snt_bw_put_sexpgolomb(&bw, gmb.x);
         snt_bw_put_sexpgolomb(&bw, gmb.y);
     }
-    snt_bw_put_expgolomb(&bw, ov_len);
     snt_bw_byte_align(&bw);
-    for (uint32_t i = 0; i < ov_len; i++)
-        snt_bw_put_byte(&bw, ov_buf[i]);
     for (uint32_t i = 0; i < rc_bytes; i++)
         snt_bw_put_byte(&bw, rc_buf[i]);
     *bs_len = snt_bw_bytes_written(&bw);
@@ -1593,6 +1577,5 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     free(blk_is_inter);
     free(blk_is_skip);
     free(rc_buf);
-    free(ov_buf);
     return 0;
 }

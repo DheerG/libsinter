@@ -31,15 +31,30 @@ static SntMixState *cur_mix;
 
 #define BLK 8
 
-/* ── Zigzag unsigned-to-signed mapping ────────────────────────────── */
-static inline int16_t u2s(uint16_t s) {
-    return (s % 2 == 0) ? (int16_t)(s / 2) : -(int16_t)((s + 1) / 2);
-}
-
-/* Decode one MV-delta component (escape: signed exp-Golomb overflow) */
-static int16_t dec_mvd(SntRangeDec *rd, SntModel *cdf, SntBitReader *ovr) {
-    uint16_t sym = (uint16_t)snt_rc_decode_sym(rd, cdf);
-    return sym == 255 ? (int16_t)snt_br_get_sexpgolomb(ovr) : u2s(sym);
+/* Decode an MV delta of a block of size16 (0 8x8, 1 16x16) and add it to
+ * *mv: x, then y, each as binary decisions (levels.h, MV models) */
+static void dec_mvd(SntRangeDec *rd, SntCdfSet *cs, int size16, int ac, SntMV *mv) {
+    int16_t d[2];
+    for (int c = 0; c < 2; c++) {
+        int xz = c && d[0] == 0;
+        d[c] = 0;
+        if (!snt_rc_decode_sym(rd, &cs->vz[c][size16][xz][ac])) continue;
+        int neg = snt_rc_decode_sym(rd, &cs->vs[c]);
+        int32_t mag = 1;
+        if (snt_rc_decode_sym(rd, &cs->vg[c][size16][xz][ac])) {
+            int k = 1;
+            while (k < SNT_LEVEL_MAX_CAT && snt_rc_decode_sym(rd, &cs->vx[c][k - 1]))
+                k++;
+            uint32_t a1 = 1;
+            for (int i = k - 2; i >= 0; i--)
+                a1 = (a1 << 1) | (uint32_t)snt_rc_decode_sym(rd, &cs->vm[c][k]);
+            mag = (int32_t)a1 + 1;
+            if (mag > 32767) mag = 32767;  /* damaged stream */
+        }
+        d[c] = (int16_t)(neg ? -mag : mag);
+    }
+    mv->x = (int16_t)(mv->x + d[0]);
+    mv->y = (int16_t)(mv->y + d[1]);
 }
 
 /* Prediction of a skipped block (bx, by): as the block to its left if
@@ -165,14 +180,14 @@ static void dec_pred_chroma(const uint8_t *rf, const uint8_t *rb, int w, int h, 
  *
  * FOR each 16x16 macroblock (raster):
  *   IF inter frame AND full macroblock: DEC(mbmode)
- *     IF INTER16: [B: DEC(bdir)], then DEC(mvx, mvy) per used direction
+ *     IF INTER16: [B: DEC(bdir)], then an MV delta per used direction
  *   FOR each 8x8 block in Z order (SKIP16/INTER16: no per-block mode symbols):
  *   IF inter frame (split macroblock):
  *     DEC(inter) → inter_flag
  *     IF inter_flag:
  *       DEC(iskip) → skip_flag
  *       IF skip: prediction with the global motion, continue (B: bi-directional)
- *       IF coded: [B: DEC(bdir)], then DEC(mvx), DEC(mvy) per used direction
+ *       IF coded: [B: DEC(bdir)], then an MV delta per used direction
  *   IF intra block: DEC(imode[is_inter_frame]) → mode (SNT_IPRED_*, intra_acdc.h)
  *   DC level's decisions (DC models, context: the left and above blocks' DC
  *     levels) → dc_level (residual for inter, absolute for intra)
@@ -214,7 +229,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     uint16_t step = snt_qp_to_step(ctx->header.base_qp);
 
     /* Fixed fields: chroma present, global motion against each reference
-     * (skipped blocks predict with it), the overflow section's length */
+     * (skipped blocks predict with it) */
     uint32_t chroma_present = snt_br_get_bits(&br, 1);
     SntMV gmf = {0, 0}, gmb = {0, 0};
     if (is_inter) {
@@ -225,16 +240,12 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         gmb.x = (int16_t)snt_br_get_sexpgolomb(&br);
         gmb.y = (int16_t)snt_br_get_sexpgolomb(&br);
     }
-    uint32_t ov_len = snt_br_get_expgolomb(&br);
     snt_br_byte_align(&br);
 
-    /* Overflow bits, then the range-coded bytes to the end of the frame */
-    uint32_t ov_start = br.byte_pos < bs_len ? br.byte_pos : bs_len;
-    if (ov_len > bs_len - ov_start) ov_len = bs_len - ov_start;  /* damaged stream */
-    SntBitReader ovr;
-    snt_br_init(&ovr, bitstream + ov_start, ov_len);
-    const uint8_t *rc_buf = bitstream + ov_start + ov_len;
-    uint32_t rc_bytes = bs_len - ov_start - ov_len;
+    /* The range-coded bytes run to the end of the frame */
+    uint32_t rc_start = br.byte_pos < bs_len ? br.byte_pos : bs_len;
+    const uint8_t *rc_buf = bitstream + rc_start;
+    uint32_t rc_bytes = bs_len - rc_start;
 
     /* ── Init range decoder ────────────────────────────────────────── */
     SntRangeDec rdec;
@@ -301,7 +312,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         /* Macroblock mode (inter frames, full macroblocks only). The 16x16
          * predictor comes from neighbours outside the macroblock. */
         int bx0 = (mb % mb_cols) * 2, by0 = (mb / mb_cols) * 2;
-        int mb_mode = SNT_MB_SPLIT, mb_dir = SNT_DIR_FWD;
+        int mb_mode = SNT_MB_SPLIT, mb_dir = SNT_DIR_FWD, mac = 0;
         SntMV mb_mvf = {0, 0}, mb_mvb = {0, 0};
         if (is_inter && bx0 + 1 < blk_cols && by0 + 1 < blk_rows) {
             mb_mvf = snt_mv_predict_at(mv_field, blk_cols, bx0, by0);
@@ -317,7 +328,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             for (int z = 0; z < 4; z++)
                 sad += agree_sad8(ref_f, ref_b, bx0 + (z & 1), by0 + (z >> 1), is_bidi,
                                   sdir, smf, smb, mb_mvf, mb_mvb);
-            mb_mode = DEC(cs->mbmode[snt_agree_class(sad, 256, step)]);
+            mac = snt_agree_class(sad, 256, step);
+            mb_mode = DEC(cs->mbmode[mac]);
             /* SKIP16 predicts with the global motion: bi-directional in
              * B-frames */
             mb_dir = is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
@@ -329,14 +341,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 /* An unused direction's MV is zero (H.263 Annex O) */
                 if (!(mb_dir & SNT_DIR_FWD)) mb_mvf = (SntMV){0, 0};
                 if (!(mb_dir & SNT_DIR_BWD)) mb_mvb = (SntMV){0, 0};
-                if (mb_dir & SNT_DIR_FWD) {
-                    mb_mvf.x += dec_mvd(&rdec, &cs->mvx, &ovr);
-                    mb_mvf.y += dec_mvd(&rdec, &cs->mvy, &ovr);
-                }
-                if (mb_dir & SNT_DIR_BWD) {
-                    mb_mvb.x += dec_mvd(&rdec, &cs->mvx, &ovr);
-                    mb_mvb.y += dec_mvd(&rdec, &cs->mvy, &ovr);
-                }
+                if (mb_dir & SNT_DIR_FWD) dec_mvd(&rdec, cs, 1, mac, &mb_mvf);
+                if (mb_dir & SNT_DIR_BWD) dec_mvd(&rdec, cs, 1, mac, &mb_mvb);
             }
         }
         for (int z = 0; z < 4; z++) {
@@ -381,14 +387,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                                 dir = DEC(cs->bdir) + 1;
                             if (!(dir & SNT_DIR_FWD)) best_mv = (SntMV){0, 0};
                             if (!(dir & SNT_DIR_BWD)) best_mvb = (SntMV){0, 0};
-                            if (dir & SNT_DIR_FWD) {
-                                best_mv.x += dec_mvd(&rdec, &cs->mvx, &ovr);
-                                best_mv.y += dec_mvd(&rdec, &cs->mvy, &ovr);
-                            }
-                            if (dir & SNT_DIR_BWD) {
-                                best_mvb.x += dec_mvd(&rdec, &cs->mvx, &ovr);
-                                best_mvb.y += dec_mvd(&rdec, &cs->mvy, &ovr);
-                            }
+                            if (dir & SNT_DIR_FWD) dec_mvd(&rdec, cs, 0, ac, &best_mv);
+                            if (dir & SNT_DIR_BWD) dec_mvd(&rdec, cs, 0, ac, &best_mvb);
                         }
                     }
                 } else {

@@ -621,10 +621,27 @@ static int agree_class_mb(const EncFrame *f, int bx0, int by0) {
     return snt_agree_class(sad, 256, f->step);
 }
 
-/* Inter prediction of a block and its residual (0 outside the frame) */
-static void mc_residual(const EncFrame *f, int bx, int by, int dir, SntMV mvf, SntMV mvb,
+/* Inter prediction of 8x8 block (bx, by) in direction dir at (mvf, mvb),
+ * overlapped with the motion of the inter blocks above and to the left
+ * (snt_pred_luma8_obmc; an intra neighbour counts as this block's motion).
+ * in16: the block is part of a 16x16 candidate, so its neighbours inside
+ * the macroblock have its motion. */
+static void pred_block(const EncFrame *f, int bx, int by, int dir, SntMV mvf, SntMV mvb, int in16,
+                       uint8_t *pred) {
+    SntMotion cur = { dir, mvf, mvb }, am = cur, lm = cur;
+    int i = by * f->blk_cols + bx, ai = i - f->blk_cols, li = i - 1;
+    if (by > 0 && !(in16 && (by & 1)) && f->blk_dir[ai])
+        am = (SntMotion){ f->blk_dir[ai], f->mv_field[ai], f->mvb_field[ai] };
+    if (bx > 0 && !(in16 && (bx & 1)) && f->blk_dir[li])
+        lm = (SntMotion){ f->blk_dir[li], f->mv_field[li], f->mvb_field[li] };
+    snt_pred_luma8_obmc(f->ref_f, f->ref_b, f->ref_2, bx * BLK, by * BLK, cur, am, lm, pred);
+}
+
+/* Inter prediction of a block (pred_block) and its residual (0 outside
+ * the frame) */
+static void mc_residual(const EncFrame *f, int bx, int by, int dir, SntMV mvf, SntMV mvb, int in16,
                         const int16_t *src, int vw, int vh, uint8_t *pred, int16_t *res) {
-    snt_pred_luma8(f->ref_f, f->ref_b, f->ref_2, bx * BLK, by * BLK, dir, mvf, mvb, pred);
+    pred_block(f, bx, by, dir, mvf, mvb, in16, pred);
     for (int dy = 0; dy < BLK; dy++)
         for (int dx = 0; dx < BLK; dx++)
             res[dy * BLK + dx] = (dy < vh && dx < vw) ? src[dy * BLK + dx] - pred[dy * BLK + dx] : 0;
@@ -803,7 +820,7 @@ static double inter8_cost(const EncFrame *f, int bx, int by, const int16_t *src,
     uint8_t p[64];
     int16_t res[64], td0[64] = {0};
     LumaCode lc;
-    mc_residual(f, bx, by, d, mvf, mvb, src, vw, vh, p, res);
+    mc_residual(f, bx, by, d, mvf, mvb, 0, src, vw, vh, p, res);
     code_luma(f->cs, NULL, f->step, 1, dc_ctx(f, bx, by), res, td0, 0, p, &lc);
     memcpy(rec, lc.recon, sizeof(lc.recon));
     *dc_level = lc.dc_level;
@@ -825,7 +842,7 @@ static double inter16_cost(const EncFrame *f, int bx0, int by0, int mac, int d, 
         uint8_t p[64];
         LumaCode lc;
         load_src(f, bx, by, src, &vw, &vh);
-        mc_residual(f, bx, by, d, mvf, mvb, src, vw, vh, p, res);
+        mc_residual(f, bx, by, d, mvf, mvb, 1, src, vw, vh, p, res);
         /* DC context, with the DC levels of this candidate's blocks inside
          * the macroblock */
         int i = by * f->blk_cols + bx;
@@ -879,7 +896,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
         int sdir;
         SntMV smf, smb;
         skip_motion(f, bx, by, &sdir, &smf, &smb);
-        snt_pred_luma8(f->ref_f, f->ref_b, f->ref_2, px0, py0, sdir, smf, smb, p);
+        pred_block(f, bx, by, sdir, smf, smb, 0, p);
         for (int k = 0; k < 64; k++) p16[k] = p[k];
         double j = block_sse(src, p16, vw, vh) + chroma_cost(f, bx, by, CAND_SKIP, sdir, smf, smb, 0)
                  + f->lambda * (cdf_bits(&cs->inter[fc], 1) + cdf_bits(&cs->iskip[fc], 1));
@@ -1013,7 +1030,7 @@ static void emit_inter_body(EncFrame *f, int bx, int by, int dir, SntMV mvf, Snt
     uint8_t pred[64];
     int vw, vh;
     load_src(f, bx, by, src, &vw, &vh);
-    mc_residual(f, bx, by, dir, mvf, mvb, src, vw, vh, pred, res);
+    mc_residual(f, bx, by, dir, mvf, mvb, 0, src, vw, vh, pred, res);
     if (skip) {
         for (int k = 0; k < 64; k++) rec[k] = pred[k];
         finish_block(f, bx, by, rec, 1, dir, mvf, mvb);
@@ -1121,7 +1138,7 @@ static double eval_mb16(EncFrame *f, int bx0, int by0, SntMV pf, SntMV pb, SntMV
         int16_t src[64], res[64], p16[64];
         uint8_t p[64];
         load_src(f, bx, by, src, &vw, &vh);
-        mc_residual(f, bx, by, sdir, smf, smb, src, vw, vh, p, res);
+        mc_residual(f, bx, by, sdir, smf, smb, 1, src, vw, vh, p, res);
         for (int k = 0; k < 64; k++) p16[k] = p[k];
         d_skip += block_sse(src, p16, vw, vh) + chroma_cost(f, bx, by, CAND_SKIP, sdir, smf, smb, 0);
     }

@@ -66,6 +66,42 @@ void snt_pred_luma8(const SntSplinePlane *ref_f, const SntSplinePlane *ref_b,
     }
 }
 
+/* H.263 Annex F.3 weighting matrices: the current motion (H0), the motion
+ * above or below (H1), left or right (H2); they sum to 8 everywhere */
+static const uint8_t obmc_h0[64] = {
+    4, 5, 5, 5, 5, 5, 5, 4,  5, 5, 5, 5, 5, 5, 5, 5,  5, 5, 6, 6, 6, 6, 5, 5,  5, 5, 6, 6, 6, 6, 5, 5,
+    5, 5, 6, 6, 6, 6, 5, 5,  5, 5, 6, 6, 6, 6, 5, 5,  5, 5, 5, 5, 5, 5, 5, 5,  4, 5, 5, 5, 5, 5, 5, 4,
+};
+static const uint8_t obmc_h1[64] = {
+    2, 2, 2, 2, 2, 2, 2, 2,  1, 1, 2, 2, 2, 2, 1, 1,  1, 1, 1, 1, 1, 1, 1, 1,  1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1,  1, 1, 1, 1, 1, 1, 1, 1,  1, 1, 2, 2, 2, 2, 1, 1,  2, 2, 2, 2, 2, 2, 2, 2,
+};
+static const uint8_t obmc_h2[64] = {
+    2, 1, 1, 1, 1, 1, 1, 2,  2, 2, 1, 1, 1, 1, 2, 2,  2, 2, 1, 1, 1, 1, 2, 2,  2, 2, 1, 1, 1, 1, 2, 2,
+    2, 2, 1, 1, 1, 1, 2, 2,  2, 2, 1, 1, 1, 1, 2, 2,  2, 2, 1, 1, 1, 1, 2, 2,  2, 1, 1, 1, 1, 1, 1, 2,
+};
+
+static int same_motion(SntMotion a, SntMotion b) {
+    return a.dir == b.dir && (!(a.dir & ~SNT_DIR_BWD) || (a.mvf.x == b.mvf.x && a.mvf.y == b.mvf.y)) &&
+           (!(a.dir & SNT_DIR_BWD) || (a.mvb.x == b.mvb.x && a.mvb.y == b.mvb.y));
+}
+
+void snt_pred_luma8_obmc(const SntSplinePlane *ref_f, const SntSplinePlane *ref_b,
+                         const SntSplinePlane *ref_2, int x0, int y0, SntMotion cur,
+                         SntMotion above, SntMotion left, uint8_t *pred) {
+    uint8_t q[64], r[64], s[64];
+    snt_pred_luma8(ref_f, ref_b, ref_2, x0, y0, cur.dir, cur.mvf, cur.mvb, q);
+    int ua = !same_motion(above, cur), ul = !same_motion(left, cur);
+    if (ua) snt_pred_luma8(ref_f, ref_b, ref_2, x0, y0, above.dir, above.mvf, above.mvb, r);
+    if (ul) snt_pred_luma8(ref_f, ref_b, ref_2, x0, y0, left.dir, left.mvf, left.mvb, s);
+    for (int y = 0; y < 8; y++)
+        for (int x = 0; x < 8; x++) {
+            int i = y * 8 + x;
+            int rr = (ua && y < 4) ? r[i] : q[i], ss = (ul && x < 4) ? s[i] : q[i];
+            pred[i] = (uint8_t)((q[i] * obmc_h0[i] + rr * obmc_h1[i] + ss * obmc_h2[i] + 4) >> 3);
+        }
+}
+
 uint32_t snt_pred_sad8(const SntSplinePlane *ref_f, const SntSplinePlane *ref_b,
                        const SntSplinePlane *ref_2, int x0, int y0,
                        int dira, SntMV af, SntMV ab, int dirb, SntMV bf, SntMV bb) {

@@ -8,6 +8,9 @@
 #include <stdlib.h>
 #include "decoder.h"
 #include "cdf_set.h"
+#ifdef SNT_EXPERIMENT_CLIPTABLES
+#include "cliptables.h"
+#endif
 #ifdef SNT_EXPERIMENT_MIXING
 #include "mixer.h"
 /* Mixing state of the model set in use (one decoder per process) */
@@ -217,7 +220,19 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
 #ifdef SNT_EXPERIMENT_MIXING
         snt_mix_init(&dec_mix[is_bidi]);
 #endif
+#ifdef SNT_EXPERIMENT_CLIPTABLES
+        if (ctx->clip_tables)
+            snt_clip_apply(cs, (const SntClipTables *)ctx->clip_tables, is_bidi);
+#endif
     }
+#ifdef SNT_EXPERIMENT_CLIPTABLES
+    /* Key frames start with a flag: per-clip tables follow */
+    if (!is_inter && snt_rc_decode_bit(&rdec, 2048)) {
+        if (!ctx->clip_tables) ctx->clip_tables = malloc(sizeof(SntClipTables));
+        snt_clip_decode(&rdec, (SntClipTables *)ctx->clip_tables);
+        snt_clip_apply(cs, (const SntClipTables *)ctx->clip_tables, SNT_SET_P);
+    }
+#endif
 #ifdef SNT_EXPERIMENT_MIXING
     cur_mix = &dec_mix[is_bidi];
 #endif

@@ -18,6 +18,9 @@
 #include <math.h>
 #include "encoder.h"
 #include "cdf_set.h"
+#ifdef SNT_EXPERIMENT_CLIPTABLES
+#include "cliptables.h"
+#endif
 #ifdef SNT_EXPERIMENT_MIXING
 #include "mixer.h"
 /* Mixing state of the model set in use (one encoder per process) */
@@ -151,6 +154,14 @@ typedef struct {
  * (tools/train/collect_stats.c) */
 static uint32_t train_hist[2][SNT_MODEL_CLASSES][SNT_NUM_MODELS][256];
 static int train_cls[2];
+
+uint32_t snte_train_count(int set, int k, int sym) {
+    uint32_t n = 0;
+    for (int c = 0; c < SNT_MODEL_CLASSES; c++) n += train_hist[set][c][k][sym];
+    return n;
+}
+
+void snte_train_reset(void) { memset(train_hist, 0, sizeof(train_hist)); }
 
 void snte_train_dump(FILE *f) {
     SntCdfSet sizes;
@@ -875,7 +886,20 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
 #ifdef SNT_EXPERIMENT_MIXING
         snt_mix_init(&enc_mix[is_bidi]);
 #endif
+#ifdef SNT_EXPERIMENT_CLIPTABLES
+        if (ctx->clip_tables)
+            snt_clip_apply(cs, (const SntClipTables *)ctx->clip_tables, is_bidi);
+#endif
     }
+#ifdef SNT_EXPERIMENT_CLIPTABLES
+    /* Key frames start with a flag: per-clip tables follow */
+    if (!is_inter) {
+        int send = ctx->clip_tables && ctx->clip_tables_send;
+        snt_rc_encode_bit(&renc, send, 2048);
+        if (send) snt_clip_encode(&renc, (const SntClipTables *)ctx->clip_tables);
+        ctx->clip_tables_send = 0;
+    }
+#endif
 #ifdef SNT_EXPERIMENT_MIXING
     cur_mix = &enc_mix[is_bidi];
 #endif

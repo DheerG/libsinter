@@ -1,24 +1,26 @@
 /*
- * Sinter Codec — Cubic B-spline interpolation of reference frames (normative)
+ * Sinter Codec — Quintic B-spline interpolation of reference frames (normative)
  *
  * M. Unser, A. Aldroubi and M. Eden, "Fast B-spline transforms for
  * continuous image representation and interpolation", IEEE Trans. PAMI
  * 13(3), 1991; and "B-spline signal processing, Part II: efficient design
  * and applications", IEEE Trans. Signal Processing 41(2), 1993.
  *
- * A reference frame is turned once into cubic B-spline coefficients by a
- * recursive prefilter (one causal and one anticausal first-order pass per
- * row, then per column, pole sqrt(3) - 2). The B-spline through those
- * coefficients passes exactly through the frame's samples, and any
- * fractional position is then a 4 x 4 weighted sum of coefficients.
+ * A reference frame is turned once into quintic B-spline coefficients by
+ * a recursive prefilter (gain 120, then a causal and an anticausal
+ * first-order pass for each of the two poles, per row, then per column).
+ * The B-spline through those coefficients passes exactly through the
+ * frame's samples, and any fractional position is then a 6 x 6 weighted
+ * sum of coefficients. (The cubic B-spline, one pole and 4 x 4 weights,
+ * was used before; the quintic one is sharper.)
  *
  * Changes from the sources (see PROVENANCE.md): fixed-point arithmetic
- * (pole and boundary constants in Q16, coefficients in Q8) so encoder
- * and decoder agree exactly; the frame is first extended by repeating
- * its edge samples SNT_SPLINE_PAD pixels on each side, and the mirror
- * boundary of the sources applies at the edge of that extension; a
- * motion vector with no fractional part copies the reference samples,
- * which is what the exact B-spline gives there.
+ * (pole and boundary constants in Q16, coefficients in Q8, weights exact
+ * in 1/122880ths) so encoder and decoder agree exactly; the frame is
+ * first extended by repeating its edge samples SNT_SPLINE_PAD pixels on
+ * each side, and the mirror boundary of the sources applies at the edge
+ * of that extension; a motion vector with no fractional part copies the
+ * reference samples, which is what the exact B-spline gives there.
  */
 #ifndef SNT_SPLINE_H
 #define SNT_SPLINE_H

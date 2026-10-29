@@ -25,8 +25,11 @@ void snt_mc_chroma(const uint8_t *ref, int w, int h, int x0, int y0,
                    SntMV mv, int bw, int bh, uint8_t *dst);
 
 /* Inter prediction directions: forward (past reference), backward
- * (future reference, B-frames), or the rounded average of both. */
-enum { SNT_DIR_FWD = 1, SNT_DIR_BWD = 2, SNT_DIR_BI = 3 };
+ * (future reference, B-frames), or the rounded average of both.
+ * SNT_DIR_FWD | SNT_DIR_REF1 (P-frames with two references): forward from
+ * the second reference, the anchor before the newest, which the
+ * functions below receive as ref_b. */
+enum { SNT_DIR_FWD = 1, SNT_DIR_BWD = 2, SNT_DIR_BI = 3, SNT_DIR_REF1 = 4 };
 
 /* Predict the 8x8 luma block at (x0, y0) in direction dir: forward from
  * ref_f at mvf, backward from ref_b at mvb, or (a + b + 1) >> 1. */

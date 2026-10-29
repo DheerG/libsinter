@@ -49,9 +49,12 @@ $(BUILD)/libsinter.a: $(CORE_OBJ)
 	@mkdir -p $(dir $@)
 	ar rcs $@ $^
 
+# -MMD -MP: rebuild objects when a header they include changes
 $(BUILD)/%.o: $(SRC_DIR)/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+-include $(CORE_OBJ:.o=.d)
 
 # Test targets — each links against the library
 $(BUILD)/test_%: $(TEST_DIR)/test_%.c $(BUILD)/libsinter.a

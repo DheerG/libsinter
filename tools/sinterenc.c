@@ -244,5 +244,6 @@ done:
     free(ctx.ref_old_y); free(ctx.ref_old_u); free(ctx.ref_old_v); free(ctx.cdf_state_b);
     free(ctx.last_y); free(ctx.last_u); free(ctx.last_v);
     free(ctx.ref_coef); free(ctx.ref_old_coef);
+    free(ctx.key_y); free(ctx.key_u); free(ctx.key_v); free(ctx.key_coef);
     return 0;
 }

@@ -79,13 +79,14 @@ static void skip_motion(const uint8_t *blk_dir, const SntMV *mvf_field, const Sn
  * the skip prediction with the prediction at the forward predictor pf;
  * B-frames compare forward at pf with backward at pb. Zero for a
  * malformed stream that lacks a reference. */
-static uint32_t agree_sad8(const SntSplinePlane *rf, const SntSplinePlane *rb, int bx, int by,
+static uint32_t agree_sad8(const SntSplinePlane *rf, const SntSplinePlane *rb,
+                           const SntSplinePlane *r2, int bx, int by,
                            int is_bidi, int sdir, SntMV smf, SntMV smb, SntMV pf, SntMV pb) {
     SntMV zero = {0, 0};
     if (!rf->coef || (is_bidi && !rb->coef)) return 0;
     if (is_bidi)
-        return snt_pred_sad8(rf, rb, bx * BLK, by * BLK, SNT_DIR_FWD, pf, zero, SNT_DIR_BWD, zero, pb);
-    return snt_pred_sad8(rf, rb, bx * BLK, by * BLK, sdir, smf, smb, SNT_DIR_FWD, pf, zero);
+        return snt_pred_sad8(rf, rb, r2, bx * BLK, by * BLK, SNT_DIR_FWD, pf, zero, SNT_DIR_BWD, zero, pb);
+    return snt_pred_sad8(rf, rb, r2, bx * BLK, by * BLK, sdir, smf, smb, SNT_DIR_FWD, pf, zero);
 }
 
 /* Decode a luma AC level at zigzag index k from its binary decisions
@@ -156,23 +157,36 @@ static int16_t dec_clevel(SntRangeDec *rd, SntCdfSet *cs, int t, int i, int z_kn
     return (int16_t)(neg ? -mag : mag);
 }
 
+/* A P-frame inter block's reference flags (two or three references):
+ * returns 0, SNT_DIR_REF1 or SNT_DIR_REF2. left_dir: the direction of the
+ * block to the left (0 if intra or outside), the flags' context. */
+static int dec_ref(SntRangeDec *rd, SntCdfSet *cs, int three, int left_dir) {
+    int left = (left_dir & SNT_DIR_REF2) ? 2 : (left_dir & SNT_DIR_REF1) ? 1 : 0;
+    if (!snt_rc_decode_sym(rd, &cs->ref1[left > 0])) return 0;
+    if (three && snt_rc_decode_sym(rd, &cs->ref2[left == 2])) return SNT_DIR_REF2;
+    return SNT_DIR_REF1;
+}
+
 /* Inter predictions, or zeros for a malformed stream that lacks a reference */
-static void dec_pred_luma(const SntSplinePlane *rf, const SntSplinePlane *rb, int x0, int y0,
+static void dec_pred_luma(const SntSplinePlane *rf, const SntSplinePlane *rb,
+                          const SntSplinePlane *r2, int x0, int y0,
                           int dir, SntMV mvf, SntMV mvb, uint8_t *pred) {
-    if (((dir & SNT_DIR_FWD) && !rf->coef) || ((dir & (SNT_DIR_BWD | SNT_DIR_REF1)) && !rb->coef)) {
+    if (((dir & SNT_DIR_FWD) && !rf->coef) || ((dir & (SNT_DIR_BWD | SNT_DIR_REF1)) && !rb->coef) ||
+        ((dir & SNT_DIR_REF2) && !r2->coef)) {
         memset(pred, 0, 64);
         return;
     }
-    snt_pred_luma8(rf, rb, x0, y0, dir, mvf, mvb, pred);
+    snt_pred_luma8(rf, rb, r2, x0, y0, dir, mvf, mvb, pred);
 }
 
-static void dec_pred_chroma(const uint8_t *rf, const uint8_t *rb, int w, int h, int x0, int y0,
-                            int dir, SntMV mvf, SntMV mvb, uint8_t *pred) {
-    if (((dir & SNT_DIR_FWD) && !rf) || ((dir & (SNT_DIR_BWD | SNT_DIR_REF1)) && !rb)) {
+static void dec_pred_chroma(const uint8_t *rf, const uint8_t *rb, const uint8_t *r2, int w, int h,
+                            int x0, int y0, int dir, SntMV mvf, SntMV mvb, uint8_t *pred) {
+    if (((dir & SNT_DIR_FWD) && !rf) || ((dir & (SNT_DIR_BWD | SNT_DIR_REF1)) && !rb) ||
+        ((dir & SNT_DIR_REF2) && !r2)) {
         memset(pred, 128, 16);
         return;
     }
-    snt_pred_chroma4(rf, rb, w, h, x0, y0, dir, mvf, mvb, pred);
+    snt_pred_chroma4(rf, rb, r2, w, h, x0, y0, dir, mvf, mvb, pred);
 }
 
 /*
@@ -180,7 +194,7 @@ static void dec_pred_chroma(const uint8_t *rf, const uint8_t *rb, int w, int h, 
  *
  * FOR each 16x16 macroblock (raster):
  *   IF inter frame AND full macroblock: DEC(mbmode)
- *     IF INTER16: [B: DEC(bdir)] [P, two references: DEC(ref1)], then an MV
+ *     IF INTER16: [B: DEC(bdir)] [P, two or three references: dec_ref], then an MV
  *                 delta per used direction
  *   FOR each 8x8 block in Z order (SKIP16/INTER16: no per-block mode symbols):
  *   IF inter frame (split macroblock):
@@ -188,7 +202,7 @@ static void dec_pred_chroma(const uint8_t *rf, const uint8_t *rb, int w, int h, 
  *     IF inter_flag:
  *       DEC(iskip) → skip_flag
  *       IF skip: prediction with the global motion, continue (B: bi-directional)
- *       IF coded: [B: DEC(bdir)] [P, two references: DEC(ref1)], then an MV
+ *       IF coded: [B: DEC(bdir)] [P, two or three references: dec_ref], then an MV
  *                 delta per used direction
  *   IF intra block: DEC(imode[is_inter_frame]) → mode (SNT_IPRED_*, intra_acdc.h)
  *   DC level's decisions (DC models, context: the left and above blocks' DC
@@ -225,12 +239,17 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     int same_ref = ctx->ref_w == width && ctx->ref_h == height;
     SntSplinePlane sp_new = { ctx->ref_y, same_ref ? ctx->ref_coef : NULL, width, height };
     SntSplinePlane sp_old = { ctx->ref_old_y, same_ref ? ctx->ref_old_coef : NULL, width, height };
+    SntSplinePlane sp_key = { ctx->key_y, same_ref ? ctx->key_coef : NULL, width, height };
     SntSplinePlane sp_none = { NULL, NULL, width, height };
     /* P-frames also predict from the anchor before the newest when it is in
      * the same GOP, as ref_b (SNT_DIR_REF1) */
     int has_ref1 = is_inter && !is_bidi && ctx->num_anchors >= 2 && sp_old.coef;
     const SntSplinePlane *ref_f = is_bidi ? &sp_old : &sp_new;
+    /* From the third anchor on, also from the GOP's key frame, as ref_2
+     * (SNT_DIR_REF2) */
+    int has_ref2 = has_ref1 && ctx->num_anchors >= 3 && sp_key.coef;
     const SntSplinePlane *ref_b = is_bidi ? &sp_new : (has_ref1 ? &sp_old : &sp_none);
+    const SntSplinePlane *ref_2 = has_ref2 ? &sp_key : &sp_none;
     uint16_t step = snt_qp_to_step(ctx->header.base_qp);
 
     /* Fixed fields: chroma present, global motion against each reference
@@ -331,7 +350,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                         gmf, gmb, &sdir, &smf, &smb);
             uint32_t sad = 0;
             for (int z = 0; z < 4; z++)
-                sad += agree_sad8(ref_f, ref_b, bx0 + (z & 1), by0 + (z >> 1), is_bidi,
+                sad += agree_sad8(ref_f, ref_b, ref_2, bx0 + (z & 1), by0 + (z >> 1), is_bidi,
                                   sdir, smf, smb, mb_mvf, mb_mvb);
             mac = snt_agree_class(sad, 256, step);
             mb_mode = DEC(cs->mbmode[snt_flag_context(mac, bx0 > 0 && blk_is_skip[by0 * blk_cols + bx0 - 1],
@@ -344,8 +363,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                             gmf, gmb, &mb_dir, &mb_mvf, &mb_mvb);
             if (mb_mode == SNT_MB_INTER16) {
                 mb_dir = is_bidi ? DEC(cs->bdir) + 1 : SNT_DIR_FWD;
-                if (has_ref1 && DEC(cs->ref1[bx0 > 0 && (blk_dir[by0 * blk_cols + bx0 - 1] & SNT_DIR_REF1)]))
-                    mb_dir |= SNT_DIR_REF1;
+                if (has_ref1)
+                    mb_dir |= dec_ref(&rdec, cs, has_ref2, bx0 > 0 ? blk_dir[by0 * blk_cols + bx0 - 1] : 0);
                 /* An unused direction's MV is zero (H.263 Annex O) */
                 if (!(mb_dir & SNT_DIR_FWD)) mb_mvf = (SntMV){0, 0};
                 if (!(mb_dir & SNT_DIR_BWD)) mb_mvb = (SntMV){0, 0};
@@ -375,7 +394,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     pf = snt_mv_predict_at(mv_field, blk_cols, bx, by);
                     if (is_bidi)
                         pb = snt_mv_predict_at(mvb_field, blk_cols, bx, by);
-                    int ac = snt_agree_class(agree_sad8(ref_f, ref_b, bx, by, is_bidi,
+                    int ac = snt_agree_class(agree_sad8(ref_f, ref_b, ref_2, bx, by, is_bidi,
                                                         sdir, smf, smb, pf, pb), 64, step);
                     int fc = snt_flag_context(ac, bx > 0 && blk_is_skip[blk_idx - 1],
                                               by > 0 && blk_is_skip[blk_idx - blk_cols]);
@@ -397,8 +416,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                                 dir = DEC(cs->bdir) + 1;
                             else
                                 dir = SNT_DIR_FWD;
-                            if (has_ref1 && DEC(cs->ref1[bx > 0 && (blk_dir[blk_idx - 1] & SNT_DIR_REF1)]))
-                                dir |= SNT_DIR_REF1;
+                            if (has_ref1)
+                                dir |= dec_ref(&rdec, cs, has_ref2, bx > 0 ? blk_dir[blk_idx - 1] : 0);
                             if (!(dir & SNT_DIR_FWD)) best_mv = (SntMV){0, 0};
                             if (!(dir & SNT_DIR_BWD)) best_mvb = (SntMV){0, 0};
                             if (dir & SNT_DIR_FWD) dec_mvd(&rdec, cs, 0, ac, &best_mv);
@@ -419,7 +438,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     mv_field[blk_idx] = best_mv;
                     mvb_field[blk_idx] = best_mvb;
                     blk_dir[blk_idx] = (uint8_t)dir;
-                    dec_pred_luma(ref_f, ref_b, px0, py0, dir, best_mv, best_mvb, mc_blk);
+                    dec_pred_luma(ref_f, ref_b, ref_2, px0, py0, dir, best_mv, best_mvb, mc_blk);
                 }
 
                 if (block_is_skip) {
@@ -560,6 +579,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                                          is_bidi ? ctx->ref_old_v : ctx->ref_v};
         const uint8_t *chroma_ref_b[2] = {is_bidi ? ctx->ref_u : (has_ref1 ? ctx->ref_old_u : NULL),
                                            is_bidi ? ctx->ref_v : (has_ref1 ? ctx->ref_old_v : NULL)};
+        const uint8_t *chroma_ref_2[2] = {has_ref2 ? ctx->key_u : NULL, has_ref2 ? ctx->key_v : NULL};
         for (int plane = 0; plane < 2; plane++) {
             const uint8_t *cr = chroma_ref[plane];
             const uint8_t *crb = chroma_ref_b[plane];
@@ -581,7 +601,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     /* Chroma skip: MC prediction at the luma block's MV */
                     if (c_is_skip && cr) {
                         uint8_t c_skip[16];
-                        dec_pred_chroma(cr, crb, cw, ch_h, cbx, cby, blk_dir[luma_blk_idx],
+                        dec_pred_chroma(cr, crb, chroma_ref_2[plane], cw, ch_h, cbx, cby, blk_dir[luma_blk_idx],
                                         mv_field[luma_blk_idx], mvb_field[luma_blk_idx], c_skip);
                         for (int dy = 0; dy < 4; dy++)
                             for (int dx = 0; dx < 4; dx++) {
@@ -597,7 +617,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     int c_bt = (c_is_inter && cr) ? 1 : 0;  /* chroma context: inter-predicted? */
                     uint8_t c_mc[16];  /* chroma MC prediction: luma MVs as 1/8-pel */
                     if (c_bt)
-                        dec_pred_chroma(cr, crb, cw, ch_h, cbx, cby, blk_dir[luma_blk_idx],
+                        dec_pred_chroma(cr, crb, chroma_ref_2[plane], cw, ch_h, cbx, cby, blk_dir[luma_blk_idx],
                                         mv_field[luma_blk_idx], mvb_field[luma_blk_idx], c_mc);
                     /* DC prediction: intra blocks from the neighbours'
                      * pixel-domain DC; inter residuals are zero-mean */
@@ -693,6 +713,17 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         }
         ctx->num_refs = 1;
         ctx->num_anchors = is_inter ? ctx->num_anchors + 1 : 1;
+        /* A key frame is also kept as the GOP's long-term reference */
+        if (!is_inter) {
+            free(ctx->key_y); free(ctx->key_u); free(ctx->key_v); free(ctx->key_coef);
+            ctx->key_y = (uint8_t *)malloc((size_t)width * height);
+            ctx->key_u = (uint8_t *)malloc((size_t)cw_dec * ch_dec);
+            ctx->key_v = (uint8_t *)malloc((size_t)cw_dec * ch_dec);
+            memcpy(ctx->key_y, ctx->ref_y, (size_t)width * height);
+            memcpy(ctx->key_u, ctx->ref_u, (size_t)cw_dec * ch_dec);
+            memcpy(ctx->key_v, ctx->ref_v, (size_t)cw_dec * ch_dec);
+            ctx->key_coef = snt_spline_coefs(ctx->key_y, width, height);
+        }
     }
 
     free(recon);

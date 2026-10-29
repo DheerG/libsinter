@@ -1,10 +1,10 @@
 /*
  * Sinter Codec — Sub-pixel motion compensation (normative)
  *
- * Luma: separable 4-tap Catmull-Rom interpolation (Keys, 1981, a = -0.5)
- * at quarter-pel positions. Taps are Q6 and each phase sums to 64. The
- * horizontal pass keeps its Q6 result, so rounding happens once, after
- * the vertical pass.
+ * Luma: separable 6-tap Lanczos-3 interpolation (windowed sinc) at
+ * quarter-pel positions. Taps are Q6, rounded from the kernel, and each
+ * phase sums to 64. The horizontal pass keeps its Q6 result, so rounding
+ * happens once, after the vertical pass.
  *
  * Chroma: bilinear interpolation at 1/8-pel positions.
  *
@@ -15,12 +15,12 @@
 #include "mc.h"
 #include "../../util/fixed_point.h"
 
-/* Catmull-Rom weights at t = 0, 1/4, 1/2, 3/4 for samples -1, 0, +1, +2 */
-static const int16_t qpel_taps[4][4] = {
-    {  0, 64,  0,  0 },
-    { -4, 55, 15, -2 },
-    { -4, 36, 36, -4 },
-    { -2, 15, 55, -4 },
+/* Lanczos-3 weights at t = 0, 1/4, 1/2, 3/4 for samples -2 .. +3 */
+static const int16_t qpel_taps[4][6] = {
+    { 0,  0, 64,  0,  0, 0 },
+    { 2, -9, 57, 17, -4, 1 },
+    { 2, -9, 39, 39, -9, 2 },
+    { 1, -4, 17, 57, -9, 2 },
 };
 
 static inline int sample(const uint8_t *ref, int w, int h, int x, int y) {
@@ -42,14 +42,14 @@ void snt_mc_luma(const uint8_t *ref, int w, int h, int x0, int y0,
     split_mv(mv.x, 4, &ix, &fx);
     split_mv(mv.y, 4, &iy, &fy);
 
-    /* Horizontal pass over bh + 3 rows (one above, two below), Q6 */
-    int16_t tmp[(SNT_MC_MAX_BLK + 3) * SNT_MC_MAX_BLK];
-    for (int y = 0; y < bh + 3; y++) {
-        int sy = y0 + iy + y - 1;
+    /* Horizontal pass over bh + 5 rows (two above, three below), Q6 */
+    int16_t tmp[(SNT_MC_MAX_BLK + 5) * SNT_MC_MAX_BLK];
+    for (int y = 0; y < bh + 5; y++) {
+        int sy = y0 + iy + y - 2;
         for (int x = 0; x < bw; x++) {
-            int sx = x0 + ix + x - 1;
+            int sx = x0 + ix + x - 2;
             int32_t s = 0;
-            for (int t = 0; t < 4; t++)
+            for (int t = 0; t < 6; t++)
                 s += qpel_taps[fx][t] * sample(ref, w, h, sx + t, sy);
             tmp[y * bw + x] = (int16_t)s;
         }
@@ -59,7 +59,7 @@ void snt_mc_luma(const uint8_t *ref, int w, int h, int x0, int y0,
     for (int y = 0; y < bh; y++)
         for (int x = 0; x < bw; x++) {
             int32_t s = 0;
-            for (int t = 0; t < 4; t++)
+            for (int t = 0; t < 6; t++)
                 s += qpel_taps[fy][t] * tmp[(y + t) * bw + x];
             dst[y * bw + x] = (s < 0) ? 0 : snt_clip_pixel((s + 2048) >> 12);
         }

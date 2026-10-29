@@ -106,9 +106,33 @@ static double block_sse(const int16_t *src, const int16_t *rec, int vw, int vh) 
 typedef struct {
     SntRangeEnc  *rc;
     SntBitWriter *ov;
+#ifdef SNT_TRAIN_STATS
+    SntModel     *base;   /* first model of the set in use */
+    uint32_t    (*hist)[256];
+#endif
 } SymSink;
 
+#ifdef SNT_TRAIN_STATS
+/* Symbol counts per model set, QP class at the set's restart, and model
+ * (tools/train/collect_stats.c) */
+static uint32_t train_hist[2][SNT_MODEL_CLASSES][SNT_NUM_MODELS][256];
+static int train_cls[2];
+
+void snte_train_dump(FILE *f) {
+    for (int set = 0; set < 2; set++)
+        for (int c = 0; c < SNT_MODEL_CLASSES; c++)
+            for (int k = 0; k < SNT_NUM_MODELS; k++) {
+                fprintf(f, "%d %d %d", set, c, k);
+                for (int i = 0; i < 256; i++) fprintf(f, " %u", train_hist[set][c][k][i]);
+                fprintf(f, "\n");
+            }
+}
+#endif
+
 static void rec(SymSink *s, SntModel *m, uint16_t sym) {
+#ifdef SNT_TRAIN_STATS
+    s->hist[m - s->base][sym]++;
+#endif
     snt_rc_encode_sym(s->rc, m, sym);
 }
 
@@ -739,9 +763,16 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         ctx->cdf_state_b_valid = 0;
     SntCdfSet *cs = (SntCdfSet *)(is_bidi ? ctx->cdf_state_b : ctx->cdf_state);
     if (!is_inter || !(is_bidi ? ctx->cdf_state_b_valid : ctx->cdf_state_valid))
-        snt_cdf_set_init(cs);
+        snt_cdf_set_init(cs, is_bidi ? SNT_SET_B : SNT_SET_P, fhdr.base_qp);
 
+#ifdef SNT_TRAIN_STATS
+    int set_id = is_bidi ? SNT_SET_B : SNT_SET_P;
+    if (!is_inter || !(is_bidi ? ctx->cdf_state_b_valid : ctx->cdf_state_valid))
+        train_cls[set_id] = snt_model_class(fhdr.base_qp);
+    SymSink sink = { &renc, &ov, (SntModel *)cs, train_hist[set_id][train_cls[set_id]] };
+#else
     SymSink sink = { &renc, &ov };
+#endif
     #define REC(cdf, sym) rec(&sink, &(cdf), (sym))
 
     /* Per-block mode flags for chroma inter derivation */

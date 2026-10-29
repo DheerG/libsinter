@@ -164,7 +164,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         ctx->cdf_state_b_valid = 0;
     SntCdfSet *cs = (SntCdfSet *)(is_bidi ? ctx->cdf_state_b : ctx->cdf_state);
     if (!is_inter || !(is_bidi ? ctx->cdf_state_b_valid : ctx->cdf_state_valid))
-        snt_cdf_set_init(cs);
+        snt_cdf_set_init(cs, is_bidi ? SNT_SET_B : SNT_SET_P, ctx->header.base_qp);
 
     #define DEC(m) ((uint16_t)snt_rc_decode_sym(&rdec, &(m)))
 

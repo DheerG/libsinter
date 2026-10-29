@@ -49,7 +49,21 @@ static inline int snt_cac_group(int i) {
     return f <= 1 ? 0 : (f <= 3 ? 1 : 2);
 }
 
-static inline void snt_cdf_set_init(SntCdfSet *s) {
+/* Number of models in a set: the struct holds nothing else */
+#define SNT_NUM_MODELS ((int)(sizeof(SntCdfSet) / sizeof(SntModel)))
+
+/* Model sets: one for key and P-frames, one for B-frames */
+enum { SNT_SET_P = 0, SNT_SET_B = 1 };
+
+/* Starting tables are trained per QP class of the frame where the set
+ * restarts: QP 0-11, 12-19, 20-27, 28+ */
+#define SNT_MODEL_CLASSES 4
+static inline int snt_model_class(int qp) {
+    int c = (qp - 4) / 8;
+    return c < 0 ? 0 : (c >= SNT_MODEL_CLASSES ? SNT_MODEL_CLASSES - 1 : c);
+}
+
+static inline void snt_cdf_set_init_uniform(SntCdfSet *s) {
     for (int t = 0; t < 2; t++) {
         snt_model_init(&s->dc[t], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
         snt_model_init(&s->imode[t], SNT_NUM_IPRED, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
@@ -69,6 +83,37 @@ static inline void snt_cdf_set_init(SntCdfSet *s) {
     snt_model_init(&s->iskip, 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
     snt_model_init(&s->mvx, 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
     snt_model_init(&s->mvy, 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
+}
+
+#include "model_tables.h"
+
+/* Weight of a trained starting table, in observations (increments):
+ * chosen by BD-rate on the tuning clips (16 to 256 were within 0.1%) */
+#define SNT_TRAINED_OBS_COEFF 64
+#define SNT_TRAINED_OBS_MODE  16
+
+/* Restart a model set for a frame of the given QP: each model starts
+ * from its trained table (model_tables.h) for the set and the QP's
+ * class, scaled to a total worth SNT_TRAINED_OBS_* observations, with
+ * every count at least 1. Models without enough training data start
+ * uniform. */
+static inline void snt_cdf_set_init(SntCdfSet *s, int set, int qp) {
+    snt_cdf_set_init_uniform(s);
+    int cls = snt_model_class(qp);
+    SntModel *m = (SntModel *)s;
+    for (int k = 0; k < SNT_NUM_MODELS; k++) {
+        const uint16_t *p = &snt_trained_prob[set][cls][snt_trained_offset[k]];
+        if (!snt_trained_valid[set][cls][k]) continue;
+        uint32_t obs = m[k].num_symbols == 256 ? SNT_TRAINED_OBS_COEFF : SNT_TRAINED_OBS_MODE;
+        uint32_t strength = obs * m[k].inc, total = 0;
+        if (strength > m[k].limit / 2) strength = m[k].limit / 2;
+        for (int i = 0; i < m[k].num_symbols; i++) {
+            uint32_t f = ((uint32_t)p[i] * strength + 16384) >> 15;
+            m[k].freq[i] = (uint16_t)(f < 1 ? 1 : f);
+            total += m[k].freq[i];
+        }
+        m[k].total = total;
+    }
 }
 
 #endif /* SNT_CDF_SET_H */

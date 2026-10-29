@@ -59,7 +59,7 @@ typedef enum {
 
 /* ── Motion vector ────────────────────────────────────────────────── */
 typedef struct {
-    int16_t x;  /* 1/8-pel precision: value * 8 = sub-pixel offset */
+    int16_t x;  /* quarter-pel luma units; chroma reads the same value as 1/8-pel */
     int16_t y;
 } SntMV;
 

@@ -109,6 +109,22 @@ static int16_t dec_level(SntRangeDec *rd, SntCdfSet *cs, int t, int k, int pc, i
     return (int16_t)(neg ? -mag : mag);
 }
 
+/* A luma DC level (levels.h, DC models) in DC context da (snt_dc_context) */
+static int16_t dec_dclevel(SntRangeDec *rd, SntCdfSet *cs, int t, int da) {
+    if (!snt_rc_decode_sym(rd, &cs->dz[t][da])) return 0;
+    int neg = snt_rc_decode_sym(rd, &cs->ds[t][da]);
+    if (!snt_rc_decode_sym(rd, &cs->dg[t][da][neg])) return (int16_t)(neg ? -1 : 1);
+    int c = 1;
+    while (c < SNT_LEVEL_MAX_CAT && snt_rc_decode_sym(rd, &cs->dx[t][c - 1]))
+        c++;
+    uint32_t a1 = 1;
+    for (int k = c - 2; k >= 0; k--)
+        a1 = (a1 << 1) | (uint32_t)snt_rc_decode_sym(rd, &cs->dm[t][c]);
+    int32_t mag = (int32_t)a1 + 1;
+    if (mag > 32767) mag = 32767;  /* damaged stream */
+    return (int16_t)(neg ? -mag : mag);
+}
+
 /* A chroma level at zigzag index i (levels.h, chroma models) */
 static int16_t dec_clevel(SntRangeDec *rd, SntCdfSet *cs, int t, int i, int z_known) {
     if (!z_known && !snt_rc_decode_sym(rd, &cs->cz[t][i])) return 0;
@@ -158,7 +174,8 @@ static void dec_pred_chroma(const uint8_t *rf, const uint8_t *rb, int w, int h, 
  *       IF skip: prediction with the global motion, continue (B: bi-directional)
  *       IF coded: [B: DEC(bdir)], then DEC(mvx), DEC(mvy) per used direction
  *   IF intra block: DEC(imode[is_inter_frame]) → mode (SNT_IPRED_*, intra_acdc.h)
- *   DEC(dc[t]) → dc_level (residual for inter, absolute for intra)
+ *   DC level's decisions (DC models, context: the left and above blocks' DC
+ *     levels) → dc_level (residual for inter, absolute for intra)
  *   FOR band b=0..15: band[t][b][nz], then (if coded) ac[t][b/4] per level
  * FOR each chroma plane, each 4x4 block not skipped: cflag[ct][luma_nz][pctx],
  *   then (if coded) 16 levels in zigzag order (chroma models)
@@ -264,6 +281,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     int16_t *acdc = (int16_t *)calloc((size_t)total_blocks_d * SNT_ACDC_STATE, sizeof(int16_t));
     uint8_t *coded = (uint8_t *)calloc(total_blocks_d, 1);
     uint8_t *luma_nz = (uint8_t *)calloc(total_blocks_d, 1);  /* any nonzero luma level? */
+    int16_t *dc_lev = (int16_t *)calloc(total_blocks_d, sizeof(int16_t));  /* luma DC levels */
 
     /* MV field and block flags for chroma inter derivation */
     SntMV *mv_field = (SntMV *)calloc(blk_cols * blk_rows, sizeof(SntMV));   /* forward MVs */
@@ -431,12 +449,10 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
              * inter residuals are zero-mean */
             int16_t dc_pred = has_pred_blk ? 0 : td_pred[0];
 
-            uint16_t dc_sym = DEC(cs->dc[block_is_inter]);
-            int16_t dc_level;
-            if (dc_sym == 255)
-                dc_level = (int16_t)snt_br_get_sexpgolomb(&ovr);
-            else
-                dc_level = u2s(dc_sym);
+            int16_t dc_level = dec_dclevel(&rdec, cs, block_is_inter,
+                                           snt_dc_context(bx > 0 ? dc_lev[blk_idx - 1] : 0,
+                                                          by > 0 ? dc_lev[blk_idx - blk_cols] : 0));
+            dc_lev[blk_idx] = dc_level;
 
             int16_t dc_recon_val = pvq_dequantize_dc(dc_level, step) + dc_pred;
             recon_coeffs[0] = dc_recon_val;
@@ -667,6 +683,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     free(acdc);
     free(coded);
     free(luma_nz);
+    free(dc_lev);
     free(mv_field);
     free(mvb_field);
     free(blk_dir);

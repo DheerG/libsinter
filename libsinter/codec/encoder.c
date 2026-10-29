@@ -888,7 +888,7 @@ static double chroma_cost(const EncFrame *f, int bx, int by, int kind, int dir,
         double s1, b1;
         int pctx = plane == 0 ? 0 : 1 + u_coded;
         int cc = chroma_rd(f->cs, f->cstep, CHROMA_LAMBDA * f->lambda, inter,
-                           &f->cs->cflag[inter][luma_nz][pctx], v, lev, &s1, &b1);
+                           &f->cs->cflag[inter][luma_nz][pctx][0], v, lev, &s1, &b1);
         if (plane == 0) u_coded = cc;
         sse += s1;
         bits += b1;
@@ -1618,7 +1618,10 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         chroma_rec[1] = (uint8_t *)calloc((size_t)cw * ch, 1);
         int cblk_cols = cpad_w / cblk;
         const uint8_t *chroma_in[2] = {input_u, input_v};
-        uint8_t *u_coded = (uint8_t *)calloc((size_t)cblk_cols * (cpad_h / cblk), 1);
+        /* Coded flags of each plane's blocks (contexts: U's for V, the left
+         * block's) */
+        uint8_t *c_coded[2] = { (uint8_t *)calloc((size_t)cblk_cols * (cpad_h / cblk), 1),
+                                (uint8_t *)calloc((size_t)cblk_cols * (cpad_h / cblk), 1) };
         for (int plane = 0; plane < 2; plane++) {
             const uint8_t *cp = chroma_in[plane];
             const uint8_t *cr = chroma_ref[plane]; /* may be NULL on first frame */
@@ -1701,10 +1704,10 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     for (int i = 0; i < 16; i++) v[i] = ccoeffs[snt_zigzag4[i]];
                     v[0] -= c_dc_pred;
                     int bi = cj * cblk_cols + ci;
-                    int pctx = plane == 0 ? 0 : 1 + u_coded[bi];
+                    int pctx = plane == 0 ? 0 : 1 + c_coded[0][bi], lctx = ci > 0 && c_coded[plane][bi - 1];
                     int cc = code_chroma4(cs, &sink, cstep, CHROMA_LAMBDA * RD_LAMBDA * (double)step * step, c_bt,
-                                          &cs->cflag[c_bt][luma_nz[luma_blk_idx]][pctx], v, vrec);
-                    if (plane == 0) u_coded[bi] = (uint8_t)cc;
+                                          &cs->cflag[c_bt][luma_nz[luma_blk_idx]][pctx][lctx], v, vrec);
+                    c_coded[plane][bi] = (uint8_t)cc;
                     for (int i = 0; i < 16; i++) crecon_coeffs[snt_zigzag4[i]] = vrec[i];
                     crecon_coeffs[0] += c_dc_pred;
 
@@ -1736,7 +1739,8 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
             }
             free(c_dc_above);
         }
-        free(u_coded);
+        free(c_coded[0]);
+        free(c_coded[1]);
         snt_deblock_chroma(chroma_rec[0], cw, ch, cw, cstep, is_inter ? blk_is_skip : NULL, blk_cols);
         snt_deblock_chroma(chroma_rec[1], cw, ch, cw, cstep, is_inter ? blk_is_skip : NULL, blk_cols);
     }

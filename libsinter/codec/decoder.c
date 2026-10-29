@@ -611,7 +611,10 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         uint16_t cstep = snt_qp_to_step((uint8_t)cqp);
 
         uint8_t *chroma_out[2] = {output_u, output_v};
-        uint8_t *u_coded = (uint8_t *)calloc((size_t)cblk_cols * (cpad_h / cblk), 1);
+        /* Coded flags of each plane's blocks (contexts: U's for V, the left
+         * block's) */
+        uint8_t *c_coded[2] = { (uint8_t *)calloc((size_t)cblk_cols * (cpad_h / cblk), 1),
+                                (uint8_t *)calloc((size_t)cblk_cols * (cpad_h / cblk), 1) };
         const uint8_t *chroma_ref[2] = {is_bidi ? ctx->ref_old_u : ctx->ref_u,
                                          is_bidi ? ctx->ref_old_v : ctx->ref_v};
         const uint8_t *chroma_ref_b[2] = {is_bidi ? ctx->ref_u : (has_ref1 ? ctx->ref_old_u : NULL),
@@ -668,9 +671,9 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
 
                     /* Coded flag, then the levels in zigzag order */
                     int bi = cj * cblk_cols + ci;
-                    int pctx = plane == 0 ? 0 : 1 + u_coded[bi];
-                    int cc = DEC(cs->cflag[c_bt][luma_nz[luma_blk_idx]][pctx]);
-                    if (plane == 0) u_coded[bi] = (uint8_t)cc;
+                    int pctx = plane == 0 ? 0 : 1 + c_coded[0][bi], lctx = ci > 0 && c_coded[plane][bi - 1];
+                    int cc = DEC(cs->cflag[c_bt][luma_nz[luma_blk_idx]][pctx][lctx]);
+                    c_coded[plane][bi] = (uint8_t)cc;
                     int16_t ccoeffs[16] = {0};
                     if (cc) {
                         int any = 0;
@@ -707,7 +710,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             }
             free(c_dc_above);
         }
-        free(u_coded);
+        free(c_coded[0]);
+        free(c_coded[1]);
         snt_deblock_chroma(output_u, cw, ch_h, stride_uv, cstep, is_inter ? blk_is_skip : NULL, blk_cols);
         snt_deblock_chroma(output_v, cw, ch_h, stride_uv, cstep, is_inter ? blk_is_skip : NULL, blk_cols);
     }

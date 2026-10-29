@@ -63,7 +63,7 @@ ffmpeg -f lavfi -i "testsrc=duration=1:size=64x64:rate=10" -pix_fmt yuv420p -f y
 
 [PROVENANCE.md](PROVENANCE.md) lists every tool the decoder runs, with its source, date and the changes made to it. All but two come from publications between 1974 and 2000: the DCT (1974), Martin's range coder (1979), Witten, Neal & Cleary's adaptive models (1987), Unser's B-splines (1991), JPEG (1992), MPEG-1 (1993), H.263 and its annexes (1996–1998) and MPEG-4 Part 2 (1999–2000). Nothing comes from H.264 or later codecs (VP8 onward, Daala, AV1).
 
-The two new tools are described in [docs/NOVEL.md](docs/NOVEL.md), with the patent searches run before keeping them. Two other new ideas were dropped because the searches found them: online mixing of several probability models (Google, EP3677027 / US10887595) and per-clip probability tables sent as changes from defaults (VP8's frame-header updates).
+The two new tools are described in [docs/NOVEL.md](docs/NOVEL.md), with the patent searches run before keeping them. Two other new ideas were left out because the searches found them: online logistic mixing of several probability models (Google, EP3677027 / US10887595), which was still built behind an off-by-default compile switch (`-DSNT_EXPERIMENT_MIXING`) and measured at 0.5%, and per-clip probability tables sent as changes from defaults (VP8's frame-header updates).
 
 These records are a map of where each idea comes from, not a patent clearance.
 

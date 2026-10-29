@@ -18,6 +18,12 @@
 #include <math.h>
 #include "encoder.h"
 #include "cdf_set.h"
+#ifdef SNT_EXPERIMENT_MIXING
+#include "mixer.h"
+/* Mixing state of the model set in use (one encoder per process) */
+static SntMixState enc_mix[2];
+static SntMixState *cur_mix;
+#endif
 #include "scan.h"
 #include "../core/transform/dct.h"
 #include "../core/quantize/pvq.h"
@@ -81,13 +87,29 @@ static double level_bits(const SntModel *cdf, int16_t level) {
 
 /* Bits for a luma AC level at zigzag index k, coded as binary decisions
  * (levels.h) with the models' current state */
-static double ac_level_bits(SntCdfSet *cs, int t, int k, int pc, int16_t v, int z_known) {
+static double ac_level_bits(SntCdfSet *cs, int t, int k, int pc, int16_t v, int z_known,
+                            int band, int nzprev) {
     SntLevelBin bins[2 * SNT_LEVEL_MAX_CAT + 4];
     int n = snt_level_bins(v, z_known, bins);
     double bits = 0;
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < n; i++) {
+#ifdef SNT_EXPERIMENT_MIXING
+        if (bins[i].kind == 0 || bins[i].kind == 2) {
+            SntMixBin mb;
+            snt_mix_prepare(cur_mix, cs, bins[i].kind == 2, t, k, band, pc, nzprev, &mb);
+            bits += -log2((bins[i].bit ? mb.p : 4096 - mb.p) / 4096.0);
+            continue;
+        }
+#endif
         bits += cdf_bits(snt_level_model(cs, t, k, pc, &bins[i]), bins[i].bit);
+    }
+    (void)band; (void)nzprev;
     return bits;
+}
+
+/* Number of nonzero levels among the two before zigzag index k */
+static inline int nz_prev2(const int16_t *lv, int k) {
+    return (lv[k - 1] != 0) + (k >= 2 && lv[k - 2] != 0);
 }
 
 static double band_sse(const int16_t *a, const int16_t *b, int n) {
@@ -220,6 +242,8 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
         snt_pred_classes(pdct, step, snt_zigzag8, band_bounds, NUM_BANDS, kcls, bcls);
     }
 
+    int16_t lv[64] = {0};  /* levels so far, zigzag order */
+    lv[0] = dc_level;
     int16_t recon_ac[63];
     memset(recon_ac, 0, sizeof(recon_ac));
     /* Each band is either all zero (flag 0) or has its levels coded (flag
@@ -241,7 +265,8 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
             /* The last level of a coded band is known nonzero if the
              * others are zero */
             s_bits += ac_level_bits(cs, t, 1 + start + i, kcls[1 + start + i], s_level[i],
-                                    i == n - 1 && !s_nz);
+                                    i == n - 1 && !s_nz, b, nz_prev2(lv, 1 + start + i));
+            lv[1 + start + i] = s_level[i];
             s_nz |= s_level[i] != 0;
         }
 
@@ -250,6 +275,8 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
         int coded = s_nz && band_sse(band_coeffs, s_recon, n) + lambda * s_bits
                             < band_sse(band_coeffs, zeros, n) + lambda * cdf_bits(flag, 0);
 
+        if (!coded)
+            for (int i = 0; i < n; i++) lv[1 + start + i] = 0;
         if (!sink) {
             bits += coded ? s_bits : cdf_bits(flag, 0);
         } else {
@@ -257,11 +284,22 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
             if (coded) {
                 int any = 0;
                 for (int i = 0; i < n; i++) {
+                    int k = 1 + start + i;
                     SntLevelBin bins[2 * SNT_LEVEL_MAX_CAT + 4];
                     int nb = snt_level_bins(s_level[i], i == n - 1 && !any, bins);
-                    for (int j = 0; j < nb; j++)
-                        rec(sink, snt_level_model(cs, t, 1 + start + i, kcls[1 + start + i], &bins[j]),
-                            bins[j].bit);
+                    for (int j = 0; j < nb; j++) {
+#ifdef SNT_EXPERIMENT_MIXING
+                        if (bins[j].kind == 0 || bins[j].kind == 2) {
+                            SntMixBin mb;
+                            snt_mix_prepare(cur_mix, cs, bins[j].kind == 2, t, k, b, kcls[k],
+                                            nz_prev2(lv, k), &mb);
+                            snt_rc_encode_bit(sink->rc, bins[j].bit, mb.p);
+                            snt_mix_update(&mb, bins[j].bit);
+                            continue;
+                        }
+#endif
+                        rec(sink, snt_level_model(cs, t, k, kcls[k], &bins[j]), bins[j].bit);
+                    }
                     any |= s_level[i] != 0;
                 }
             }
@@ -832,8 +870,15 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     if (!is_inter)
         ctx->cdf_state_b_valid = 0;
     SntCdfSet *cs = (SntCdfSet *)(is_bidi ? ctx->cdf_state_b : ctx->cdf_state);
-    if (!is_inter || !(is_bidi ? ctx->cdf_state_b_valid : ctx->cdf_state_valid))
+    if (!is_inter || !(is_bidi ? ctx->cdf_state_b_valid : ctx->cdf_state_valid)) {
         snt_cdf_set_init(cs, is_bidi ? SNT_SET_B : SNT_SET_P, fhdr.base_qp);
+#ifdef SNT_EXPERIMENT_MIXING
+        snt_mix_init(&enc_mix[is_bidi]);
+#endif
+    }
+#ifdef SNT_EXPERIMENT_MIXING
+    cur_mix = &enc_mix[is_bidi];
+#endif
 
 #ifdef SNT_TRAIN_STATS
     int set_id = is_bidi ? SNT_SET_B : SNT_SET_P;

@@ -49,12 +49,6 @@ static inline uint16_t s2u(int16_t v) {
  * off repeatedly. The frame header carries the QP actually used. */
 #define KEY_QP_OFFSET 4
 
-/* Inter-frame intra decision: a block is coded intra only if its SAD from
- * a flat block is under 1/INTRA_SAD_BIAS of the inter SAD + MV cost. The
- * flat-block SAD makes intra look cheaper than it codes; 2 was best by
- * BD-rate. */
-#define INTRA_SAD_BIAS 2
-
 /* Ideal cost in bits of coding sym with cdf in its current state. */
 static double cdf_bits(const RansCDF *cdf, uint16_t sym) {
     uint16_t lo, freq;
@@ -84,6 +78,18 @@ static double band_sse(const int16_t *a, const int16_t *b, int n) {
         double d = (double)a[i] - b[i];
         sse += d * d;
     }
+    return sse;
+}
+
+/* Squared error of a reconstruction (clipped, as it will be output)
+ * against the source over the block's in-frame vw x vh region. */
+static double block_sse(const int16_t *src, const int16_t *rec, int vw, int vh) {
+    double sse = 0;
+    for (int y = 0; y < vh; y++)
+        for (int x = 0; x < vw; x++) {
+            double d = (double)src[y * 8 + x] - snt_clip_pixel(rec[y * 8 + x]);
+            sse += d * d;
+        }
     return sse;
 }
 
@@ -366,12 +372,46 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         for (int bx = 0; bx < blk_cols; bx++) {
             int blk_idx = by * blk_cols + bx;
             int px0 = bx * BLK, py0 = by * BLK;
-            int block_is_inter = 0;
-            int block_is_skip = 0;
-            SntMV best_mv = {0, 0};
-            uint8_t mc_blk[BLK * BLK];  /* MC prediction (skip and inter coded blocks) */
+            uint8_t mc_blk[BLK * BLK];  /* chosen prediction (skip, inter or spatial intra) */
 
-            /* ── Inter mode decision ──────────────────────────── */
+            /* Source block (work is 0 outside the frame) and its in-frame size */
+            int16_t src[64];
+            for (int dy = 0; dy < BLK; dy++)
+                for (int dx = 0; dx < BLK; dx++)
+                    src[dy * BLK + dx] = work[(py0 + dy) * pad_w + px0 + dx];
+            int vw = width - px0 < BLK ? width - px0 : BLK;
+            int vh = height - py0 < BLK ? height - py0 : BLK;
+
+            /* Transform-domain prediction for intra candidates: DC from the
+             * neighbours' pixel-domain DC; low AC (key frames) from their
+             * reconstructed coefficients. */
+            int16_t td_pred[64];
+            memset(td_pred, 0, sizeof(td_pred));
+            if (bx > 0 && by > 0)
+                td_pred[0] = (dc_recon_left + dc_recon_above[bx] + 1) >> 1;
+            else if (bx > 0)
+                td_pred[0] = dc_recon_left;
+            else if (by > 0)
+                td_pred[0] = dc_recon_above[bx];
+            if (!is_inter)
+                for (int p = 0; p < NUM_PRED_AC; p++) {
+                    int idx = pred_ac_idx[p];
+                    if (idx < 8 && bx > 0)
+                        td_pred[idx] = ac_recon_left[p];
+                    else if (idx >= 8 && by > 0)
+                        td_pred[idx] = ac_recon_above[bx * NUM_PRED_AC + p];
+                }
+
+            /* ── Mode decision by trial encoding ──────────────────────
+             * Each candidate (skip, inter at the searched MV, intra in each
+             * mode) is coded without emitting anything; the one with the
+             * least distortion + lambda * bits wins. */
+            enum { CAND_SKIP, CAND_INTER, CAND_INTRA };
+            double lambda = RD_LAMBDA * (double)step * step;
+            int best = CAND_INTRA, best_imode = SNT_IPRED_TD;
+            double best_j = 1e300;
+            SntMV mv_pred = {0, 0}, qmv = {0, 0};
+
             if (is_inter) {
                 /* MV prediction from spatial neighbors (also used by the
                  * search, which charges each candidate for its MV delta) */
@@ -379,88 +419,77 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                 const SntMV *above_mv = (by > 0) ? &mv_field[blk_idx - blk_cols] : NULL;
                 const SntMV *above_right_mv = (by > 0 && bx + 1 < blk_cols) ?
                     &mv_field[blk_idx - blk_cols + 1] : NULL;
-                SntMV mv_pred = snt_mv_predict(left_mv, above_mv, above_right_mv);
+                mv_pred = snt_mv_predict(left_mv, above_mv, above_right_mv);
 
-                /* SAD for skip, which predicts at mv_pred (so a block moving
-                 * with its neighbours costs only the two flags).
-                 * Note: input accessed at stride width (not stride_y) to match
-                 * ref buffer stride. Correct when stride_y == width (CLI). */
-                snt_mc_luma(ctx->ref_y, width, height, px0, py0, mv_pred, BLK, BLK, mc_blk);
-                uint32_t skip_sad = 0;
-                for (int dy = 0; dy < BLK; dy++)
-                    for (int dx = 0; dx < BLK; dx++) {
-                        int py = py0 + dy, px_v = px0 + dx;
-                        if (py < height && px_v < width) {
-                            int diff = (int)input_y[py * width + px_v]
-                                     - (int)mc_blk[dy * BLK + dx];
-                            skip_sad += (uint32_t)(diff < 0 ? -diff : diff);
-                        }
-                    }
-
-                /* lambda for SAD-domain decisions = sqrt(mode lambda) */
+                /* Motion search: input accessed at stride width (not
+                 * stride_y) to match the ref buffer. Correct when
+                 * stride_y == width (CLI). lambda for SAD = sqrt(lambda). */
                 double lambda_sad = sqrt(RD_LAMBDA) * step;
-
-                /* Motion search: cur uses stride_y, ref uses width.
-                 * Both must use the same stride for snte_motion_search.
-                 * We pass width — correct when stride_y == width (CLI). */
                 SntMV search_mv = snte_motion_search(
                     input_y, ctx->ref_y, width,
                     px0, py0, BLK, 16, width, height, mv_pred, lambda_sad);
-                /* Refine to quarter-pel; inter_sad is the SAD at the result */
-                uint32_t inter_sad;
-                SntMV qmv = snte_subpel_refine(input_y, ctx->ref_y, width, height,
-                                               px0, py0, BLK, search_mv, mv_pred,
-                                               lambda_sad, &inter_sad);
+                qmv = snte_subpel_refine(input_y, ctx->ref_y, width, height,
+                                         px0, py0, BLK, search_mv, mv_pred,
+                                         lambda_sad, NULL);
 
-                /* Rough intra SAD (vs flat DC) */
-                int32_t mean = 0;
+                /* Skip: MC prediction at mv_pred, nothing else coded */
+                uint8_t p[64];
+                int16_t p16[64];
+                snt_mc_luma(ctx->ref_y, width, height, px0, py0, mv_pred, BLK, BLK, p);
+                for (int k = 0; k < 64; k++) p16[k] = p[k];
+                double j = block_sse(src, p16, vw, vh)
+                         + lambda * (cdf_bits(&cs->inter, 1) + cdf_bits(&cs->iskip, 1));
+                if (j < best_j) { best_j = j; best = CAND_SKIP; }
+
+                /* Inter coded at the searched MV (residual 0 outside the frame) */
+                int16_t res[64];
+                snt_mc_luma(ctx->ref_y, width, height, px0, py0, qmv, BLK, BLK, p);
                 for (int dy = 0; dy < BLK; dy++)
-                    for (int dx = 0; dx < BLK; dx++) {
-                        int py = py0 + dy, px_v = px0 + dx;
-                        if (py < height && px_v < width)
-                            mean += input_y[py * width + px_v];
-                    }
-                mean /= (BLK * BLK);
-                uint32_t intra_sad = 0;
-                for (int dy = 0; dy < BLK; dy++)
-                    for (int dx = 0; dx < BLK; dx++) {
-                        int py = py0 + dy, px_v = px0 + dx;
-                        if (py < height && px_v < width) {
-                            int diff = (int)input_y[py * width + px_v] - (int)mean;
-                            intra_sad += (uint32_t)(diff < 0 ? -diff : diff);
-                        }
-                    }
+                    for (int dx = 0; dx < BLK; dx++)
+                        res[dy * BLK + dx] = (dy < vh && dx < vw) ?
+                            src[dy * BLK + dx] - p[dy * BLK + dx] : 0;
+                LumaCode lc;
+                code_luma(cs, NULL, step, 1, res, td_pred, 0, p, &lc);
+                j = block_sse(src, lc.recon, vw, vh)
+                  + lambda * (cdf_bits(&cs->inter, 1) + cdf_bits(&cs->iskip, 0)
+                              + level_bits(&cs->mvx, qmv.x - mv_pred.x)
+                              + level_bits(&cs->mvy, qmv.y - mv_pred.y) + lc.bits);
+                if (j < best_j) { best_j = j; best = CAND_INTER; }
+            }
 
-                /* Decision: skip < inter-coded < intra, with MV cost bias */
-                /* Skip threshold: if SAD < step * BLK * 2, the quantized residual
-                 * would be mostly zeros — skip avoids coding overhead.
-                 * (Jens-Rainer: step*BLK was too conservative, step*BLK*2 catches
-                 * more near-static blocks without visible artifacts.) */
-                uint32_t skip_threshold = (uint32_t)step * BLK * 2;
-                double mv_cost = lambda_sad * (snte_mvd_bits(qmv.x - mv_pred.x) +
-                                               snte_mvd_bits(qmv.y - mv_pred.y));
-
-                if (skip_sad <= skip_threshold) {
-                    block_is_inter = 1;
-                    block_is_skip = 1;
-                    best_mv = mv_pred;
-                } else if (inter_sad + mv_cost < INTRA_SAD_BIAS * (double)intra_sad) {
-                    block_is_inter = 1;
-                    block_is_skip = 0;
-                    best_mv = qmv;
+            for (int m = SNT_IPRED_TD; m < SNT_NUM_IPRED; m++) {
+                uint8_t p[64];
+                int16_t in[64];
+                if (m == SNT_IPRED_TD) {
+                    memcpy(in, src, sizeof(in));
                 } else {
-                    block_is_inter = 0;
+                    snt_intra_spatial_pred8(recon, pad_w, px0, py0, m, p);
+                    for (int k = 0; k < 64; k++)
+                        in[k] = src[k] - p[k];
                 }
+                LumaCode lc;
+                code_luma(cs, NULL, step, 0, in, td_pred, !is_inter && m == SNT_IPRED_TD,
+                          m == SNT_IPRED_TD ? NULL : p, &lc);
+                double bits = cdf_bits(&cs->imode[is_inter], (uint16_t)m) + lc.bits
+                            + (is_inter ? cdf_bits(&cs->inter, 0) : 0);
+                double j = block_sse(src, lc.recon, vw, vh) + lambda * bits;
+                if (j < best_j) { best_j = j; best = CAND_INTRA; best_imode = m; }
+            }
 
+            /* ── Emit the chosen mode ─────────────────────────────── */
+            int block_is_inter = best != CAND_INTRA;
+            int block_is_skip = best == CAND_SKIP;
+            SntMV best_mv = {0, 0};
+            if (best == CAND_SKIP) best_mv = mv_pred;
+            if (best == CAND_INTER) best_mv = qmv;
+
+            if (is_inter) {
                 /* Store flags for chroma inter derivation */
                 blk_is_inter[blk_idx] = block_is_inter;
                 blk_is_skip[blk_idx] = block_is_skip;
 
-                /* REC: inter_flag */
                 REC(cs->inter, block_is_inter ? 1 : 0);
-
                 if (block_is_inter) {
-                    /* REC: skip_flag */
                     REC(cs->iskip, block_is_skip ? 1 : 0);
 
                     if (block_is_skip) {
@@ -487,100 +516,40 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     /* MV delta (quarter-pel) */
                     int16_t mvd_x = best_mv.x - mv_pred.x;
                     int16_t mvd_y = best_mv.y - mv_pred.y;
-
-                    /* REC: MV deltas */
                     uint16_t mvx_sym = s2u(mvd_x);
                     REC(cs->mvx, mvx_sym);
                     if (mvx_sym == 255)
                         snt_bw_put_sexpgolomb(&ov, mvd_x);
-
                     uint16_t mvy_sym = s2u(mvd_y);
                     REC(cs->mvy, mvy_sym);
                     if (mvy_sym == 255)
                         snt_bw_put_sexpgolomb(&ov, mvd_y);
-
                     mv_field[blk_idx] = best_mv;
                 }
             }
 
-            /* ── DCT input: residual (inter) or pixels (intra) ──── */
-            int16_t dct_input[64];
-            if (block_is_inter && !block_is_skip) {
+            /* Block input: MC residual, spatial-intra residual, or pixels */
+            int16_t luma_in[64];
+            int imode = SNT_IPRED_TD;
+            if (block_is_inter) {
                 snt_mc_luma(ctx->ref_y, width, height, px0, py0, best_mv, BLK, BLK, mc_blk);
-                /* Inter coded: DCT of residual = cur - MC prediction
-                 * (zero outside the frame) */
-                for (int dy = 0; dy < BLK; dy++)
-                    for (int dx = 0; dx < BLK; dx++) {
-                        int py = py0 + dy, px_v = px0 + dx;
-                        dct_input[dy * BLK + dx] = (py < height && px_v < width) ?
-                            work[py * pad_w + px_v] - mc_blk[dy * BLK + dx] : 0;
-                    }
-            } else {
-                /* Intra (key or inter-frame intra): use work buffer directly */
                 for (int dy = 0; dy < BLK; dy++)
                     for (int dx = 0; dx < BLK; dx++)
-                        dct_input[dy * BLK + dx] = work[(py0 + dy) * pad_w + (px0 + dx)];
-            }
-
-            int16_t coeffs[64];
-            snt_dct_fwd_2d_ref(dct_input, BLK, BLK, coeffs);
-
-            /* Transform-domain prediction for intra blocks: DC from the
-             * neighbours' pixel-domain DC; low AC (key frames) from their
-             * reconstructed coefficients. */
-            int16_t td_pred[64];
-            memset(td_pred, 0, sizeof(td_pred));
-            if (!block_is_inter) {
-                if (bx > 0 && by > 0)
-                    td_pred[0] = (dc_recon_left + dc_recon_above[bx] + 1) >> 1;
-                else if (bx > 0)
-                    td_pred[0] = dc_recon_left;
-                else if (by > 0)
-                    td_pred[0] = dc_recon_above[bx];
-                if (!is_inter)
-                    for (int p = 0; p < NUM_PRED_AC; p++) {
-                        int idx = pred_ac_idx[p];
-                        if (idx < 8 && bx > 0)
-                            td_pred[idx] = ac_recon_left[p];
-                        else if (idx >= 8 && by > 0)
-                            td_pred[idx] = ac_recon_above[bx * NUM_PRED_AC + p];
-                    }
-            }
-
-            /* Intra mode: transform-domain prediction or a spatial
-             * predictor, whichever has the lower transform-domain cost
-             * (sum of |residual coefficients| + lambda * mode bits).
-             * A spatial prediction goes in mc_blk, like an MC prediction;
-             * luma_in becomes its residual. */
-            int16_t luma_in[64];
-            memcpy(luma_in, dct_input, sizeof(luma_in));
-            int imode = SNT_IPRED_TD;
-            if (!block_is_inter) {
-                double lambda_sad = sqrt(RD_LAMBDA) * step;
-                double best_cost = lambda_sad * cdf_bits(&cs->imode[is_inter], SNT_IPRED_TD);
-                for (int k = 0; k < 64; k++)
-                    best_cost += abs(coeffs[k] - td_pred[k]);
-                for (int m = SNT_IPRED_V; m < SNT_NUM_IPRED; m++) {
-                    uint8_t p[BLK * BLK];
-                    int16_t res[64], rcf[64];
-                    snt_intra_spatial_pred8(recon, pad_w, px0, py0, m, p);
-                    for (int k = 0; k < 64; k++)
-                        res[k] = dct_input[k] - p[k];
-                    snt_dct_fwd_2d_ref(res, BLK, BLK, rcf);
-                    double cost = lambda_sad * cdf_bits(&cs->imode[is_inter], (uint16_t)m);
-                    for (int k = 0; k < 64; k++)
-                        cost += abs(rcf[k]);
-                    if (cost < best_cost) {
-                        best_cost = cost;
-                        imode = m;
-                        memcpy(mc_blk, p, sizeof(p));
-                        memcpy(luma_in, res, sizeof(res));
-                    }
-                }
+                        luma_in[dy * BLK + dx] = (dy < vh && dx < vw) ?
+                            src[dy * BLK + dx] - mc_blk[dy * BLK + dx] : 0;
+            } else {
+                imode = best_imode;
                 REC(cs->imode[is_inter], (uint16_t)imode);
+                if (imode == SNT_IPRED_TD) {
+                    memcpy(luma_in, src, sizeof(luma_in));
+                } else {
+                    snt_intra_spatial_pred8(recon, pad_w, px0, py0, imode, mc_blk);
+                    for (int k = 0; k < 64; k++)
+                        luma_in[k] = src[k] - mc_blk[k];
+                }
             }
             /* mc_blk holds this block's prediction (inter or spatial intra) */
-            int has_pred_blk = (block_is_inter && !block_is_skip) || imode != SNT_IPRED_TD;
+            int has_pred_blk = block_is_inter || imode != SNT_IPRED_TD;
             int td_ac = !is_inter && imode == SNT_IPRED_TD;
 
             LumaCode lc;
@@ -599,15 +568,15 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
              * prediction. Spatial-intra blocks coded a residual, so take
              * the coefficients of the reconstructed block itself. */
             if (!is_inter) {
-                const int16_t *src = lc.recon_coeffs;
+                const int16_t *srcc = lc.recon_coeffs;
                 int16_t full[64];
                 if (imode != SNT_IPRED_TD) {
                     snt_dct_fwd_2d_ref(lc.recon, BLK, BLK, full);
-                    src = full;
+                    srcc = full;
                 }
                 for (int p = 0; p < NUM_PRED_AC; p++) {
-                    ac_recon_left[p] = src[pred_ac_idx[p]];
-                    ac_recon_above[bx * NUM_PRED_AC + p] = src[pred_ac_idx[p]];
+                    ac_recon_left[p] = srcc[pred_ac_idx[p]];
+                    ac_recon_above[bx * NUM_PRED_AC + p] = srcc[pred_ac_idx[p]];
                 }
             }
         }

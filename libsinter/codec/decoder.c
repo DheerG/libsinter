@@ -51,6 +51,19 @@ static void skip_motion(const uint8_t *blk_dir, const SntMV *mvf_field, const Sn
     }
 }
 
+/* Prediction agreement of 8x8 block (bx, by) (cdf_set.h): P-frames compare
+ * the skip prediction with the prediction at the forward predictor pf;
+ * B-frames compare forward at pf with backward at pb. Zero for a
+ * malformed stream that lacks a reference. */
+static uint32_t agree_sad8(const SntSplinePlane *rf, const SntSplinePlane *rb, int bx, int by,
+                           int is_bidi, int sdir, SntMV smf, SntMV smb, SntMV pf, SntMV pb) {
+    SntMV zero = {0, 0};
+    if (!rf->coef || (is_bidi && !rb->coef)) return 0;
+    if (is_bidi)
+        return snt_pred_sad8(rf, rb, bx * BLK, by * BLK, SNT_DIR_FWD, pf, zero, SNT_DIR_BWD, zero, pb);
+    return snt_pred_sad8(rf, rb, bx * BLK, by * BLK, sdir, smf, smb, SNT_DIR_FWD, pf, zero);
+}
+
 /* Decode a luma AC level at zigzag index k from its binary decisions
  * (levels.h; the same decisions and models as snt_level_bins) */
 static int16_t dec_level(SntRangeDec *rd, SntCdfSet *cs, int t, int k, int pc, int z_known) {
@@ -211,7 +224,17 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             mb_mvf = snt_mv_predict_at(mv_field, blk_cols, bx0, by0);
             if (is_bidi)
                 mb_mvb = snt_mv_predict_at(mvb_field, blk_cols, bx0, by0);
-            mb_mode = DEC(cs->mbmode);
+            /* The mode's model: agreement of two predictions over the
+             * macroblock, with its skip motion and predictors */
+            int sdir;
+            SntMV smf, smb;
+            skip_motion(blk_dir, mv_field, mvb_field, blk_cols, bx0, by0, is_bidi,
+                        gmf, gmb, &sdir, &smf, &smb);
+            uint32_t sad = 0;
+            for (int z = 0; z < 4; z++)
+                sad += agree_sad8(ref_f, ref_b, bx0 + (z & 1), by0 + (z >> 1), is_bidi,
+                                  sdir, smf, smb, mb_mvf, mb_mvb);
+            mb_mode = DEC(cs->mbmode[snt_agree_class(sad, 256, step)]);
             /* SKIP16 predicts with the global motion: bi-directional in
              * B-frames */
             mb_dir = is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
@@ -247,12 +270,22 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             /* ── Inter mode decode ────────────────────────────── */
             if (is_inter) {
                 if (mb_mode == SNT_MB_SPLIT) {
-                    block_is_inter = DEC(cs->inter) == 1;
+                    /* The flags' models: agreement of two predictions */
+                    int sdir;
+                    SntMV smf, smb, pf, pb = {0, 0};
+                    skip_motion(blk_dir, mv_field, mvb_field, blk_cols, bx, by, is_bidi,
+                                gmf, gmb, &sdir, &smf, &smb);
+                    pf = snt_mv_predict_at(mv_field, blk_cols, bx, by);
+                    if (is_bidi)
+                        pb = snt_mv_predict_at(mvb_field, blk_cols, bx, by);
+                    int ac = snt_agree_class(agree_sad8(ref_f, ref_b, bx, by, is_bidi,
+                                                        sdir, smf, smb, pf, pb), 64, step);
+                    block_is_inter = DEC(cs->inter[ac]) == 1;
                     if (block_is_inter) {
                         /* A skip block predicts with the global motion; a
                          * coded block's MVs are coded against the median of
                          * its neighbours' (an unused direction's MV is zero) */
-                        block_is_skip = DEC(cs->iskip) == 1;
+                        block_is_skip = DEC(cs->iskip[ac]) == 1;
                         dir = is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
                         if (block_is_skip)
                             skip_motion(blk_dir, mv_field, mvb_field, blk_cols, bx, by, is_bidi,

@@ -39,3 +39,19 @@ No patent or application found that selects contexts from the content or spectru
 - "VP8 coefficient probability updates frame header": VP8 ([RFC 6386](https://datatracker.ietf.org/doc/rfc6386/), 2010) sends exactly this: default token probabilities plus per-frame updates in the frame header, which persist until the next key frame.
 
 **Result.** Dropped: sending probability changes from defaults in the header is VP8's design, and VP8 is an excluded source. Choosing one of a few predefined tables instead would be H.264's `cabac_init_idc`, also excluded. JPEG's two-pass optimized tables (1992) would be the pre-2004 form, but sending complete tables for hundreds of adaptive models costs more than the trained starting tables leave to gain.
+
+## 4. Prediction agreement for mode flags (kept)
+
+Chosen from a measured breakdown of where the bits go: at QP 28 the macroblock mode and the per-block inter and skip flags took 6-16% of the bits (foreman 15.8%, akiyo 8%), coded with models that only knew the history of those flags.
+
+**Idea.** Before a macroblock's mode (or a block's inter and skip flags) is read, the decoder can already form two predictions from the references alone. In P-frames: the skip prediction (the motion a skipped block would use) and the prediction at the median motion vector predictor. In B-frames: the forward prediction at the forward predictor and the backward prediction at the backward predictor. Their mean absolute difference, against the quantizer step (below step/8, below step/2, above), selects the mode models. Nothing extra is sent.
+
+**Why it should help.** When the two predictions agree, the motion around the block is consistent (in B-frames, consistent in time from both sides), so skipping is likely to be good enough; when they disagree, the block probably has its own motion and needs coding.
+
+**Search.**
+- "patent skip flag context derived from difference between two motion compensated predictions decoder side similarity forward backward prediction entropy coding mode": closest [US 11,310,522](https://patents.justia.com/patent/11310522) (ByteDance, decoder-side motion vector refinement: the SAD between the two bi-predictions decides whether to skip the refinement, not a context for coding), [US9420300B2](https://patents.google.com/patent/US9420300), [US9451270B2](https://patents.google.com/patent/US9451270B2/en), [JP2006518564A](https://patents.google.com/patent/JP2006518564A/en).
+- "entropy coding mode decision probability estimated from agreement of candidate predictions computed at decoder context macroblock skip": closest [US8520732](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/8520732) and [US8428133](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/8428133) (contexts from whether neighbours use one or two directions), [US10630978](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/10630978) (decoder reorders intra modes by redundancy), [US9967594B2](https://patents.google.com/patent/US9967594).
+
+No patent or application found that selects the models for mode or skip flags from the agreement of two decoder-side predictions.
+
+**Result.** Kept. -0.6% (-0.5%): foreman -0.6%, mobile -0.2%, akiyo -0.9%. Thresholds twice as coarse (step/4, step) were worse (-0.5%). The decoder forms two 8x8 predictions per flag decision; it still decodes a CIF frame in 3-6 ms.

@@ -368,6 +368,39 @@ static void skip_motion(const EncFrame *f, int bx, int by, int *dir, SntMV *mvf,
     }
 }
 
+/* Prediction agreement class of 8x8 block (bx, by) (cdf_set.h), with its
+ * skip motion and predictors */
+static uint32_t agree_sad8(const EncFrame *f, int bx, int by, int sdir, SntMV smf, SntMV smb,
+                           SntMV pf, SntMV pb) {
+    SntMV zero = {0, 0};
+    if (f->is_bidi)
+        return snt_pred_sad8(f->ref_f, f->ref_b, bx * BLK, by * BLK,
+                             SNT_DIR_FWD, pf, zero, SNT_DIR_BWD, zero, pb);
+    return snt_pred_sad8(f->ref_f, f->ref_b, bx * BLK, by * BLK,
+                         sdir, smf, smb, SNT_DIR_FWD, pf, zero);
+}
+
+static int agree_class_block(const EncFrame *f, int bx, int by) {
+    int sdir;
+    SntMV smf, smb, pf, pb;
+    skip_motion(f, bx, by, &sdir, &smf, &smb);
+    mv_predictors(f, bx, by, &pf, &pb);
+    return snt_agree_class(agree_sad8(f, bx, by, sdir, smf, smb, pf, pb), 64, f->step);
+}
+
+/* The same for the 16x16 macroblock whose top-left block is (bx0, by0),
+ * with the macroblock's skip motion and predictors */
+static int agree_class_mb(const EncFrame *f, int bx0, int by0) {
+    int sdir;
+    SntMV smf, smb, pf, pb;
+    skip_motion(f, bx0, by0, &sdir, &smf, &smb);
+    mv_predictors(f, bx0, by0, &pf, &pb);
+    uint32_t sad = 0;
+    for (int z = 0; z < 4; z++)
+        sad += agree_sad8(f, bx0 + (z & 1), by0 + (z >> 1), sdir, smf, smb, pf, pb);
+    return snt_agree_class(sad, 256, f->step);
+}
+
 /* Inter prediction of a block and its residual (0 outside the frame) */
 static void mc_residual(const EncFrame *f, int bx, int by, int dir, SntMV mvf, SntMV mvb,
                         const int16_t *src, int vw, int vh, uint8_t *pred, int16_t *res) {
@@ -418,6 +451,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
     bc->kind = CAND_INTRA; bc->imode = SNT_IPRED_DC; bc->dir = 0;
     bc->mvf = zero; bc->mvb = zero;
 
+    int ac = f->is_inter ? agree_class_block(f, bx, by) : 0;
     if (f->is_inter) {
         SntMV pf, pb;
         mv_predictors(f, bx, by, &pf, &pb);
@@ -432,7 +466,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
         snt_pred_luma8(f->ref_f, f->ref_b, px0, py0, sdir, smf, smb, p);
         for (int k = 0; k < 64; k++) p16[k] = p[k];
         double j = block_sse(src, p16, vw, vh)
-                 + f->lambda * (cdf_bits(&cs->inter, 1) + cdf_bits(&cs->iskip, 1));
+                 + f->lambda * (cdf_bits(&cs->inter[ac], 1) + cdf_bits(&cs->iskip[ac], 1));
         if (j < best_j) {
             best_j = j; bc->kind = CAND_SKIP; bc->dir = sdir; bc->mvf = smf; bc->mvb = smb;
             memcpy(best_rec, p16, sizeof(best_rec));
@@ -449,7 +483,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
             memset(td_pred, 0, sizeof(td_pred));
             code_luma(cs, NULL, f->step, 1, res, td_pred, 0, p, &lc);
             j = block_sse(src, lc.recon, vw, vh)
-              + f->lambda * (cdf_bits(&cs->inter, 1) + cdf_bits(&cs->iskip, 0)
+              + f->lambda * (cdf_bits(&cs->inter[ac], 1) + cdf_bits(&cs->iskip[ac], 0)
                              + inter_mv_bits(f, d, mvf, mvb, pf, pb) + lc.bits);
             if (j < best_j) {
                 best_j = j; bc->kind = CAND_INTER; bc->dir = d; bc->mvf = mvf; bc->mvb = mvb;
@@ -463,7 +497,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
         LumaCode lc;
         code_luma(cs, NULL, f->step, 0, src, td_pred, 1, NULL, &lc);
         double bits = cdf_bits(&cs->imode[f->is_inter], (uint16_t)m) + lc.bits
-                    + (f->is_inter ? cdf_bits(&cs->inter, 0) : 0);
+                    + (f->is_inter ? cdf_bits(&cs->inter[ac], 0) : 0);
         double j = block_sse(src, lc.recon, vw, vh) + f->lambda * bits;
         if (j < best_j) {
             best_j = j; bc->kind = CAND_INTRA; bc->imode = m; bc->dir = 0;
@@ -545,9 +579,10 @@ static void emit_block(EncFrame *f, int bx, int by, const BlockChoice *bc) {
     if (f->is_inter) {
         SntMV pf, pb;
         mv_predictors(f, bx, by, &pf, &pb);
-        rec(f->sink, &cs->inter, bc->kind != CAND_INTRA);
+        int ac = agree_class_block(f, bx, by);
+        rec(f->sink, &cs->inter[ac], bc->kind != CAND_INTRA);
         if (bc->kind != CAND_INTRA) {
-            rec(f->sink, &cs->iskip, bc->kind == CAND_SKIP);
+            rec(f->sink, &cs->iskip[ac], bc->kind == CAND_SKIP);
             if (bc->kind == CAND_SKIP) {
                 /* Skip predicts with the global motion */
                 int sdir;
@@ -590,7 +625,8 @@ typedef struct {
  * 16x16-searched MVs with each 8x8 residual coded (forward; in B-frames
  * also backward and bi-directional). Returns the skip cost and the best
  * inter candidate. */
-static double eval_mb16(EncFrame *f, int bx0, int by0, SntMV pf, SntMV pb, Mb16Choice *best) {
+static double eval_mb16(EncFrame *f, int bx0, int by0, SntMV pf, SntMV pb, int mac,
+                        Mb16Choice *best) {
     SntCdfSet *cs = f->cs;
     int px0 = bx0 * BLK, py0 = by0 * BLK;
     int sdir;
@@ -622,13 +658,13 @@ static double eval_mb16(EncFrame *f, int bx0, int by0, SntMV pf, SntMV pb, Mb16C
             d_inter += block_sse(src, lc.recon, vw, vh);
             bits += lc.bits;
         }
-        double j = d_inter + f->lambda * (cdf_bits(&cs->mbmode, SNT_MB_INTER16) + bits
+        double j = d_inter + f->lambda * (cdf_bits(&cs->mbmode[mac], SNT_MB_INTER16) + bits
                                           + inter_mv_bits(f, d, mvf, mvb, pf, pb));
         if (j < best->j) {
             best->j = j; best->dir = d; best->mvf = mvf; best->mvb = mvb;
         }
     }
-    return d_skip + f->lambda * cdf_bits(&cs->mbmode, SNT_MB_SKIP16);
+    return d_skip + f->lambda * cdf_bits(&cs->mbmode[mac], SNT_MB_SKIP16);
 }
 
 /* Code one 16x16 macroblock (mb_x, mb_y in macroblock units) */
@@ -653,18 +689,19 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
      * come from neighbours outside the macroblock. */
     SntMV pf, pb;
     mv_predictors(f, bx0, by0, &pf, &pb);
+    int mac = agree_class_mb(f, bx0, by0);  /* before the blocks' provisional state */
     BlockChoice bc[4];
-    double j_split = f->lambda * cdf_bits(&f->cs->mbmode, SNT_MB_SPLIT);
+    double j_split = f->lambda * cdf_bits(&f->cs->mbmode[mac], SNT_MB_SPLIT);
     for (int z = 0; z < 4; z++)
         j_split += decide_block(f, bx0 + (z & 1), by0 + (z >> 1), 1, &bc[z]);
     Mb16Choice m16;
-    double j_skip = eval_mb16(f, bx0, by0, pf, pb, &m16);
+    double j_skip = eval_mb16(f, bx0, by0, pf, pb, mac, &m16);
 
     int mode = SNT_MB_SPLIT;
     if (j_skip < j_split && j_skip <= m16.j) mode = SNT_MB_SKIP16;
     else if (m16.j < j_split) mode = SNT_MB_INTER16;
 
-    rec(f->sink, &f->cs->mbmode, (uint16_t)mode);
+    rec(f->sink, &f->cs->mbmode[mac], (uint16_t)mode);
     if (mode == SNT_MB_SPLIT) {
         for (int z = 0; z < 4; z++)
             emit_block(f, bx0 + (z & 1), by0 + (z >> 1), &bc[z]);

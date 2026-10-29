@@ -33,6 +33,12 @@ enum { SNT_DIR_FWD = 1, SNT_DIR_BWD = 2, SNT_DIR_BI = 3 };
 void snt_pred_luma8(const SntSplinePlane *ref_f, const SntSplinePlane *ref_b,
                     int x0, int y0, int dir, SntMV mvf, SntMV mvb, uint8_t *pred);
 
+/* Sum of absolute differences between two predictions of the 8x8 luma
+ * block at (x0, y0): direction dira with MVs (af, ab), and dirb with
+ * (bf, bb) */
+uint32_t snt_pred_sad8(const SntSplinePlane *ref_f, const SntSplinePlane *ref_b, int x0, int y0,
+                       int dira, SntMV af, SntMV ab, int dirb, SntMV bf, SntMV bb);
+
 /* The same for a 4x4 chroma block, with the luma MVs read as 1/8-pel */
 void snt_pred_chroma4(const uint8_t *ref_f, const uint8_t *ref_b, int w, int h,
                       int x0, int y0, int dir, SntMV mvf, SntMV mvb, uint8_t *pred);

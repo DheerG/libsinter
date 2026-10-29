@@ -58,9 +58,14 @@ SntMV snte_motion_search(const uint8_t *cur, const uint8_t *ref,
             rx + blk_size > frame_w || ry + blk_size > frame_h)
             continue;
 
+        /* SAD row by row, stopping once the cost can't beat the best so far
+         * (the same result as the full sum) */
         const uint8_t *ref_blk = &ref[ry * stride + rx];
-        double cost = snt_sad(cur_blk, stride, ref_blk, stride, blk_size, blk_size)
-                    + lambda * (snte_mvd_bits(4 * dx - pred.x) + snte_mvd_bits(4 * dy - pred.y));
+        double mv_cost = lambda * (snte_mvd_bits(4 * dx - pred.x) + snte_mvd_bits(4 * dy - pred.y));
+        uint32_t sad = 0;
+        for (int y = 0; y < blk_size && (double)sad + mv_cost < best_cost; y++)
+            sad += snt_sad(cur_blk + y * stride, stride, ref_blk + y * stride, stride, blk_size, 1);
+        double cost = sad + mv_cost;
 
         if (cost < best_cost) {
             best_cost = cost;

@@ -14,6 +14,7 @@
 #define SNT_CDF_SET_H
 
 #include "../core/entropy/rans.h"
+#include "../core/prediction/intra_spatial.h"
 
 #define SNT_NUM_BANDS   16
 #define SNT_AC_GROUPS    4  /* luma AC contexts: band / 4 */
@@ -25,6 +26,7 @@ typedef struct {
     RansCDF mode[2][SNT_NUM_BANDS];   /* band mode: 0 = PVQ, 1 = scalar */
     RansCDF skip[2][SNT_NUM_BANDS];   /* PVQ band skip */
     RansCDF gain[2];                  /* PVQ gain */
+    RansCDF imode[2];                 /* intra mode, by frame type (0 key, 1 inter) */
     RansCDF inter, iskip, mvx, mvy;   /* inter-frame block modes and MV deltas */
     RansCDF cdc[2];                   /* chroma DC residual, by block type */
     RansCDF cac[2][SNT_CAC_GROUPS];   /* chroma AC level */
@@ -41,6 +43,7 @@ static inline void snt_cdf_set_init(SntCdfSet *s) {
     for (int t = 0; t < 2; t++) {
         rans_cdf_init_uniform(&s->dc[t],   256, RANS_ADAPT_RATE_COEFF);
         rans_cdf_init_uniform(&s->gain[t], 256, RANS_ADAPT_RATE_COEFF);
+        rans_cdf_init_uniform(&s->imode[t], SNT_NUM_IPRED, RANS_ADAPT_RATE_MODE);
         rans_cdf_init_uniform(&s->cdc[t],  256, RANS_ADAPT_RATE_COEFF);
         for (int g = 0; g < SNT_AC_GROUPS; g++)
             rans_cdf_init_uniform(&s->ac[t][g], 256, RANS_ADAPT_RATE_COEFF);

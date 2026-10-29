@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include "decoder.h"
 #include "cdf_set.h"
+#include "scan.h"
 #include "../util/fixed_point.h"
 #include "../core/transform/dct.h"
 #include "../core/quantize/pvq.h"
@@ -16,6 +17,8 @@
 #include "../core/entropy/rans.h"
 #include "../core/prediction/motion_est.h"
 #include "../core/prediction/mc.h"
+#include "../core/filter/deblock.h"
+#include "../core/prediction/intra_spatial.h"
 #include "../core/grain/grain_synth.h"
 #include "../perceptual/csf_weights.h"
 
@@ -36,6 +39,7 @@ static inline int16_t u2s(uint16_t s) {
  *       DEC(iskip) → skip_flag
  *       IF skip: MC prediction at the predicted MV, continue
  *       IF coded: DEC(mvx), DEC(mvy) → MV delta
+ *   IF intra block: DEC(imode[is_inter_frame]) → mode (SNT_IPRED_*)
  *   DEC(dc[t]) → dc_level (residual for inter, absolute for intra)
  *   FOR band b=0..15: mode[t][b], then ac[t][b/4] or skip[t][b] + gain[t]
  * FOR each chroma plane: cdc[ct], then cac[ct][snt_cac_group(i)]
@@ -195,13 +199,25 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     memset(mc_blk, 0, sizeof(mc_blk));  /* malformed: inter frame, no reference */
             }
 
+            /* Intra mode; a spatial prediction goes in mc_blk */
+            int imode = SNT_IPRED_TD;
+            if (!block_is_inter) {
+                imode = DEC(cs->imode[is_inter]);
+                if (imode != SNT_IPRED_TD)
+                    snt_intra_spatial_pred8(recon, pad_w, px0, py0, imode, mc_blk);
+            }
+            /* mc_blk holds this block's prediction (inter or spatial intra) */
+            int has_pred_blk = (block_is_inter && !block_is_skip) || imode != SNT_IPRED_TD;
+            int td_ac = !is_inter && imode == SNT_IPRED_TD;
+
             /* ── Decode DC + bands (same for intra and inter coded) ── */
             int16_t recon_coeffs[64];
 
-            /* DC prediction. Inter residuals are zero-mean and predict 0;
-             * intra blocks predict from the neighbours' pixel-domain DC. */
+            /* DC prediction: only transform-domain intra blocks predict DC
+             * (from the neighbours' pixel-domain DC); inter and
+             * spatial-intra residuals are zero-mean. */
             int16_t dc_pred = 0;
-            if (block_is_inter)
+            if (has_pred_blk)
                 dc_pred = 0;
             else if (bx > 0 && by > 0)
                 dc_pred = (dc_recon_left + dc_recon_above[bx] + 1) >> 1;
@@ -219,8 +235,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
 
             int16_t dc_recon_val = pvq_dequantize_dc(dc_level, step) + dc_pred;
             recon_coeffs[0] = dc_recon_val;
-            /* Neighbours see the pixel-domain DC (inter: add the prediction's DC) */
-            dc_recon_left = block_is_inter ? dc_recon_val + snt_pred_dc8(mc_blk) : dc_recon_val;
+            /* Neighbours see the pixel-domain DC (add the prediction block's DC) */
+            dc_recon_left = has_pred_blk ? dc_recon_val + snt_pred_dc8(mc_blk) : dc_recon_val;
             dc_recon_above[bx] = dc_recon_left;
 
             /* Band processing */
@@ -230,7 +246,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
 
                 float csf_sum = 0;
                 for (int i = 0; i < n; i++)
-                    csf_sum += psy_csf_weight(8, 1 + start + i);
+                    csf_sum += psy_csf_weight(8, snt_zigzag8[1 + start + i]);
                 uint8_t band_csf = (uint8_t)(csf_sum / n * 255.0f);
                 if (band_csf < 1) band_csf = 1;
 
@@ -250,7 +266,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                             level = (int16_t)snt_br_get_sexpgolomb(&ovr);
                         else
                             level = u2s(ac_sym);
-                        recon_coeffs[1 + start + i] = pvq_dequantize_dc(level, eff_step);
+                        recon_coeffs[snt_zigzag8[1 + start + i]] = pvq_dequantize_dc(level, eff_step);
                     }
                 } else {
                     /* PVQ mode */
@@ -283,16 +299,16 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                         int16_t band_recon[16];
                         pvq_decode(&code, n, step, band_recon);
                         for (int i = 0; i < n; i++)
-                            recon_coeffs[1 + start + i] = band_recon[i];
+                            recon_coeffs[snt_zigzag8[1 + start + i]] = band_recon[i];
                     } else {
                         for (int i = 0; i < n; i++)
-                            recon_coeffs[1 + start + i] = 0;
+                            recon_coeffs[snt_zigzag8[1 + start + i]] = 0;
                     }
                 }
             }
 
-            /* Add back AC prediction (key frames only) */
-            if (!is_inter) {
+            /* Add back AC prediction (transform-domain intra in key frames) */
+            if (td_ac) {
                 for (int p = 0; p < NUM_PRED_AC; p++) {
                     int idx = pred_ac_idx[p];
                     int16_t pred_val = 0;
@@ -304,29 +320,35 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 }
             }
 
-            /* Store reconstructed AC for future prediction (key frames only) */
-            if (!is_inter) {
-                for (int p = 0; p < NUM_PRED_AC; p++) {
-                    int idx = pred_ac_idx[p];
-                    ac_recon_left[p] = recon_coeffs[idx];
-                    ac_recon_above[bx * NUM_PRED_AC + p] = recon_coeffs[idx];
-                }
-            }
-
             /* IDCT */
             int16_t recon_blk[64];
             snt_dct_inv_2d_ref(recon_coeffs, BLK, recon_blk, BLK);
 
-
-            /* Write to recon: add MC prediction for inter coded blocks */
+            /* Write to recon: add the prediction block (inter or spatial intra) */
             for (int dy = 0; dy < BLK; dy++)
                 for (int dx = 0; dx < BLK; dx++) {
                     int py = py0 + dy, px_v = px0 + dx;
                     int16_t val = recon_blk[dy * BLK + dx];
-                    if (block_is_inter && !block_is_skip && ctx->ref_y)
+                    if (has_pred_blk)
                         val += mc_blk[dy * BLK + dx];
                     recon[py * pad_w + px_v] = val;
+                    recon_blk[dy * BLK + dx] = val;
                 }
+
+            /* Key frames: store reconstructed low AC for the neighbours'
+             * prediction (spatial-intra blocks: from the reconstructed block) */
+            if (!is_inter) {
+                const int16_t *src = recon_coeffs;
+                int16_t full[64];
+                if (imode != SNT_IPRED_TD) {
+                    snt_dct_fwd_2d_ref(recon_blk, BLK, BLK, full);
+                    src = full;
+                }
+                for (int p = 0; p < NUM_PRED_AC; p++) {
+                    ac_recon_left[p] = src[pred_ac_idx[p]];
+                    ac_recon_above[bx * NUM_PRED_AC + p] = src[pred_ac_idx[p]];
+                }
+            }
         }
         memset(ac_recon_left, 0, sizeof(ac_recon_left));
     }
@@ -335,6 +357,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     for (int y = 0; y < height; y++)
         for (int x = 0; x < width; x++)
             output_y[y * stride_y + x] = snt_clip_pixel((int32_t)recon[y * pad_w + x]);
+    snt_deblock_luma(output_y, width, height, stride_y, step,
+                     is_inter ? blk_is_skip : NULL, mv_field, blk_cols);
 
     /* Decode chroma with inter prediction support */
     if (chroma_present && output_u && output_v) {
@@ -438,6 +462,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             }
             free(c_dc_above);
         }
+        snt_deblock_chroma(output_u, cw, ch_h, stride_uv, cstep, is_inter ? blk_is_skip : NULL, mv_field, blk_cols);
+        snt_deblock_chroma(output_v, cw, ch_h, stride_uv, cstep, is_inter ? blk_is_skip : NULL, mv_field, blk_cols);
     }
 
     /* Grain synthesis */

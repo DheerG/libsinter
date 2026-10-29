@@ -6,7 +6,8 @@
  * - 32-bit state, 16-bit renormalization
  * - 15-bit CDF probability resolution (totals sum to 32768)
  * - Normative dual interleaved rANS (Giesen's approach)
- * - PARA: rate=5 for coefficients, rate=4 for modes
+ * - PARA: steady-state rate 8 for coefficients, 6 for modes; faster for
+ *   the first 256 symbols after init
  *
  * CRITICAL: ANS is LIFO (stack-based).
  *   Encoder processes symbols in REVERSE order.
@@ -26,6 +27,7 @@
 void rans_cdf_init_uniform(RansCDF *cdf, uint16_t num_symbols, uint8_t adapt_rate) {
     cdf->num_symbols = num_symbols;
     cdf->adapt_rate = adapt_rate;
+    cdf->count = 0;
 
     /* Uniform: each symbol gets RANS_PROB_TOTAL / num_symbols probability.
      * Ensure no symbol has zero probability (minimum 1). */
@@ -47,7 +49,11 @@ void rans_cdf_adapt(RansCDF *cdf, uint16_t symbol) {
      * For each CDF entry: cdf[i] += ((target[i] - cdf[i]) >> rate)
      * where target[i] = i <= symbol ? 0 : RANS_PROB_TOTAL
      * (i.e., target is a step function at 'symbol'). */
-    uint8_t rate = cdf->adapt_rate;
+    /* Count-based rate: fast while the CDF has seen few symbols, then
+     * slower, reaching adapt_rate after 256 symbols. */
+    int rate = cdf->adapt_rate - (cdf->count < 16) - (cdf->count < 64) - (cdf->count < 256);
+    if (rate < 3) rate = 3;
+    if (cdf->count < UINT16_MAX) cdf->count++;
     uint16_t nsym = cdf->num_symbols;
 
     /* cdf[0] is always 0, cdf[nsym] is always RANS_PROB_TOTAL. */

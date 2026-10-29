@@ -19,8 +19,6 @@
 #include "../core/prediction/mc.h"
 #include "../core/filter/deblock.h"
 #include "../core/prediction/intra_acdc.h"
-#include "../core/grain/grain_synth.h"
-#include "../perceptual/csf_weights.h"
 
 #define BLK 8
 
@@ -69,7 +67,7 @@ static void dec_pred_chroma(const uint8_t *rf, const uint8_t *rb, int w, int h, 
  *       IF coded: [B: DEC(bdir)], then DEC(mvx), DEC(mvy) per used direction
  *   IF intra block: DEC(imode[is_inter_frame]) → mode (SNT_IPRED_*, intra_acdc.h)
  *   DEC(dc[t]) → dc_level (residual for inter, absolute for intra)
- *   FOR band b=0..15: mode[t][b], then ac[t][b/4] or skip[t][b] + gain[t]
+ *   FOR band b=0..15: band[t][b][nz], then (if coded) ac[t][b/4] per level
  * FOR each chroma plane: cdc[ct], then cac[ct][snt_cac_group(i)]
  * (contexts: see cdf_set.h and the encoder's symbol-order comment)
  */
@@ -298,78 +296,22 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             int16_t dc_recon_val = pvq_dequantize_dc(dc_level, step) + dc_pred;
             recon_coeffs[0] = dc_recon_val;
 
-            /* Band processing. Band flags take the previous band's (band 0:
-             * the DC level's) zero/nonzero status as context. */
+            /* Bands: a coded flag (context: is the previous band, for
+             * band 0 the DC level, nonzero?), then the levels */
             int prev_nz = dc_level != 0;
             for (int b = 0; b < NUM_BANDS; b++) {
                 int start = band_bounds[b];
                 int n = band_bounds[b + 1] - start;
-
-                float csf_sum = 0;
-                for (int i = 0; i < n; i++)
-                    csf_sum += psy_csf_weight(8, snt_zigzag8[1 + start + i]);
-                uint8_t band_csf = (uint8_t)(csf_sum / n * 255.0f);
-                if (band_csf < 1) band_csf = 1;
-
-                uint16_t mode_sym = DEC(cs->mode[block_is_inter][b][prev_nz]);
-
-                if (mode_sym == 1) {
-                    /* Scalar mode */
-                    uint16_t eff_step = step;
-                    if (band_csf < 128) {
-                        eff_step = (uint16_t)((uint32_t)step * 256 / band_csf);
-                        if (eff_step > 3072) eff_step = 3072;
-                    }
-                    int nz = 0;
-                    for (int i = 0; i < n; i++) {
+                int coded = DEC(cs->band[block_is_inter][b][prev_nz]) == 1;
+                for (int i = 0; i < n; i++) {
+                    int16_t level = 0;
+                    if (coded) {
                         uint16_t ac_sym = DEC(cs->ac[block_is_inter][b / 4]);
-                        int16_t level;
-                        if (ac_sym == 255)
-                            level = (int16_t)snt_br_get_sexpgolomb(&ovr);
-                        else
-                            level = u2s(ac_sym);
-                        nz |= level != 0;
-                        recon_coeffs[snt_zigzag8[1 + start + i]] = pvq_dequantize_dc(level, eff_step);
+                        level = ac_sym == 255 ? (int16_t)snt_br_get_sexpgolomb(&ovr) : u2s(ac_sym);
                     }
-                    prev_nz = nz;
-                } else {
-                    /* PVQ mode */
-                    uint16_t skip_sym = DEC(cs->skip[block_is_inter][b][prev_nz]);
-                    prev_nz = !skip_sym;
-
-                    if (!skip_sym) {
-                        SntPVQCode code;
-                        code.skip = 0;
-
-                        uint16_t gain_sym = DEC(cs->gain[block_is_inter]);
-                        if (gain_sym == 255)
-                            code.gain = snt_br_get_expgolomb(&ovr);
-                        else
-                            code.gain = (uint32_t)gain_sym;
-
-                        /* K is derived, not transmitted (same formula as encoder) */
-                        code.k = pvq_compute_k(code.gain, n, band_csf);
-
-                        int shape_bits = pvq_shape_bits(n, code.k);
-                        if (shape_bits < 1) shape_bits = 1;
-                        if (shape_bits > 64) shape_bits = 64;
-                        if (shape_bits > 32) {
-                            uint64_t hi = snt_br_get_bits(&ovr, shape_bits - 32);
-                            uint64_t lo = snt_br_get_bits(&ovr, 32);
-                            code.shape_idx = (hi << 32) | lo;
-                        } else {
-                            code.shape_idx = snt_br_get_bits(&ovr, shape_bits);
-                        }
-
-                        int16_t band_recon[16];
-                        pvq_decode(&code, n, step, band_recon);
-                        for (int i = 0; i < n; i++)
-                            recon_coeffs[snt_zigzag8[1 + start + i]] = band_recon[i];
-                    } else {
-                        for (int i = 0; i < n; i++)
-                            recon_coeffs[snt_zigzag8[1 + start + i]] = 0;
-                    }
+                    recon_coeffs[snt_zigzag8[1 + start + i]] = pvq_dequantize_dc(level, step);
                 }
+                prev_nz = coded;
             }
 
             /* Add back the intra AC prediction (first row or column) */
@@ -520,12 +462,6 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         }
         snt_deblock_chroma(output_u, cw, ch_h, stride_uv, cstep, is_inter ? blk_is_skip : NULL, blk_cols);
         snt_deblock_chroma(output_v, cw, ch_h, stride_uv, cstep, is_inter ? blk_is_skip : NULL, blk_cols);
-    }
-
-    /* Grain synthesis */
-    if (ctx->header.grain.enabled && output_u && output_v) {
-        snt_grain_apply(&ctx->header.grain, output_y, output_u, output_v,
-                        width, height, stride_y, stride_uv);
     }
 
     /* Models now carry into the next frame of the same kind */

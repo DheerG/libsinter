@@ -29,8 +29,6 @@
 #include "../core/filter/deblock.h"
 #include "../core/prediction/intra_acdc.h"
 #include "../util/fixed_point.h"
-#include "../perceptual/activity_mask.h"
-#include "../perceptual/csf_weights.h"
 
 #define BLK 8
 
@@ -156,93 +154,47 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
 
     int16_t recon_ac[63];
     memset(recon_ac, 0, sizeof(recon_ac));
-    /* Band flag context: is the previous band (for band 0, the DC level)
+    /* Each band is either all zero (flag 0) or has its levels coded (flag
+     * 1). Flag context: is the previous band (for band 0, the DC level)
      * nonzero? Zero bands come in runs. */
     int prev_nz = dc_level != 0;
     for (int b = 0; b < NUM_BANDS; b++) {
         int start = band_bounds[b];
         int n = band_bounds[b + 1] - start;
+        SntModel *flag = &cs->band[t][b][prev_nz];
 
-        float csf_sum = 0.0f;
-        for (int i = 0; i < n; i++)
-            csf_sum += psy_csf_weight(BLK, snt_zigzag8[1 + start + i]);
-        uint8_t band_csf = (uint8_t)(csf_sum / n * 255.0f);
-        if (band_csf < 1) band_csf = 1;
-
-        int16_t band_coeffs[16];  /* this band, in zigzag order */
-        for (int i = 0; i < n; i++)
-            band_coeffs[i] = coeffs[snt_zigzag8[1 + start + i]];
-
-        /* Scalar candidate (CSF-weighted step on high bands) */
-        uint16_t eff_step = step;
-        if (band_csf < 128) {
-            eff_step = (uint16_t)((uint32_t)step * 256 / band_csf);
-            if (eff_step > 3072) eff_step = 3072;
-        }
-        int16_t s_level[16], s_recon[16];
-        double s_bits = cdf_bits(&cs->mode[t][b][prev_nz], 1);
+        int16_t band_coeffs[16], s_level[16], s_recon[16];  /* zigzag order */
+        double s_bits = cdf_bits(flag, 1);
         int s_nz = 0;
         for (int i = 0; i < n; i++) {
-            s_level[i] = pvq_quantize_dc(band_coeffs[i], eff_step, 1);
-            s_recon[i] = pvq_dequantize_dc(s_level[i], eff_step);
+            band_coeffs[i] = coeffs[snt_zigzag8[1 + start + i]];
+            s_level[i] = pvq_quantize_dc(band_coeffs[i], step, 1);
+            s_recon[i] = pvq_dequantize_dc(s_level[i], step);
             s_bits += level_bits(&cs->ac[t][b / 4], s_level[i]);
             s_nz |= s_level[i] != 0;
         }
 
-        /* PVQ candidate */
-        SntPVQCode code;
-        int16_t p_recon[16];
-        pvq_encode(band_coeffs, n, step, 1, band_csf, &code, p_recon);
-        uint16_t gain_sym = (code.gain > 255) ? 255 : (uint16_t)code.gain;
-        int shape_bits = 0;
-        double p_bits = cdf_bits(&cs->mode[t][b][prev_nz], 0)
-                      + cdf_bits(&cs->skip[t][b][prev_nz], code.skip ? 1 : 0);
-        if (!code.skip) {
-            /* K = pvq_compute_k(gain, n, band_csf): the decoder
-             * has all three inputs, so K is not transmitted. */
-            shape_bits = pvq_shape_bits(n, code.k);
-            if (shape_bits < 1) shape_bits = 1;
-            if (shape_bits > 64) shape_bits = 64;
-            p_bits += cdf_bits(&cs->gain[t], gain_sym) + shape_bits;
-            if (gain_sym == 255) p_bits += expgolomb_len(code.gain);
-        }
-
-        /* Mode decision: minimum distortion + lambda * bits.
-         * (The old energy-concentration heuristic picked PVQ for
-         * bands where it cost far more than it saved.) */
-        int use_scalar = band_sse(band_coeffs, s_recon, n) + lambda * s_bits
-                      <= band_sse(band_coeffs, p_recon, n) + lambda * p_bits;
-        const int16_t *band_recon = use_scalar ? s_recon : p_recon;
+        /* Coded or zero: least distortion + lambda * bits */
+        int16_t zeros[16] = {0};
+        int coded = s_nz && band_sse(band_coeffs, s_recon, n) + lambda * s_bits
+                            < band_sse(band_coeffs, zeros, n) + lambda * cdf_bits(flag, 0);
 
         if (!sink) {
-            bits += use_scalar ? s_bits : p_bits;
+            bits += coded ? s_bits : cdf_bits(flag, 0);
         } else {
-            rec(sink, &cs->mode[t][b][prev_nz], use_scalar ? 1 : 0);
-            if (use_scalar) {
+            rec(sink, flag, (uint16_t)coded);
+            if (coded)
                 for (int i = 0; i < n; i++) {
                     uint16_t ac_sym = s2u(s_level[i]);
                     rec(sink, &cs->ac[t][b / 4], ac_sym);
                     if (ac_sym == 255)
                         snt_bw_put_sexpgolomb(sink->ov, s_level[i]);
                 }
-            } else {
-                rec(sink, &cs->skip[t][b][prev_nz], code.skip ? 1 : 0);
-                if (!code.skip) {
-                    rec(sink, &cs->gain[t], gain_sym);
-                    if (gain_sym == 255)
-                        snt_bw_put_expgolomb(sink->ov, code.gain);
-                    if (shape_bits > 32) {
-                        snt_bw_put_bits(sink->ov, (uint32_t)(code.shape_idx >> 32), shape_bits - 32);
-                        snt_bw_put_bits(sink->ov, (uint32_t)(code.shape_idx & 0xFFFFFFFF), 32);
-                    } else {
-                        snt_bw_put_bits(sink->ov, (uint32_t)code.shape_idx, shape_bits);
-                    }
-                }
-            }
         }
-        prev_nz = use_scalar ? s_nz : !code.skip;
-        for (int i = 0; i < n; i++)
-            recon_ac[start + i] = band_recon[i];
+        prev_nz = coded;
+        if (coded)
+            for (int i = 0; i < n; i++)
+                recon_ac[start + i] = s_recon[i];
     }
 
     /* Reconstruct coefficients, then pixels */
@@ -656,11 +608,8 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
  *   REC(dc[t], s2u(dc_level))       // DC of residual (inter) or pixels (intra)
  *   // Intra: the mode's coefficient prediction is subtracted first
  *   FOR band b=0..15:
- *     REC(mode[t][b][nz], mode)       // nz: previous band (band 0: DC level) nonzero
- *     IF scalar: FOR i=0..n-1: REC(ac[t][b/4], s2u(level))
- *     IF PVQ:    REC(skip[t][b][nz], skip)
- *                IF !skip: REC(gain[t], min(gain,255))
- *                          (K is not sent: decoder derives it with pvq_compute_k)
+ *     REC(band[t][b][nz], coded)      // nz: previous band (band 0: DC level) nonzero
+ *     IF coded: FOR i=0..n-1: REC(ac[t][b/4], s2u(level))
  * FOR each chroma plane (U, V):
  *   FOR each 4x4 block:
  *     REC(cdc[ct], s2u(dc_level))

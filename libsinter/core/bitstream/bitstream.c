@@ -6,9 +6,8 @@
  *   [32] width  [32] height  [2] frame_type  [6] base_qp
  *   [4] num_tile_cols  [4] num_tile_rows  [1] dual_rans
  *   [8] chroma_qp_offset (signed)  [32] frame_number
- *   [1] grain_enabled  [grain params if enabled]
+ * The dual_rans bit is unused (the format is range-coded).
  *
- * Per-block QP deltas are rANS-coded (13 symbols for [-6..+6]).
  * Byte-align after each entropy-coded segment (Gary's requirement).
  */
 
@@ -157,10 +156,6 @@ void snt_write_frame_header(SntBitWriter *bw, const SntFrameHeader *hdr) {
     snt_bw_put_bits(bw, hdr->dual_rans ? 1 : 0, 1);
     snt_bw_put_bits(bw, (uint32_t)(uint8_t)hdr->chroma_qp_offset, 8);
     snt_bw_put_bits(bw, hdr->frame_number, 32);
-    snt_bw_put_bits(bw, hdr->grain.enabled ? 1 : 0, 1);
-    if (hdr->grain.enabled) {
-        snt_write_grain_params(bw, &hdr->grain);
-    }
     snt_bw_byte_align(bw);
 }
 
@@ -174,10 +169,7 @@ void snt_read_frame_header(SntBitReader *br, SntFrameHeader *hdr) {
     hdr->dual_rans = snt_br_get_bits(br, 1) != 0;
     hdr->chroma_qp_offset = (int8_t)(uint8_t)snt_br_get_bits(br, 8);
     hdr->frame_number = snt_br_get_bits(br, 32);
-    hdr->grain.enabled = snt_br_get_bits(br, 1) != 0;
-    if (hdr->grain.enabled) {
-        snt_read_grain_params(br, &hdr->grain);
-    }
+    hdr->grain.enabled = 0;  /* film grain synthesis is not part of the format */
     snt_br_byte_align(br);
 }
 

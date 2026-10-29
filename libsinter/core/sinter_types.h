@@ -138,6 +138,7 @@ typedef struct {
     uint8_t       temporal_layer; /* 0=base, 1-3=enhancement (for B-frames) */
     SntGrainParams grain;
     uint32_t      frame_number;
+    uint32_t      key_frame_number; /* frame_number of the last key frame */
 } SntFrameHeader;
 
 /* ── Perceptual encoder config (non-normative) ────────────────────── */

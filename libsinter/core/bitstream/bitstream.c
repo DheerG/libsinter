@@ -2,11 +2,7 @@
  * Sinter Codec — Bitstream Reader/Writer
  * Implements bitstream syntax elements.
  *
- * Frame header layout:
- *   [32] width  [32] height  [2] frame_type  [6] base_qp
- *   [4] num_tile_cols  [4] num_tile_rows  [1] dual_rans
- *   [8] chroma_qp_offset (signed)  [32] frame_number
- * The dual_rans bit is unused (the format is range-coded).
+ * Frame header layout: see snt_write_frame_header.
  *
  * Byte-align after each entropy-coded segment (Gary's requirement).
  */
@@ -145,32 +141,39 @@ int32_t snt_br_get_sexpgolomb(SntBitReader *br) {
 }
 
 /* ── Frame header ─────────────────────────────────────────────────── */
+/* Key frames:   [2] frame_type [6] base_qp [16] width [16] height
+ *               [8] chroma_qp_offset [32] frame_number
+ * Other frames: [2] frame_type [6] base_qp
+ *               se(frame_number - key_frame_number)
+ * Width, height and the chroma offset carry over from the key frame. The
+ * codec writes the rest of the frame's fixed fields after these. */
 
 void snt_write_frame_header(SntBitWriter *bw, const SntFrameHeader *hdr) {
-    snt_bw_put_bits(bw, hdr->width, 32);
-    snt_bw_put_bits(bw, hdr->height, 32);
     snt_bw_put_bits(bw, hdr->frame_type, 2);
     snt_bw_put_bits(bw, hdr->base_qp, 6);
-    snt_bw_put_bits(bw, hdr->num_tile_cols, 4);
-    snt_bw_put_bits(bw, hdr->num_tile_rows, 4);
-    snt_bw_put_bits(bw, hdr->dual_rans ? 1 : 0, 1);
-    snt_bw_put_bits(bw, (uint32_t)(uint8_t)hdr->chroma_qp_offset, 8);
-    snt_bw_put_bits(bw, hdr->frame_number, 32);
-    snt_bw_byte_align(bw);
+    if (hdr->frame_type == SNT_FRAME_KEY) {
+        snt_bw_put_bits(bw, hdr->width, 16);
+        snt_bw_put_bits(bw, hdr->height, 16);
+        snt_bw_put_bits(bw, (uint32_t)(uint8_t)hdr->chroma_qp_offset, 8);
+        snt_bw_put_bits(bw, hdr->frame_number, 32);
+    } else {
+        snt_bw_put_sexpgolomb(bw, (int32_t)(hdr->frame_number - hdr->key_frame_number));
+    }
 }
 
 void snt_read_frame_header(SntBitReader *br, SntFrameHeader *hdr) {
-    hdr->width = snt_br_get_bits(br, 32);
-    hdr->height = snt_br_get_bits(br, 32);
     hdr->frame_type = (SntFrameType)snt_br_get_bits(br, 2);
     hdr->base_qp = (uint8_t)snt_br_get_bits(br, 6);
-    hdr->num_tile_cols = (uint8_t)snt_br_get_bits(br, 4);
-    hdr->num_tile_rows = (uint8_t)snt_br_get_bits(br, 4);
-    hdr->dual_rans = snt_br_get_bits(br, 1) != 0;
-    hdr->chroma_qp_offset = (int8_t)(uint8_t)snt_br_get_bits(br, 8);
-    hdr->frame_number = snt_br_get_bits(br, 32);
+    if (hdr->frame_type == SNT_FRAME_KEY) {
+        hdr->width = snt_br_get_bits(br, 16);
+        hdr->height = snt_br_get_bits(br, 16);
+        hdr->chroma_qp_offset = (int8_t)(uint8_t)snt_br_get_bits(br, 8);
+        hdr->frame_number = snt_br_get_bits(br, 32);
+        hdr->key_frame_number = hdr->frame_number;
+    } else {
+        hdr->frame_number = hdr->key_frame_number + (uint32_t)snt_br_get_sexpgolomb(br);
+    }
     hdr->grain.enabled = 0;  /* film grain synthesis is not part of the format */
-    snt_br_byte_align(br);
 }
 
 /* ── Grain parameters ─────────────────────────────────────────────── */

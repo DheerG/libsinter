@@ -8,7 +8,9 @@
  * Contexts separate symbols whose statistics differ: block type (0 = intra,
  * 1 = inter residual), band index, and luma vs chroma. One shared model has
  * to average distributions that have little in common; with separate models,
- * the mode/skip flags of mostly-empty bands become nearly free.
+ * the flags of mostly-empty bands become nearly free. Conditioning each
+ * symbol's model on earlier symbols is context modeling as in Rissanen &
+ * Langdon, "Universal modeling and coding" (IEEE Trans. IT, 1981).
  */
 #ifndef SNT_CDF_SET_H
 #define SNT_CDF_SET_H
@@ -31,9 +33,7 @@ enum {
 typedef struct {
     SntModel dc[2];                    /* luma DC residual, by block type */
     SntModel ac[2][SNT_AC_GROUPS];     /* luma scalar AC level */
-    SntModel mode[2][SNT_NUM_BANDS][2];  /* band mode: 0 = PVQ, 1 = scalar; by previous band nonzero */
-    SntModel skip[2][SNT_NUM_BANDS][2];  /* PVQ band skip; by previous band nonzero */
-    SntModel gain[2];                  /* PVQ gain */
+    SntModel band[2][SNT_NUM_BANDS][2];  /* band coded (1) or all zero (0); by previous band nonzero */
     SntModel imode[2];                 /* intra mode, by frame type (0 key, 1 inter) */
     SntModel mbmode;                   /* macroblock mode (SNT_MB_*) */
     SntModel bdir;                     /* B-frame prediction direction - 1 (SNT_DIR_*) */
@@ -52,7 +52,6 @@ static inline int snt_cac_group(int i) {
 static inline void snt_cdf_set_init(SntCdfSet *s) {
     for (int t = 0; t < 2; t++) {
         snt_model_init(&s->dc[t], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
-        snt_model_init(&s->gain[t], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
         snt_model_init(&s->imode[t], SNT_NUM_IPRED, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         snt_model_init(&s->cdc[t], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
         for (int g = 0; g < SNT_AC_GROUPS; g++)
@@ -60,10 +59,8 @@ static inline void snt_cdf_set_init(SntCdfSet *s) {
         for (int g = 0; g < SNT_CAC_GROUPS; g++)
             snt_model_init(&s->cac[t][g], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
         for (int b = 0; b < SNT_NUM_BANDS; b++) {
-            for (int z = 0; z < 2; z++) {
-                snt_model_init(&s->mode[t][b][z], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
-                snt_model_init(&s->skip[t][b][z], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
-            }
+            for (int z = 0; z < 2; z++)
+                snt_model_init(&s->band[t][b][z], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         }
     }
     snt_model_init(&s->mbmode, SNT_NUM_MB_MODES, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);

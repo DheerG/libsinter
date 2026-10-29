@@ -4,7 +4,7 @@ Phase 3 of the clean-format work tried tools of Sinter's own design. Each entry 
 
 BD-rates are luma (and YUV), mean of foreman, mobile and akiyo (Xiph CIF, 60 frames, 2 B-frames), against the codec just before the change.
 
-## 1. A decoder that learns while decoding (dropped after the search)
+## 1. A decoder that learns while decoding (measured, left out of the format)
 
 **Idea.** Code each binary decision with several context models at once (coarse and fast, fine and slow) and combine their probabilities by logistic mixing, with the mixing weights learned online from the decoded data (as in the PAQ compressors). A new context could then be added without diluting the statistics: the mixer learns how much to trust it.
 
@@ -13,7 +13,11 @@ BD-rates are luma (and YUV), mean of foreman, mobile and akiyo (Xiph CIF, 60 fra
 **Search.**
 - Query: "patent video coding entropy context mixing logistic mixing weights updated online probability estimation transform coefficients". Found Google's [EP3677027A1](https://patents.google.com/patent/EP3677027A1/en) (granted as EP3677027B1) and [US10887595B2](https://patents.google.com/patent/US10887595B2/en), "Mixing of probabilities for entropy coding in video compression" / "Using multiple probability models for entropy coding in video compression" (priority 2017-08-29, active): two or more probability models for the tokens of quantized transform coefficients, combined into a mixed probability with weights updated online from the code length each model would have produced. Also [US10735736](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/10735736), "Selective mixing for entropy coding in video compression", and [US11259053B2](https://patents.google.com/patent/US11259053) (machine-learned probability refinement).
 
-**Result.** Dropped before implementation: adaptive mixing of several models' probabilities for coefficient coding is the same idea, although these patents mix linearly rather than in the logistic domain. The prior-art route would be Context Tree Weighting (F. Willems, Y. Shtarkov and T. Tjalkens, IEEE Trans. Information Theory 41(3), 1995), which weights context models by their accumulated code lengths and predates these patents by 22 years. But that weighting is essentially the patents' mechanism, so building it would follow the letter of the source rule and not its purpose. It is left for a patent professional to judge.
+Adaptive mixing of several models' probabilities for coefficient coding is the same idea, although these patents mix linearly rather than in the logistic domain. The prior-art route would be Context Tree Weighting (F. Willems, Y. Shtarkov and T. Tjalkens, IEEE Trans. Information Theory 41(3), 1995), which weights context models by their accumulated code lengths and predates these patents by 22 years; but that weighting is essentially the patents' mechanism.
+
+**Experiment.** To measure what the tool would save, it is built only with `-DSNT_EXPERIMENT_MIXING` (`libsinter/codec/mixer.h`); a normal build doesn't contain it, and its streams don't decode with one. The zero and "above one" decisions of luma AC levels (most of the bits) are coded with a probability mixed in the logistic domain, `p = squash(sum w_i stretch(p_i))`, from four predictors and a bias: the level's usual model; a fast estimate per block type and zigzag index; a slower one that also sees the prediction class and how many of the two previous levels were nonzero; and the same by band. After each bit every weight moves by `stretch(p_i) * (bit - p) / 2^10`, and every predictor adapts. Integer arithmetic throughout, with generated stretch and squash tables.
+
+**Result.** -0.5% (-0.4%): foreman -0.5%, mobile -0.5%, akiyo -0.5%, with the learning rate 2^-10 (2^-8 to 2^-16 tried: 2^-8 -0.3%, 2^-9 -0.5%, 2^-12 -0.3%, 2^-14 -0.2%, 2^-16 -0.1%). Encoder and decoder match on every test point; decoding stays at about 6 ms per CIF frame at QP 8. Left out of the format because of the patents above: 0.5% is real but small, and not worth the exposure.
 
 ## 2. Contexts from the prediction (kept)
 

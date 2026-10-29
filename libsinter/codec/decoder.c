@@ -8,6 +8,12 @@
 #include <stdlib.h>
 #include "decoder.h"
 #include "cdf_set.h"
+#ifdef SNT_EXPERIMENT_MIXING
+#include "mixer.h"
+/* Mixing state of the model set in use (one decoder per process) */
+static SntMixState dec_mix[2];
+static SntMixState *cur_mix;
+#endif
 #include "scan.h"
 #include "../util/fixed_point.h"
 #include "../core/transform/dct.h"
@@ -66,10 +72,29 @@ static uint32_t agree_sad8(const SntSplinePlane *rf, const SntSplinePlane *rb, i
 
 /* Decode a luma AC level at zigzag index k from its binary decisions
  * (levels.h; the same decisions and models as snt_level_bins) */
-static int16_t dec_level(SntRangeDec *rd, SntCdfSet *cs, int t, int k, int pc, int z_known) {
-    if (!z_known && !snt_rc_decode_sym(rd, &cs->acz[t][k][pc])) return 0;
+#ifdef SNT_EXPERIMENT_MIXING
+/* Z or G decision with the mixed probability (mixer.h) */
+static int dec_mixed(SntRangeDec *rd, SntCdfSet *cs, int kind, int t, int k, int band, int pc,
+                     int nzprev) {
+    SntMixBin mb;
+    snt_mix_prepare(cur_mix, cs, kind, t, k, band, pc, nzprev, &mb);
+    int bit = snt_rc_decode_bit(rd, mb.p);
+    snt_mix_update(&mb, bit);
+    return bit;
+}
+#define DEC_Z(rd, cs, t, k, pc) dec_mixed(rd, cs, 0, t, k, band, pc, nzprev)
+#define DEC_G(rd, cs, t, k, pc) dec_mixed(rd, cs, 1, t, k, band, pc, nzprev)
+#else
+#define DEC_Z(rd, cs, t, k, pc) snt_rc_decode_sym(rd, &(cs)->acz[t][k][pc])
+#define DEC_G(rd, cs, t, k, pc) snt_rc_decode_sym(rd, &(cs)->acg[t][k][pc])
+#endif
+
+static int16_t dec_level(SntRangeDec *rd, SntCdfSet *cs, int t, int k, int pc, int z_known,
+                         int band, int nzprev) {
+    (void)band; (void)nzprev;
+    if (!z_known && !DEC_Z(rd, cs, t, k, pc)) return 0;
     int neg = snt_rc_decode_sym(rd, &cs->acs[t]);
-    if (!snt_rc_decode_sym(rd, &cs->acg[t][k][pc])) return (int16_t)(neg ? -1 : 1);
+    if (!DEC_G(rd, cs, t, k, pc)) return (int16_t)(neg ? -1 : 1);
     int c = 1;
     while (c < SNT_LEVEL_MAX_CAT && snt_rc_decode_sym(rd, &cs->acx[t][k > SNT_LEVEL_KLOW][c - 1]))
         c++;
@@ -187,8 +212,15 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     if (!is_inter)
         ctx->cdf_state_b_valid = 0;
     SntCdfSet *cs = (SntCdfSet *)(is_bidi ? ctx->cdf_state_b : ctx->cdf_state);
-    if (!is_inter || !(is_bidi ? ctx->cdf_state_b_valid : ctx->cdf_state_valid))
+    if (!is_inter || !(is_bidi ? ctx->cdf_state_b_valid : ctx->cdf_state_valid)) {
         snt_cdf_set_init(cs, is_bidi ? SNT_SET_B : SNT_SET_P, ctx->header.base_qp);
+#ifdef SNT_EXPERIMENT_MIXING
+        snt_mix_init(&dec_mix[is_bidi]);
+#endif
+    }
+#ifdef SNT_EXPERIMENT_MIXING
+    cur_mix = &dec_mix[is_bidi];
+#endif
 
     #define DEC(m) ((uint16_t)snt_rc_decode_sym(&rdec, &(m)))
 
@@ -387,6 +419,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 snt_pred_classes(pdct, step, snt_zigzag8, band_bounds, NUM_BANDS, kcls, bcls);
             }
             int prev_nz = dc_level != 0;
+            int16_t lv[64] = {0};  /* levels so far, zigzag order */
+            lv[0] = dc_level;
             for (int b = 0; b < NUM_BANDS; b++) {
                 int start = band_bounds[b];
                 int n = band_bounds[b + 1] - start;
@@ -396,8 +430,10 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     int16_t level = 0;
                     if (coded) {
                         /* The last level is known nonzero if the others are 0 */
-                        level = dec_level(&rdec, cs, block_is_inter, 1 + start + i,
-                                          kcls[1 + start + i], i == n - 1 && !any);
+                        int k = 1 + start + i;
+                        level = dec_level(&rdec, cs, block_is_inter, k, kcls[k], i == n - 1 && !any,
+                                          b, (lv[k - 1] != 0) + (k >= 2 && lv[k - 2] != 0));
+                        lv[k] = level;
                         any |= level != 0;
                     }
                     recon_coeffs[snt_zigzag8[1 + start + i]] = pvq_dequantize_dc(level, step);

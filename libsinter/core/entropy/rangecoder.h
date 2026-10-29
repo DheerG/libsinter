@@ -87,4 +87,9 @@ void snt_rc_dec_init(SntRangeDec *d, const uint8_t *buf, uint32_t len);
 /* Decode one symbol with model m, then update m */
 int snt_rc_decode_sym(SntRangeDec *d, SntModel *m);
 
+/* Binary decision with an explicit probability p1 (of a 1) in 1/4096ths,
+ * 1..4095: encode bit, or decode and return it */
+void snt_rc_encode_bit(SntRangeEnc *e, int bit, uint32_t p1);
+int snt_rc_decode_bit(SntRangeDec *d, uint32_t p1);
+
 #endif /* SNT_RANGECODER_H */

@@ -137,3 +137,22 @@ int snt_rc_decode_sym(SntRangeDec *d, SntModel *m) {
     snt_model_update(m, sym);
     return sym;
 }
+
+void snt_rc_encode_bit(SntRangeEnc *e, int bit, uint32_t p1) {
+    if (bit) snt_rc_encode(e, 4096 - p1, p1, 4096);
+    else     snt_rc_encode(e, 0, 4096 - p1, 4096);
+}
+
+int snt_rc_decode_bit(SntRangeDec *d, uint32_t p1) {
+    uint32_t r = d->range / 4096;
+    uint32_t v = d->code / r;
+    int bit = v >= 4096 - p1;
+    uint32_t cum = bit ? 4096 - p1 : 0, freq = bit ? p1 : 4096 - p1;
+    d->code -= r * cum;
+    d->range = r * freq;
+    while (d->range < RC_TOP) {
+        d->code = (d->code << 8) | get_byte(d);
+        d->range <<= 8;
+    }
+    return bit;
+}

@@ -17,4 +17,10 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                        uint8_t *bitstream, uint32_t bs_capacity,
                        uint32_t *bs_len);
 
+#ifdef SNT_TRAIN_STATS
+#include <stdio.h>
+/* Training builds: write the symbol counts collected so far */
+void snte_train_dump(FILE *f);
+#endif
+
 #endif

@@ -29,6 +29,7 @@
  * difference against the quantizer step: below step/8, below step/2,
  * above. The class selects the mode models. */
 #define SNT_AGREE_CLASSES 3
+#define SNT_FLAG_CONTEXTS (SNT_AGREE_CLASSES * 3)  /* mode-flag contexts, see snt_flag_context */
 #define SNT_DC_CONTEXTS  10  /* luma DC contexts, see snt_dc_context */
 static inline int snt_agree_class(uint32_t sad, int npix, uint16_t step) {
     uint64_t s8 = 8ull * sad, s2 = 2ull * sad, ns = (uint64_t)npix * step;
@@ -58,10 +59,10 @@ typedef struct {
     SntModel band[2][SNT_NUM_BANDS][2][SNT_PRED_CLASSES];  /* band coded (1) or all zero (0);
                                           by previous band nonzero, prediction class */
     SntModel imode[2];                 /* intra mode, by frame type (0 key, 1 inter) */
-    SntModel mbmode[SNT_AGREE_CLASSES];  /* macroblock mode (SNT_MB_*), by prediction agreement */
+    SntModel mbmode[SNT_FLAG_CONTEXTS];  /* macroblock mode (SNT_MB_*), by snt_flag_context */
     SntModel bdir;                     /* B-frame prediction direction - 1 (SNT_DIR_*) */
-    SntModel inter[SNT_AGREE_CLASSES];   /* inter-frame block: inter (1) or intra, by agreement */
-    SntModel iskip[SNT_AGREE_CLASSES];   /* inter block: skipped (1) or coded, by agreement */
+    SntModel inter[SNT_FLAG_CONTEXTS];   /* inter-frame block: inter (1) or intra, by snt_flag_context */
+    SntModel iskip[SNT_FLAG_CONTEXTS];   /* inter block: skipped (1) or coded, by snt_flag_context */
     /* MV deltas as binary decisions (levels.h), by component (x, y); Z and G
      * also by block size (8x8, 16x16) and, for y, whether x's delta is zero */
     SntModel vz[2][2][2][SNT_AGREE_CLASSES], vs[2], vg[2][2][2][SNT_AGREE_CLASSES];
@@ -134,7 +135,7 @@ static inline void snt_cdf_set_init_uniform(SntCdfSet *s) {
                     snt_model_init(&s->band[t][b][z][p], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         }
     }
-    for (int a = 0; a < SNT_AGREE_CLASSES; a++) {
+    for (int a = 0; a < SNT_FLAG_CONTEXTS; a++) {
         snt_model_init(&s->mbmode[a], SNT_NUM_MB_MODES, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         snt_model_init(&s->inter[a], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         snt_model_init(&s->iskip[a], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
@@ -202,6 +203,16 @@ static inline SntModel *snt_level_model(SntCdfSet *s, int t, int k, int pc, cons
     case 3:  return &s->acx[t][k > SNT_LEVEL_KLOW][b->sub];
     default: return &s->acm[t][b->sub];
     }
+}
+
+/* Context of a mode flag (macroblock mode, inter, skip): the prediction
+ * agreement class ac, and how many of the blocks left of and above the
+ * (macro)block's top-left 8x8 block are skipped (0-2; a missing neighbour
+ * counts as not skipped). A skip map is a binary image, which JBIG (ITU-T
+ * T.82, 1993) codes with an adaptive model chosen by a template of
+ * neighbouring pixels. */
+static inline int snt_flag_context(int ac, int left_skip, int above_skip) {
+    return ac * 3 + left_skip + above_skip;
 }
 
 /* Class of a DC level for the next block's DC context, as JPEG classifies

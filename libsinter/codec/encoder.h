@@ -21,6 +21,9 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
 #include <stdio.h>
 /* Training builds: write the symbol counts collected so far */
 void snte_train_dump(FILE *f);
+/* Training builds: count of sym in model k of set so far; reset counts */
+uint32_t snte_train_count(int set, int k, int sym);
+void snte_train_reset(void);
 /* Training builds: ideal bits per model set and model, and other bits */
 void snte_bits_dump(FILE *f);
 #endif

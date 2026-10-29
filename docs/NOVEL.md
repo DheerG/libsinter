@@ -34,15 +34,19 @@ No patent or application found that selects contexts from the content or spectru
 
 **Result.** Kept. -0.9% (-0.7%): foreman -0.9%, mobile -1.2%, akiyo -0.5%. Lowering or raising the class thresholds by 2x was no better.
 
-## 3. Per-clip starting tables (dropped after the search)
+## 3. Per-clip starting tables (measured, left out of the format)
 
-**Idea.** A first encoder pass collects the clip's symbol statistics; the sequence or key-frame header then sends starting probability tables as small changes from the trained defaults.
+**Idea.** A first encoder pass collects the clip's symbol statistics; the sequence or key-frame header then sends starting probability tables as changes from the trained defaults.
 
 **Search.**
 - "patent video encoder transmit initial probability tables context initialization in bitstream header per sequence first pass statistics arithmetic coding": closest [US20260122287A1](https://patents.google.com/patent/US20260122287A1/en) (frame context initialization from averaged tile contexts), [US8344917B2](https://patents.google.com/patent/US8344917B2/en) and [US20170250709A1](https://patents.google.com/patent/US20170250709) (initialization from QP), [WO2016196307A1](https://patents.google.com/patent/WO2016196307A1/en).
 - "VP8 coefficient probability updates frame header": VP8 ([RFC 6386](https://datatracker.ietf.org/doc/rfc6386/), 2010) sends exactly this: default token probabilities plus per-frame updates in the frame header, which persist until the next key frame.
 
-**Result.** Dropped: sending probability changes from defaults in the header is VP8's design, and VP8 is an excluded source. Choosing one of a few predefined tables instead would be H.264's `cabac_init_idc`, also excluded. JPEG's two-pass optimized tables (1992) would be the pre-2004 form, but sending complete tables for hundreds of adaptive models costs more than the trained starting tables leave to gain.
+Sending probability changes from defaults in the header is VP8's design, and VP8 is an excluded source. Choosing one of a few predefined tables instead would be H.264's `cabac_init_idc`, also excluded. JPEG's two-pass optimized tables (1992) are the pre-2004 form.
+
+**Experiment.** To measure what the tool would save, it is built only with `-DSNT_EXPERIMENT_CLIPTABLES` (`libsinter/codec/cliptables.h`) and measured with `tools/experiments/cliptables_eval.c`. Pass 1 encodes the clip and counts each binary model's symbols. A model gets a per-clip start when its expected saving (the Kullback-Leibler distance from the default start, over the first 24 symbols after each restart) beats the cost of sending it. Pass 2 sends the starts in the first key frame: a flag per binary model (probability 1/32), and a 5-bit logistic-domain value when set. Encoder and decoder apply them whenever a model set restarts.
+
+**Result.** -0.1% (-0.1%), net of the tables' cost: foreman -0.2%, mobile -0.1%, akiyo +0.1%. A looser threshold (first 48 symbols, saving above 6 bits) was 0.0%. Encoder and decoder match on every test point. The trained starting tables already start most models close to the clip's statistics, and the models adapt within a few dozen symbols, so little is left to gain. Left out of the format: it is VP8's design, and it saves almost nothing.
 
 ## 4. Prediction agreement for mode flags (kept)
 

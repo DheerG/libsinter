@@ -178,6 +178,10 @@ typedef struct {
     int                 cdf_state_b_valid;
     /* Cubic B-spline coefficients of ref_y and ref_old_y (spline.h) */
     int32_t            *ref_coef, *ref_old_coef;
+    /* Experiment builds only (codec/cliptables.h): per-clip starting
+     * tables, and whether the next key frame sends them */
+    void               *clip_tables;
+    int                 clip_tables_send;
     /* Reconstruction of the last coded frame (any type), for checking */
     uint8_t            *last_y, *last_u, *last_v;
 } SntEncoderCtx;
@@ -202,6 +206,8 @@ typedef struct {
     int                 cdf_state_b_valid;
     /* Cubic B-spline coefficients of ref_y and ref_old_y (spline.h) */
     int32_t            *ref_coef, *ref_old_coef;
+    /* Experiment builds only (codec/cliptables.h): per-clip starting tables */
+    void               *clip_tables;
 } SntDecoderCtx;
 
 /* ── Frame buffer allocation/free ─────────────────────────────────── */

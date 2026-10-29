@@ -284,6 +284,22 @@ static void mv_predictors(const EncFrame *f, int bx, int by, SntMV *pf, SntMV *p
                      : (SntMV){0, 0};
 }
 
+/* Prediction of a skipped block (bx, by): as the block to its left if
+ * that block is inter-predicted (MPEG-1's rule for skipped macroblocks
+ * in B-pictures), otherwise with the global motion */
+static void skip_motion(const EncFrame *f, int bx, int by, int *dir, SntMV *mvf, SntMV *mvb) {
+    int left = by * f->blk_cols + bx - 1;
+    if (bx > 0 && f->blk_dir[left]) {
+        *dir = f->blk_dir[left];
+        *mvf = f->mv_field[left];
+        *mvb = f->mvb_field[left];
+    } else {
+        *dir = f->is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
+        *mvf = f->gmf;
+        *mvb = f->gmb;
+    }
+}
+
 /* Inter prediction of a block and its residual (0 outside the frame) */
 static void mc_residual(const EncFrame *f, int bx, int by, int dir, SntMV mvf, SntMV mvb,
                         const int16_t *src, int vw, int vh, uint8_t *pred, int16_t *res) {
@@ -342,13 +358,15 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
 
         /* Skip: prediction with the global motion (bi-directional in
          * B-frames), nothing else coded */
-        int sdir = f->is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
-        snt_pred_luma8(f->ref_f, f->ref_b, px0, py0, sdir, f->gmf, f->gmb, p);
+        int sdir;
+        SntMV smf, smb;
+        skip_motion(f, bx, by, &sdir, &smf, &smb);
+        snt_pred_luma8(f->ref_f, f->ref_b, px0, py0, sdir, smf, smb, p);
         for (int k = 0; k < 64; k++) p16[k] = p[k];
         double j = block_sse(src, p16, vw, vh)
                  + f->lambda * (cdf_bits(&cs->inter, 1) + cdf_bits(&cs->iskip, 1));
         if (j < best_j) {
-            best_j = j; bc->kind = CAND_SKIP; bc->dir = sdir; bc->mvf = f->gmf; bc->mvb = f->gmb;
+            best_j = j; bc->kind = CAND_SKIP; bc->dir = sdir; bc->mvf = smf; bc->mvb = smb;
             memcpy(best_rec, p16, sizeof(best_rec));
         }
 
@@ -464,7 +482,10 @@ static void emit_block(EncFrame *f, int bx, int by, const BlockChoice *bc) {
             rec(f->sink, &cs->iskip, bc->kind == CAND_SKIP);
             if (bc->kind == CAND_SKIP) {
                 /* Skip predicts with the global motion */
-                emit_inter_body(f, bx, by, f->is_bidi ? SNT_DIR_BI : SNT_DIR_FWD, f->gmf, f->gmb, 1);
+                int sdir;
+                SntMV smf, smb;
+                skip_motion(f, bx, by, &sdir, &smf, &smb);
+                emit_inter_body(f, bx, by, sdir, smf, smb, 1);
             } else {
                 /* An unused direction's MV is zero, as in the decoder */
                 SntMV zero = {0, 0};
@@ -496,15 +517,17 @@ typedef struct {
 } Mb16Choice;
 
 /* 16x16 candidates for the full macroblock whose top-left block is
- * (bx0, by0): skip with the global motion, and inter at
+ * (bx0, by0): skip (motion from skip_motion of the top-left block), and
+ * inter at
  * 16x16-searched MVs with each 8x8 residual coded (forward; in B-frames
  * also backward and bi-directional). Returns the skip cost and the best
  * inter candidate. */
 static double eval_mb16(EncFrame *f, int bx0, int by0, SntMV pf, SntMV pb, Mb16Choice *best) {
     SntCdfSet *cs = f->cs;
     int px0 = bx0 * BLK, py0 = by0 * BLK;
-    int sdir = f->is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
-    SntMV zero = {0, 0};
+    int sdir;
+    SntMV smf, smb, zero = {0, 0};
+    skip_motion(f, bx0, by0, &sdir, &smf, &smb);
     SntMV qf = search_mv(f, f->ref_f, px0, py0, 16, pf);
     SntMV qb = f->is_bidi ? search_mv(f, f->ref_b, px0, py0, 16, pb) : zero;
 
@@ -520,7 +543,7 @@ static double eval_mb16(EncFrame *f, int bx0, int by0, SntMV pf, SntMV pb, Mb16C
             int vw, vh;
             load_src(f, bx, by, src, &vw, &vh);
             if (d == SNT_DIR_FWD) {
-                mc_residual(f, bx, by, sdir, f->gmf, f->gmb, src, vw, vh, p, res);
+                mc_residual(f, bx, by, sdir, smf, smb, src, vw, vh, p, res);
                 for (int k = 0; k < 64; k++) p16[k] = p[k];
                 d_skip += block_sse(src, p16, vw, vh);
             }
@@ -578,9 +601,11 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
         for (int z = 0; z < 4; z++)
             emit_block(f, bx0 + (z & 1), by0 + (z >> 1), &bc[z]);
     } else if (mode == SNT_MB_SKIP16) {
+        int sdir;
+        SntMV smf, smb;
+        skip_motion(f, bx0, by0, &sdir, &smf, &smb);
         for (int z = 0; z < 4; z++)
-            emit_inter_body(f, bx0 + (z & 1), by0 + (z >> 1),
-                            f->is_bidi ? SNT_DIR_BI : SNT_DIR_FWD, f->gmf, f->gmb, 1);
+            emit_inter_body(f, bx0 + (z & 1), by0 + (z >> 1), sdir, smf, smb, 1);
     } else {
         emit_inter_mvs(f, m16.dir, m16.mvf, m16.mvb, pf, pb);
         for (int z = 0; z < 4; z++)

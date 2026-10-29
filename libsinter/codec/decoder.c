@@ -33,6 +33,24 @@ static int16_t dec_mvd(SntRangeDec *rd, SntModel *cdf, SntBitReader *ovr) {
     return sym == 255 ? (int16_t)snt_br_get_sexpgolomb(ovr) : u2s(sym);
 }
 
+/* Prediction of a skipped block (bx, by): as the block to its left if
+ * that block is inter-predicted (MPEG-1's rule for skipped macroblocks
+ * in B-pictures), otherwise with the global motion */
+static void skip_motion(const uint8_t *blk_dir, const SntMV *mvf_field, const SntMV *mvb_field,
+                        int blk_cols, int bx, int by, int is_bidi, SntMV gmf, SntMV gmb,
+                        int *dir, SntMV *mvf, SntMV *mvb) {
+    int left = by * blk_cols + bx - 1;
+    if (bx > 0 && blk_dir[left]) {
+        *dir = blk_dir[left];
+        *mvf = mvf_field[left];
+        *mvb = mvb_field[left];
+    } else {
+        *dir = is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
+        *mvf = gmf;
+        *mvb = gmb;
+    }
+}
+
 /* Inter predictions, or zeros for a malformed stream that lacks a reference */
 static void dec_pred_luma(const SntSplinePlane *rf, const SntSplinePlane *rb, int x0, int y0,
                           int dir, SntMV mvf, SntMV mvb, uint8_t *pred) {
@@ -186,10 +204,9 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             /* SKIP16 predicts with the global motion: bi-directional in
              * B-frames */
             mb_dir = is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
-            if (mb_mode == SNT_MB_SKIP16) {
-                mb_mvf = gmf;
-                mb_mvb = gmb;
-            }
+            if (mb_mode == SNT_MB_SKIP16)
+                skip_motion(blk_dir, mv_field, mvb_field, blk_cols, bx0, by0, is_bidi,
+                            gmf, gmb, &mb_dir, &mb_mvf, &mb_mvb);
             if (mb_mode == SNT_MB_INTER16) {
                 mb_dir = is_bidi ? DEC(cs->bdir) + 1 : SNT_DIR_FWD;
                 /* An unused direction's MV is zero (H.263 Annex O) */
@@ -226,8 +243,9 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                          * its neighbours' (an unused direction's MV is zero) */
                         block_is_skip = DEC(cs->iskip) == 1;
                         dir = is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
-                        best_mv = gmf;
-                        best_mvb = gmb;
+                        if (block_is_skip)
+                            skip_motion(blk_dir, mv_field, mvb_field, blk_cols, bx, by, is_bidi,
+                                        gmf, gmb, &dir, &best_mv, &best_mvb);
                         if (!block_is_skip) {
                             best_mv = snt_mv_predict_at(mv_field, blk_cols, bx, by);
                             if (is_bidi)

@@ -72,6 +72,14 @@ void snt_pred_luma8_obmc(const SntSplinePlane *ref_f, const SntSplinePlane *ref_
                          const SntSplinePlane *ref_2, int x0, int y0, SntMotion cur,
                          SntMotion above, SntMotion left, uint8_t *pred);
 
+/* The blend of snt_pred_luma8_obmc, from the predictions at the block's
+ * own motion (q), the above block's (r) and the left block's (s); NULL for
+ * r or s means the same motion as q */
+void snt_obmc_blend(const uint8_t *q, const uint8_t *r, const uint8_t *s, uint8_t *pred);
+
+/* Do motions a and b predict the same way? */
+int snt_same_motion(SntMotion a, SntMotion b);
+
 /* Sum of absolute differences between two predictions of the 8x8 luma
  * block at (x0, y0): direction dira with MVs (af, ab), and dirb with
  * (bf, bb) */

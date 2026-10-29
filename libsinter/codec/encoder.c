@@ -87,8 +87,170 @@ static double band_sse(const int16_t *a, const int16_t *b, int n) {
     return sse;
 }
 
-/* ── Symbol range recording ───────────────────────────────────────── */
+/* ── Symbol recording ──────────────────────────────────────────────── */
 typedef struct { uint16_t cdf_lo; uint16_t freq; } SymRange;
+
+/* Forward-pass symbol sink: records each symbol's rANS range, adapts its
+ * CDF, and holds the overflow bit writer for escapes and PVQ shapes. */
+typedef struct {
+    SymRange     *ranges;
+    uint32_t      rc;
+    SntBitWriter *ov;
+} SymSink;
+
+static void rec(SymSink *s, RansCDF *cdf, uint16_t sym) {
+    rans_cdf_symbol_range(cdf, sym, &s->ranges[s->rc].cdf_lo, &s->ranges[s->rc].freq);
+    rans_cdf_adapt(cdf, sym);
+    s->rc++;
+}
+
+/* ── Luma block coding ─────────────────────────────────────────────── */
+#define NUM_BANDS 16
+static const int band_bounds[NUM_BANDS + 1] = {0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,59,63};
+#define NUM_PRED_AC 4
+static const int pred_ac_idx[NUM_PRED_AC] = {1, 8, 2, 9};
+
+/* Result of coding one 8x8 luma block's DC and bands */
+typedef struct {
+    int16_t recon_coeffs[64];  /* reconstructed coefficients (TD prediction included) */
+    int16_t recon[64];         /* reconstructed pixels (prediction block added) */
+    int16_t dc_recon;          /* reconstructed DC coefficient */
+    double  bits;              /* estimated bits (estimate mode only) */
+} LumaCode;
+
+/* Code one 8x8 luma block's DC and bands.
+ * dct_in: pixels (transform-domain intra) or a residual (all other modes).
+ * td_pred: transform-domain prediction, used when pred is NULL: the DC,
+ *   plus the low AC when td_ac. pred: prediction block added back on
+ *   reconstruction (NULL for transform-domain intra).
+ * t: context block type (0 intra, 1 inter).
+ * With a sink, symbols are emitted and CDFs adapt as they go. Without
+ * one, nothing is emitted, the CDFs are untouched, and out->bits
+ * estimates the cost from their current state. */
+static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
+                      const int16_t *dct_in, const int16_t *td_pred, int td_ac,
+                      const uint8_t *pred, LumaCode *out) {
+    int16_t coeffs[64];
+    snt_dct_fwd_2d_ref(dct_in, BLK, BLK, coeffs);
+    double bits = 0;
+    double lambda = RD_LAMBDA * (double)step * step;
+
+    /* DC: transform-domain intra predicts it; other residuals are zero-mean */
+    int16_t dc_pred = pred ? 0 : td_pred[0];
+    int16_t dc_level = pvq_quantize_dc(coeffs[0] - dc_pred, step, 1);
+    if (sink) {
+        uint16_t dc_sym = s2u(dc_level);
+        rec(sink, &cs->dc[t], dc_sym);
+        if (dc_sym == 255)
+            snt_bw_put_sexpgolomb(sink->ov, dc_level);
+    } else {
+        bits += level_bits(&cs->dc[t], dc_level);
+    }
+    out->dc_recon = pvq_dequantize_dc(dc_level, step) + dc_pred;
+
+    /* Low-AC prediction (transform-domain intra in key frames) */
+    if (td_ac)
+        for (int p = 0; p < NUM_PRED_AC; p++)
+            coeffs[pred_ac_idx[p]] -= td_pred[pred_ac_idx[p]];
+
+    int16_t recon_ac[63];
+    memset(recon_ac, 0, sizeof(recon_ac));
+    for (int b = 0; b < NUM_BANDS; b++) {
+        int start = band_bounds[b];
+        int n = band_bounds[b + 1] - start;
+
+        float csf_sum = 0.0f;
+        for (int i = 0; i < n; i++)
+            csf_sum += psy_csf_weight(BLK, snt_zigzag8[1 + start + i]);
+        uint8_t band_csf = (uint8_t)(csf_sum / n * 255.0f);
+        if (band_csf < 1) band_csf = 1;
+
+        int16_t band_coeffs[16];  /* this band, in zigzag order */
+        for (int i = 0; i < n; i++)
+            band_coeffs[i] = coeffs[snt_zigzag8[1 + start + i]];
+
+        /* Scalar candidate (CSF-weighted step on high bands) */
+        uint16_t eff_step = step;
+        if (band_csf < 128) {
+            eff_step = (uint16_t)((uint32_t)step * 256 / band_csf);
+            if (eff_step > 3072) eff_step = 3072;
+        }
+        int16_t s_level[16], s_recon[16];
+        double s_bits = cdf_bits(&cs->mode[t][b], 1);
+        for (int i = 0; i < n; i++) {
+            s_level[i] = pvq_quantize_dc(band_coeffs[i], eff_step, 1);
+            s_recon[i] = pvq_dequantize_dc(s_level[i], eff_step);
+            s_bits += level_bits(&cs->ac[t][b / 4], s_level[i]);
+        }
+
+        /* PVQ candidate */
+        SntPVQCode code;
+        int16_t p_recon[16];
+        pvq_encode(band_coeffs, n, step, 1, band_csf, &code, p_recon);
+        uint16_t gain_sym = (code.gain > 255) ? 255 : (uint16_t)code.gain;
+        int shape_bits = 0;
+        double p_bits = cdf_bits(&cs->mode[t][b], 0)
+                      + cdf_bits(&cs->skip[t][b], code.skip ? 1 : 0);
+        if (!code.skip) {
+            /* K = pvq_compute_k(gain, n, band_csf): the decoder
+             * has all three inputs, so K is not transmitted. */
+            shape_bits = pvq_shape_bits(n, code.k);
+            if (shape_bits < 1) shape_bits = 1;
+            if (shape_bits > 64) shape_bits = 64;
+            p_bits += cdf_bits(&cs->gain[t], gain_sym) + shape_bits;
+            if (gain_sym == 255) p_bits += expgolomb_len(code.gain);
+        }
+
+        /* Mode decision: minimum distortion + lambda * bits.
+         * (The old energy-concentration heuristic picked PVQ for
+         * bands where it cost far more than it saved.) */
+        int use_scalar = band_sse(band_coeffs, s_recon, n) + lambda * s_bits
+                      <= band_sse(band_coeffs, p_recon, n) + lambda * p_bits;
+        const int16_t *band_recon = use_scalar ? s_recon : p_recon;
+
+        if (!sink) {
+            bits += use_scalar ? s_bits : p_bits;
+        } else {
+            rec(sink, &cs->mode[t][b], use_scalar ? 1 : 0);
+            if (use_scalar) {
+                for (int i = 0; i < n; i++) {
+                    uint16_t ac_sym = s2u(s_level[i]);
+                    rec(sink, &cs->ac[t][b / 4], ac_sym);
+                    if (ac_sym == 255)
+                        snt_bw_put_sexpgolomb(sink->ov, s_level[i]);
+                }
+            } else {
+                rec(sink, &cs->skip[t][b], code.skip ? 1 : 0);
+                if (!code.skip) {
+                    rec(sink, &cs->gain[t], gain_sym);
+                    if (gain_sym == 255)
+                        snt_bw_put_expgolomb(sink->ov, code.gain);
+                    if (shape_bits > 32) {
+                        snt_bw_put_bits(sink->ov, (uint32_t)(code.shape_idx >> 32), shape_bits - 32);
+                        snt_bw_put_bits(sink->ov, (uint32_t)(code.shape_idx & 0xFFFFFFFF), 32);
+                    } else {
+                        snt_bw_put_bits(sink->ov, (uint32_t)code.shape_idx, shape_bits);
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < n; i++)
+            recon_ac[start + i] = band_recon[i];
+    }
+
+    /* Reconstruct coefficients, then pixels */
+    out->recon_coeffs[0] = out->dc_recon;
+    for (int i = 0; i < 63; i++)
+        out->recon_coeffs[snt_zigzag8[i + 1]] = recon_ac[i];
+    if (td_ac)
+        for (int p = 0; p < NUM_PRED_AC; p++)
+            out->recon_coeffs[pred_ac_idx[p]] += td_pred[pred_ac_idx[p]];
+    snt_dct_inv_2d_ref(out->recon_coeffs, BLK, out->recon, BLK);
+    if (pred)
+        for (int k = 0; k < 64; k++)
+            out->recon[k] += pred[k];
+    out->bits = bits;
+}
 
 /*
  * Symbol emission order (normative, must match decoder exactly):
@@ -170,7 +332,6 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
 
     uint32_t max_ranges = (uint32_t)(total_blocks * 85 + chroma_blocks * 16 + 256);
     SymRange *ranges = (SymRange *)malloc(max_ranges * sizeof(SymRange));
-    uint32_t rc = 0;
 
     uint32_t ov_cap = (uint32_t)(total_blocks * 128 + 4096);
     uint8_t *ov_buf = (uint8_t *)malloc(ov_cap);
@@ -184,11 +345,8 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     if (!is_inter || !ctx->cdf_state_valid)
         snt_cdf_set_init(cs);
 
-    #define REC(cdf, sym) do { \
-        rans_cdf_symbol_range(&(cdf), (sym), &ranges[rc].cdf_lo, &ranges[rc].freq); \
-        rans_cdf_adapt(&(cdf), (sym)); \
-        rc++; \
-    } while(0)
+    SymSink sink = { ranges, 0, &ov };
+    #define REC(cdf, sym) rec(&sink, &(cdf), (sym))
 
     /* ── PHASE 1: Forward pass — record symbols + overflow ─────── */
     /* Per-block mode flags for chroma inter derivation */
@@ -197,16 +355,11 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
 
     int16_t *dc_recon_above = (int16_t *)calloc(blk_cols, sizeof(int16_t));
     int16_t dc_recon_left = 0;
-    #define NUM_PRED_AC 4
-    static const int pred_ac_idx[NUM_PRED_AC] = {1, 8, 2, 9};
     int16_t *ac_recon_above = (int16_t *)calloc((size_t)blk_cols * NUM_PRED_AC, sizeof(int16_t));
     int16_t ac_recon_left[NUM_PRED_AC] = {0};
 
     /* MV field for spatial prediction (inter only) */
     SntMV *mv_field = (SntMV *)calloc(blk_cols * blk_rows, sizeof(SntMV));
-
-    #define NUM_BANDS 16
-    static const int band_bounds[NUM_BANDS + 1] = {0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,59,63};
 
     for (int by = 0; by < blk_rows; by++) {
         dc_recon_left = 0;
@@ -397,7 +550,10 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
             /* Intra mode: transform-domain prediction or a spatial
              * predictor, whichever has the lower transform-domain cost
              * (sum of |residual coefficients| + lambda * mode bits).
-             * A spatial prediction goes in mc_blk, like an MC prediction. */
+             * A spatial prediction goes in mc_blk, like an MC prediction;
+             * luma_in becomes its residual. */
+            int16_t luma_in[64];
+            memcpy(luma_in, dct_input, sizeof(luma_in));
             int imode = SNT_IPRED_TD;
             if (!block_is_inter) {
                 double lambda_sad = sqrt(RD_LAMBDA) * step;
@@ -406,168 +562,47 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     best_cost += abs(coeffs[k] - td_pred[k]);
                 for (int m = SNT_IPRED_V; m < SNT_NUM_IPRED; m++) {
                     uint8_t p[BLK * BLK];
-                    int16_t res[64], rc[64];
+                    int16_t res[64], rcf[64];
                     snt_intra_spatial_pred8(recon, pad_w, px0, py0, m, p);
                     for (int k = 0; k < 64; k++)
                         res[k] = dct_input[k] - p[k];
-                    snt_dct_fwd_2d_ref(res, BLK, BLK, rc);
+                    snt_dct_fwd_2d_ref(res, BLK, BLK, rcf);
                     double cost = lambda_sad * cdf_bits(&cs->imode[is_inter], (uint16_t)m);
                     for (int k = 0; k < 64; k++)
-                        cost += abs(rc[k]);
+                        cost += abs(rcf[k]);
                     if (cost < best_cost) {
                         best_cost = cost;
                         imode = m;
                         memcpy(mc_blk, p, sizeof(p));
-                        memcpy(coeffs, rc, sizeof(rc));
+                        memcpy(luma_in, res, sizeof(res));
                     }
                 }
                 REC(cs->imode[is_inter], (uint16_t)imode);
             }
             /* mc_blk holds this block's prediction (inter or spatial intra) */
             int has_pred_blk = (block_is_inter && !block_is_skip) || imode != SNT_IPRED_TD;
+            int td_ac = !is_inter && imode == SNT_IPRED_TD;
 
-            /* DC prediction: only transform-domain intra blocks predict DC;
-             * inter and spatial-intra residuals are zero-mean. */
-            int16_t dc_pred = has_pred_blk ? 0 : td_pred[0];
+            LumaCode lc;
+            code_luma(cs, &sink, step, block_is_inter, luma_in, td_pred, td_ac,
+                      has_pred_blk ? mc_blk : NULL, &lc);
 
-            int16_t dc_residual = coeffs[0] - dc_pred;
-            int16_t dc_level = pvq_quantize_dc(dc_residual, step, 1);
-
-            uint16_t dc_sym = s2u(dc_level);
-            REC(cs->dc[block_is_inter], dc_sym);
-            if (dc_sym == 255)
-                snt_bw_put_sexpgolomb(&ov, dc_level);
-
-            int16_t dc_recon = pvq_dequantize_dc(dc_level, step) + dc_pred;
             /* Neighbours see the pixel-domain DC (add the prediction block's DC) */
-            dc_recon_left = has_pred_blk ? dc_recon + snt_pred_dc8(mc_blk) : dc_recon;
+            dc_recon_left = has_pred_blk ? lc.dc_recon + snt_pred_dc8(mc_blk) : lc.dc_recon;
             dc_recon_above[bx] = dc_recon_left;
 
-            /* Low-AC prediction (transform-domain intra in key frames) */
-            int td_ac = !is_inter && imode == SNT_IPRED_TD;
-            if (td_ac)
-                for (int p = 0; p < NUM_PRED_AC; p++)
-                    coeffs[pred_ac_idx[p]] -= td_pred[pred_ac_idx[p]];
-
-            /* Band processing (same for all block types) */
-            int16_t recon_ac[63];
-            memset(recon_ac, 0, sizeof(recon_ac));
-
-            for (int b = 0; b < NUM_BANDS; b++) {
-                int start = band_bounds[b];
-                int n = band_bounds[b + 1] - start;
-
-                float csf_sum = 0.0f;
-                for (int i = 0; i < n; i++)
-                    csf_sum += psy_csf_weight(BLK, snt_zigzag8[1 + start + i]);
-                uint8_t band_csf = (uint8_t)(csf_sum / n * 255.0f);
-                if (band_csf < 1) band_csf = 1;
-
-                int16_t band_coeffs[16];  /* this band, in zigzag order */
-                for (int i = 0; i < n; i++)
-                    band_coeffs[i] = coeffs[snt_zigzag8[1 + start + i]];
-                int t = block_is_inter;
-
-                /* Scalar candidate (CSF-weighted step on high bands) */
-                uint16_t eff_step = step;
-                if (band_csf < 128) {
-                    eff_step = (uint16_t)((uint32_t)step * 256 / band_csf);
-                    if (eff_step > 3072) eff_step = 3072;
-                }
-                int16_t s_level[16], s_recon[16];
-                double s_bits = cdf_bits(&cs->mode[t][b], 1);
-                for (int i = 0; i < n; i++) {
-                    s_level[i] = pvq_quantize_dc(band_coeffs[i], eff_step, 1);
-                    s_recon[i] = pvq_dequantize_dc(s_level[i], eff_step);
-                    s_bits += level_bits(&cs->ac[t][b / 4], s_level[i]);
-                }
-
-                /* PVQ candidate */
-                SntPVQCode code;
-                int16_t p_recon[16];
-                pvq_encode(band_coeffs, n, step, 1, band_csf, &code, p_recon);
-                uint16_t gain_sym = (code.gain > 255) ? 255 : (uint16_t)code.gain;
-                int shape_bits = 0;
-                double p_bits = cdf_bits(&cs->mode[t][b], 0)
-                              + cdf_bits(&cs->skip[t][b], code.skip ? 1 : 0);
-                if (!code.skip) {
-                    /* K = pvq_compute_k(gain, n, band_csf): the decoder
-                     * has all three inputs, so K is not transmitted. */
-                    shape_bits = pvq_shape_bits(n, code.k);
-                    if (shape_bits < 1) shape_bits = 1;
-                    if (shape_bits > 64) shape_bits = 64;
-                    p_bits += cdf_bits(&cs->gain[t], gain_sym) + shape_bits;
-                    if (gain_sym == 255) p_bits += expgolomb_len(code.gain);
-                }
-
-                /* Mode decision: minimum distortion + lambda * bits.
-                 * (The old energy-concentration heuristic picked PVQ for
-                 * bands where it cost far more than it saved.) */
-                double lambda = RD_LAMBDA * (double)step * step;
-                int use_scalar = band_sse(band_coeffs, s_recon, n) + lambda * s_bits
-                              <= band_sse(band_coeffs, p_recon, n) + lambda * p_bits;
-                const int16_t *band_recon = use_scalar ? s_recon : p_recon;
-
-                REC(cs->mode[t][b], use_scalar ? 1 : 0);
-                if (use_scalar) {
-                    for (int i = 0; i < n; i++) {
-                        uint16_t ac_sym = s2u(s_level[i]);
-                        REC(cs->ac[t][b / 4], ac_sym);
-                        if (ac_sym == 255)
-                            snt_bw_put_sexpgolomb(&ov, s_level[i]);
-                    }
-                } else {
-                    REC(cs->skip[t][b], code.skip ? 1 : 0);
-                    if (!code.skip) {
-                        REC(cs->gain[t], gain_sym);
-                        if (gain_sym == 255)
-                            snt_bw_put_expgolomb(&ov, code.gain);
-                        if (shape_bits > 32) {
-                            snt_bw_put_bits(&ov, (uint32_t)(code.shape_idx >> 32), shape_bits - 32);
-                            snt_bw_put_bits(&ov, (uint32_t)(code.shape_idx & 0xFFFFFFFF), 32);
-                        } else {
-                            snt_bw_put_bits(&ov, (uint32_t)code.shape_idx, shape_bits);
-                        }
-                    }
-                }
-                for (int i = 0; i < n; i++)
-                    recon_ac[start + i] = band_recon[i];
-            }
-
-            /* Reconstruct coefficients */
-            int16_t recon_coeffs[64];
-            recon_coeffs[0] = dc_recon;
-            for (int i = 0; i < 63; i++)
-                recon_coeffs[snt_zigzag8[i + 1]] = recon_ac[i];
-
-            /* Add back AC prediction */
-            if (td_ac)
-                for (int p = 0; p < NUM_PRED_AC; p++)
-                    recon_coeffs[pred_ac_idx[p]] += td_pred[pred_ac_idx[p]];
-
-            /* IDCT → recon buffer */
-            int16_t recon_blk[64];
-            snt_dct_inv_2d_ref(recon_coeffs, BLK, recon_blk, BLK);
-
-            /* Write to recon: add the prediction block (inter or spatial intra) */
             for (int dy = 0; dy < BLK; dy++)
-                for (int dx = 0; dx < BLK; dx++) {
-                    int py = py0 + dy, px_v = px0 + dx;
-                    int16_t val = recon_blk[dy * BLK + dx];
-                    if (has_pred_blk)
-                        val += mc_blk[dy * BLK + dx];
-                    recon[py * pad_w + px_v] = val;
-                    recon_blk[dy * BLK + dx] = val;
-                }
+                for (int dx = 0; dx < BLK; dx++)
+                    recon[(py0 + dy) * pad_w + px0 + dx] = lc.recon[dy * BLK + dx];
 
             /* Key frames: store reconstructed low AC for the neighbours'
              * prediction. Spatial-intra blocks coded a residual, so take
              * the coefficients of the reconstructed block itself. */
             if (!is_inter) {
-                const int16_t *src = recon_coeffs;
+                const int16_t *src = lc.recon_coeffs;
                 int16_t full[64];
                 if (imode != SNT_IPRED_TD) {
-                    snt_dct_fwd_2d_ref(recon_blk, BLK, BLK, full);
+                    snt_dct_fwd_2d_ref(lc.recon, BLK, BLK, full);
                     src = full;
                 }
                 for (int p = 0; p < NUM_PRED_AC; p++) {
@@ -729,12 +764,12 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     }
 
     /* ── PHASE 2: Reverse rANS encode ──────────────────────────────── */
-    uint32_t rev_cap = rc * 2 + 64;
+    uint32_t rev_cap = sink.rc * 2 + 64;
     uint16_t *rev_buf = (uint16_t *)malloc(rev_cap * sizeof(uint16_t));
     RansEncoder renc;
     rans_enc_init(&renc, rev_buf, rev_cap, 1);
 
-    for (int32_t i = (int32_t)rc - 1; i >= 0; i--)
+    for (int32_t i = (int32_t)sink.rc - 1; i >= 0; i--)
         rans_enc_put(&renc, ranges[i].cdf_lo, ranges[i].freq, (uint32_t)i);
     rans_enc_flush(&renc);
 

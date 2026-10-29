@@ -1,0 +1,41 @@
+# Novel tools
+
+Phase 3 of the clean-format work tried tools of Sinter's own design. Each entry gives the idea, why it should help, the search for the same idea in patents and papers, and the measured result. A new tool is kept only if the search finds no patent or application with the same idea. The searches are checks for obvious collisions, not patent clearance.
+
+BD-rates are luma (and YUV), mean of foreman, mobile and akiyo (Xiph CIF, 60 frames, 2 B-frames), against the codec just before the change.
+
+## 1. A decoder that learns while decoding (dropped after the search)
+
+**Idea.** Code each binary decision with several context models at once (coarse and fast, fine and slow) and combine their probabilities by logistic mixing, with the mixing weights learned online from the decoded data (as in the PAQ compressors). A new context could then be added without diluting the statistics: the mixer learns how much to trust it.
+
+**Why it should help.** Richer contexts lost before because each one relearns slowly after a key frame; mixing lets a fast general model cover for slow specific ones.
+
+**Search.**
+- Query: "patent video coding entropy context mixing logistic mixing weights updated online probability estimation transform coefficients". Found Google's [EP3677027A1](https://patents.google.com/patent/EP3677027A1/en) (granted as EP3677027B1) and [US10887595B2](https://patents.google.com/patent/US10887595B2/en), "Mixing of probabilities for entropy coding in video compression" / "Using multiple probability models for entropy coding in video compression" (priority 2017-08-29, active): two or more probability models for the tokens of quantized transform coefficients, combined into a mixed probability with weights updated online from the code length each model would have produced. Also [US10735736](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/10735736), "Selective mixing for entropy coding in video compression", and [US11259053B2](https://patents.google.com/patent/US11259053) (machine-learned probability refinement).
+
+**Result.** Dropped before implementation: adaptive mixing of several models' probabilities for coefficient coding is the same idea, although these patents mix linearly rather than in the logistic domain. The prior-art route would be Context Tree Weighting (F. Willems, Y. Shtarkov and T. Tjalkens, IEEE Trans. Information Theory 41(3), 1995), which weights context models by their accumulated code lengths and predates these patents by 22 years. But that weighting is essentially the patents' mechanism, so building it would follow the letter of the source rule and not its purpose. It is left for a patent professional to judge.
+
+## 2. Contexts from the prediction (kept)
+
+**Idea.** Before an inter block's residual is decoded, the decoder already has the block's motion-compensated prediction. Take its DCT and compare each coefficient's magnitude with the quantizer step (classes: below 1 step, below 4 steps, above), and each band's summed magnitude (below 2 steps, below 8, above). These classes select the models for the band's coded flag and for each level's zero and "above one" decisions (`levels.h`). Intra blocks use class 0. Nothing extra is sent.
+
+**Why it should help.** A residual is roughly the prediction's misalignment times its gradient, so it tends to be nonzero at the frequencies where the prediction has energy, and zero where the prediction is flat.
+
+**Search.**
+- "patent entropy coding residual coefficients context derived from motion compensated prediction block energy frequency": closest [US7974343B2](https://patents.google.com/patent/US7974343/zh-cn) (code tables chosen by macroblock type), [US20160295242A1](https://patents.google.com/patent/US20160295242), [US20100046626A1](https://patents.google.com/patent/US20100046626A1/en). None derives contexts from the prediction.
+- "patent selecting context for coding transform coefficients of residual based on prediction block characteristics ... variance gradient": closest [US6680974B1](https://patents.google.com/patent/US6680974) (contexts from previously reconstructed neighbouring coefficients; expired), [US8891630B2](https://ipverse.greyb.com/patents/US8891630B2) (partition sets).
+- '"prediction signal" OR "predicted block" used to derive context for entropy coding of residual transform coefficients': closest [US10397577](https://patents.justia.com/patent/10397577) (contexts by prediction mode and transform type, not the prediction's content), [WO2019029951A1](https://patents.google.com/patent/WO2019029951A1/en), [US9621894B2](https://patents.google.com/patent/US9621894).
+
+No patent or application found that selects contexts from the content or spectrum of the prediction block.
+
+**Result.** Kept. -0.9% (-0.7%): foreman -0.9%, mobile -1.2%, akiyo -0.5%. Lowering or raising the class thresholds by 2x was no better.
+
+## 3. Per-clip starting tables (dropped after the search)
+
+**Idea.** A first encoder pass collects the clip's symbol statistics; the sequence or key-frame header then sends starting probability tables as small changes from the trained defaults.
+
+**Search.**
+- "patent video encoder transmit initial probability tables context initialization in bitstream header per sequence first pass statistics arithmetic coding": closest [US20260122287A1](https://patents.google.com/patent/US20260122287A1/en) (frame context initialization from averaged tile contexts), [US8344917B2](https://patents.google.com/patent/US8344917B2/en) and [US20170250709A1](https://patents.google.com/patent/US20170250709) (initialization from QP), [WO2016196307A1](https://patents.google.com/patent/WO2016196307A1/en).
+- "VP8 coefficient probability updates frame header": VP8 ([RFC 6386](https://datatracker.ietf.org/doc/rfc6386/), 2010) sends exactly this: default token probabilities plus per-frame updates in the frame header, which persist until the next key frame.
+
+**Result.** Dropped: sending probability changes from defaults in the header is VP8's design, and VP8 is an excluded source. Choosing one of a few predefined tables instead would be H.264's `cabac_init_idc`, also excluded. JPEG's two-pass optimized tables (1992) would be the pre-2004 form, but sending complete tables for hundreds of adaptive models costs more than the trained starting tables leave to gain.

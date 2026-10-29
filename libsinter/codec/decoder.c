@@ -53,10 +53,10 @@ static void skip_motion(const uint8_t *blk_dir, const SntMV *mvf_field, const Sn
 
 /* Decode a luma AC level at zigzag index k from its binary decisions
  * (levels.h; the same decisions and models as snt_level_bins) */
-static int16_t dec_level(SntRangeDec *rd, SntCdfSet *cs, int t, int k, int z_known) {
-    if (!z_known && !snt_rc_decode_sym(rd, &cs->acz[t][k])) return 0;
+static int16_t dec_level(SntRangeDec *rd, SntCdfSet *cs, int t, int k, int pc, int z_known) {
+    if (!z_known && !snt_rc_decode_sym(rd, &cs->acz[t][k][pc])) return 0;
     int neg = snt_rc_decode_sym(rd, &cs->acs[t]);
-    if (!snt_rc_decode_sym(rd, &cs->acg[t][k])) return (int16_t)(neg ? -1 : 1);
+    if (!snt_rc_decode_sym(rd, &cs->acg[t][k][pc])) return (int16_t)(neg ? -1 : 1);
     int c = 1;
     while (c < SNT_LEVEL_MAX_CAT && snt_rc_decode_sym(rd, &cs->acx[t][k > SNT_LEVEL_KLOW][c - 1]))
         c++;
@@ -345,17 +345,26 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
 
             /* Bands: a coded flag (context: is the previous band, for
              * band 0 the DC level, nonzero?), then the levels */
+            /* Contexts from the prediction (inter blocks; levels.h) */
+            uint8_t kcls[64] = {0}, bcls[NUM_BANDS] = {0};
+            if (has_pred_blk) {
+                int16_t p16[64], pdct[64];
+                for (int i = 0; i < 64; i++) p16[i] = mc_blk[i];
+                snt_dct_fwd_2d_ref(p16, BLK, BLK, pdct);
+                snt_pred_classes(pdct, step, snt_zigzag8, band_bounds, NUM_BANDS, kcls, bcls);
+            }
             int prev_nz = dc_level != 0;
             for (int b = 0; b < NUM_BANDS; b++) {
                 int start = band_bounds[b];
                 int n = band_bounds[b + 1] - start;
-                int coded = DEC(cs->band[block_is_inter][b][prev_nz]) == 1;
+                int coded = DEC(cs->band[block_is_inter][b][prev_nz][bcls[b]]) == 1;
                 int any = 0;
                 for (int i = 0; i < n; i++) {
                     int16_t level = 0;
                     if (coded) {
                         /* The last level is known nonzero if the others are 0 */
-                        level = dec_level(&rdec, cs, block_is_inter, 1 + start + i, i == n - 1 && !any);
+                        level = dec_level(&rdec, cs, block_is_inter, 1 + start + i,
+                                          kcls[1 + start + i], i == n - 1 && !any);
                         any |= level != 0;
                     }
                     recon_coeffs[snt_zigzag8[1 + start + i]] = pvq_dequantize_dc(level, step);

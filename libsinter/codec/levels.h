@@ -56,4 +56,30 @@ static inline int snt_level_bins(int16_t v, int z_known, SntLevelBin *out) {
     return n;
 }
 
+/* Contexts from the prediction (inter blocks): the DCT of the motion-
+ * compensated prediction block, compared with the quantizer step, per
+ * zigzag index and per band. A residual is roughly the prediction's
+ * misalignment times its gradient, so it tends to be nonzero where the
+ * prediction has energy. Classes 0, 1, 2; intra blocks use 0. */
+#define SNT_PRED_CLASSES 3
+
+static inline void snt_pred_classes(const int16_t *pred_dct, uint16_t step, const uint8_t *zigzag,
+                                    const int *band_bounds, int num_bands,
+                                    uint8_t *kcls, uint8_t *bcls) {
+    kcls[0] = 0;
+    for (int k = 1; k < 64; k++) {
+        int e = pred_dct[zigzag[k]];
+        if (e < 0) e = -e;
+        kcls[k] = (uint8_t)(e < step ? 0 : (e < 4 * step ? 1 : 2));
+    }
+    for (int b = 0; b < num_bands; b++) {
+        int sum = 0;
+        for (int k = band_bounds[b]; k < band_bounds[b + 1]; k++) {
+            int e = pred_dct[zigzag[1 + k]];
+            sum += e < 0 ? -e : e;
+        }
+        bcls[b] = (uint8_t)(sum < 2 * step ? 0 : (sum < 8 * step ? 1 : 2));
+    }
+}
+
 #endif /* SNT_LEVELS_H */

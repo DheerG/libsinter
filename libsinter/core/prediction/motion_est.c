@@ -4,7 +4,7 @@
  *
  * Full-search integer-pel ME with quarter-pel refinement.
  * Diamond search for speed presets > 0 (future optimization).
- * MV prediction via median of spatial neighbors (AMVP-style).
+ * MV prediction: median of three neighbours (H.263, see motion_est.h).
  */
 
 #include <stdlib.h>
@@ -124,20 +124,8 @@ static int16_t median3(int16_t a, int16_t b, int16_t c) {
 
 SntMV snt_mv_predict(const SntMV *left_mv, const SntMV *above_mv,
                       const SntMV *above_right_mv) {
-    SntMV pred = {0, 0};
-    int count = 0;
-    int16_t mvx[3] = {0, 0, 0};
-    int16_t mvy[3] = {0, 0, 0};
-
-    if (left_mv) { mvx[count] = left_mv->x; mvy[count] = left_mv->y; count++; }
-    if (above_mv) { mvx[count] = above_mv->x; mvy[count] = above_mv->y; count++; }
-    if (above_right_mv) { mvx[count] = above_right_mv->x; mvy[count] = above_right_mv->y; count++; }
-
-    if (count == 0) return pred;
-    if (count == 1) { pred.x = mvx[0]; pred.y = mvy[0]; return pred; }
-    if (count == 2) { pred.x = (mvx[0] + mvx[1] + 1) >> 1; pred.y = (mvy[0] + mvy[1] + 1) >> 1; return pred; }
-
-    pred.x = median3(mvx[0], mvx[1], mvx[2]);
-    pred.y = median3(mvy[0], mvy[1], mvy[2]);
+    SntMV pred;
+    pred.x = median3(left_mv->x, above_mv->x, above_right_mv->x);
+    pred.y = median3(left_mv->y, above_mv->y, above_right_mv->y);
     return pred;
 }

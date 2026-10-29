@@ -169,9 +169,9 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         int mb_mode = SNT_MB_SPLIT, mb_dir = SNT_DIR_FWD;
         SntMV mb_mvf = {0, 0}, mb_mvb = {0, 0};
         if (is_inter && bx0 + 1 < blk_cols && by0 + 1 < blk_rows) {
-            mb_mvf = snt_mv_predict_at(mv_field, coded, blk_cols, bx0, by0);
+            mb_mvf = snt_mv_predict_at(mv_field, blk_cols, bx0, by0);
             if (is_bidi)
-                mb_mvb = snt_mv_predict_at(mvb_field, coded, blk_cols, bx0, by0);
+                mb_mvb = snt_mv_predict_at(mvb_field, blk_cols, bx0, by0);
             mb_mode = DEC(cs->mbmode);
             /* SKIP16 predicts at zero motion: bi-directional in B-frames */
             mb_dir = is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
@@ -181,6 +181,9 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             }
             if (mb_mode == SNT_MB_INTER16) {
                 mb_dir = is_bidi ? DEC(cs->bdir) + 1 : SNT_DIR_FWD;
+                /* An unused direction's MV is zero (H.263 Annex O) */
+                if (!(mb_dir & SNT_DIR_FWD)) mb_mvf = (SntMV){0, 0};
+                if (!(mb_dir & SNT_DIR_BWD)) mb_mvb = (SntMV){0, 0};
                 if (mb_dir & SNT_DIR_FWD) {
                     mb_mvf.x += dec_mvd(&rdec, &cs->mvx, &ovr);
                     mb_mvf.y += dec_mvd(&rdec, &cs->mvy, &ovr);
@@ -209,15 +212,17 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     if (block_is_inter) {
                         /* A skip block predicts at zero motion; a coded
                          * block's MVs are coded against the median of its
-                         * neighbours' (an unused direction keeps it) */
+                         * neighbours' (an unused direction's MV is zero) */
                         block_is_skip = DEC(cs->iskip) == 1;
                         dir = is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
                         if (!block_is_skip) {
-                            best_mv = snt_mv_predict_at(mv_field, coded, blk_cols, bx, by);
+                            best_mv = snt_mv_predict_at(mv_field, blk_cols, bx, by);
                             if (is_bidi)
-                                best_mvb = snt_mv_predict_at(mvb_field, coded, blk_cols, bx, by);
+                                best_mvb = snt_mv_predict_at(mvb_field, blk_cols, bx, by);
                             if (is_bidi)
                                 dir = DEC(cs->bdir) + 1;
+                            if (!(dir & SNT_DIR_FWD)) best_mv = (SntMV){0, 0};
+                            if (!(dir & SNT_DIR_BWD)) best_mvb = (SntMV){0, 0};
                             if (dir & SNT_DIR_FWD) {
                                 best_mv.x += dec_mvd(&rdec, &cs->mvx, &ovr);
                                 best_mv.y += dec_mvd(&rdec, &cs->mvy, &ovr);

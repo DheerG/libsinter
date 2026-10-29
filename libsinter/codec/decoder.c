@@ -51,6 +51,23 @@ static void skip_motion(const uint8_t *blk_dir, const SntMV *mvf_field, const Sn
     }
 }
 
+/* Decode a luma AC level at zigzag index k from its binary decisions
+ * (levels.h; the same decisions and models as snt_level_bins) */
+static int16_t dec_level(SntRangeDec *rd, SntCdfSet *cs, int t, int k, int z_known) {
+    if (!z_known && !snt_rc_decode_sym(rd, &cs->acz[t][k])) return 0;
+    int neg = snt_rc_decode_sym(rd, &cs->acs[t]);
+    if (!snt_rc_decode_sym(rd, &cs->acg[t][k])) return (int16_t)(neg ? -1 : 1);
+    int c = 1;
+    while (c < SNT_LEVEL_MAX_CAT && snt_rc_decode_sym(rd, &cs->acx[t][k > SNT_LEVEL_KLOW][c - 1]))
+        c++;
+    uint32_t a1 = 1;
+    for (int i = c - 2; i >= 0; i--)
+        a1 = (a1 << 1) | (uint32_t)snt_rc_decode_sym(rd, &cs->acm[t][c]);
+    int32_t mag = (int32_t)a1 + 1;
+    if (mag > 32767) mag = 32767;  /* damaged stream */
+    return (int16_t)(neg ? -mag : mag);
+}
+
 /* Inter predictions, or zeros for a malformed stream that lacks a reference */
 static void dec_pred_luma(const SntSplinePlane *rf, const SntSplinePlane *rb, int x0, int y0,
                           int dir, SntMV mvf, SntMV mvb, uint8_t *pred) {
@@ -333,11 +350,13 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 int start = band_bounds[b];
                 int n = band_bounds[b + 1] - start;
                 int coded = DEC(cs->band[block_is_inter][b][prev_nz]) == 1;
+                int any = 0;
                 for (int i = 0; i < n; i++) {
                     int16_t level = 0;
                     if (coded) {
-                        uint16_t ac_sym = DEC(cs->ac[block_is_inter][b / 4]);
-                        level = ac_sym == 255 ? (int16_t)snt_br_get_sexpgolomb(&ovr) : u2s(ac_sym);
+                        /* The last level is known nonzero if the others are 0 */
+                        level = dec_level(&rdec, cs, block_is_inter, 1 + start + i, i == n - 1 && !any);
+                        any |= level != 0;
                     }
                     recon_coeffs[snt_zigzag8[1 + start + i]] = pvq_dequantize_dc(level, step);
                 }

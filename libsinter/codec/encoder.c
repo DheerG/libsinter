@@ -79,6 +79,17 @@ static double level_bits(const SntModel *cdf, int16_t level) {
     return bits;
 }
 
+/* Bits for a luma AC level at zigzag index k, coded as binary decisions
+ * (levels.h) with the models' current state */
+static double ac_level_bits(SntCdfSet *cs, int t, int k, int16_t v, int z_known) {
+    SntLevelBin bins[2 * SNT_LEVEL_MAX_CAT + 4];
+    int n = snt_level_bins(v, z_known, bins);
+    double bits = 0;
+    for (int i = 0; i < n; i++)
+        bits += cdf_bits(snt_level_model(cs, t, k, &bins[i]), bins[i].bit);
+    return bits;
+}
+
 static double band_sse(const int16_t *a, const int16_t *b, int n) {
     double sse = 0;
     for (int i = 0; i < n; i++) {
@@ -120,10 +131,12 @@ static uint32_t train_hist[2][SNT_MODEL_CLASSES][SNT_NUM_MODELS][256];
 static int train_cls[2];
 
 void snte_train_dump(FILE *f) {
+    SntCdfSet sizes;
+    snt_cdf_set_init_uniform(&sizes);
     for (int set = 0; set < 2; set++)
         for (int c = 0; c < SNT_MODEL_CLASSES; c++)
             for (int k = 0; k < SNT_NUM_MODELS; k++) {
-                fprintf(f, "%d %d %d", set, c, k);
+                fprintf(f, "%d %d %d %d", set, c, k, ((SntModel *)&sizes)[k].num_symbols);
                 for (int i = 0; i < 256; i++) fprintf(f, " %u", train_hist[set][c][k][i]);
                 fprintf(f, "\n");
             }
@@ -216,7 +229,9 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
             band_coeffs[i] = coeffs[snt_zigzag8[1 + start + i]];
             s_level[i] = pvq_quantize_dc(band_coeffs[i], step, 1);
             s_recon[i] = pvq_dequantize_dc(s_level[i], step);
-            s_bits += level_bits(&cs->ac[t][b / 4], s_level[i]);
+            /* The last level of a coded band is known nonzero if the
+             * others are zero */
+            s_bits += ac_level_bits(cs, t, 1 + start + i, s_level[i], i == n - 1 && !s_nz);
             s_nz |= s_level[i] != 0;
         }
 
@@ -229,13 +244,16 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
             bits += coded ? s_bits : cdf_bits(flag, 0);
         } else {
             rec(sink, flag, (uint16_t)coded);
-            if (coded)
+            if (coded) {
+                int any = 0;
                 for (int i = 0; i < n; i++) {
-                    uint16_t ac_sym = s2u(s_level[i]);
-                    rec(sink, &cs->ac[t][b / 4], ac_sym);
-                    if (ac_sym == 255)
-                        snt_bw_put_sexpgolomb(sink->ov, s_level[i]);
+                    SntLevelBin bins[2 * SNT_LEVEL_MAX_CAT + 4];
+                    int nb = snt_level_bins(s_level[i], i == n - 1 && !any, bins);
+                    for (int j = 0; j < nb; j++)
+                        rec(sink, snt_level_model(cs, t, 1 + start + i, &bins[j]), bins[j].bit);
+                    any |= s_level[i] != 0;
                 }
+            }
         }
         prev_nz = coded;
         if (coded)
@@ -681,7 +699,8 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
  *   // Intra: the mode's coefficient prediction is subtracted first
  *   FOR band b=0..15:
  *     REC(band[t][b][nz], coded)      // nz: previous band (band 0: DC level) nonzero
- *     IF coded: FOR i=0..n-1: REC(ac[t][b/4], s2u(level))
+ *     IF coded: FOR i=0..n-1: the level's binary decisions (levels.h);
+ *               the last level's Z decision is skipped if the others are 0
  * FOR each chroma plane (U, V):
  *   FOR each 4x4 block:
  *     REC(cdc[ct], s2u(dc_level))

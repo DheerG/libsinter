@@ -37,11 +37,11 @@
 
 /* Adaptive frequency-count model */
 typedef struct {
-    uint16_t freq[SNT_RC_MAX_SYMBOLS];
     uint32_t total;
     uint16_t num_symbols;
     uint16_t inc;
     uint32_t limit;
+    uint16_t freq[SNT_RC_MAX_SYMBOLS];
 } SntModel;
 
 /* Every symbol starts with count init. */

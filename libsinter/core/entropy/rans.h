@@ -14,9 +14,12 @@
 #define RANS_RENORM_BITS 16         /* renormalize when state < (1<<16) */
 #define RANS_RENORM_LO   (1u << RANS_RENORM_BITS)  /* 65536 */
 
-/* Probability adaptation rates (PARA) */
-#define RANS_ADAPT_RATE_COEFF  5   /* for transform coefficients */
-#define RANS_ADAPT_RATE_MODE   4   /* for mode decisions */
+/* Probability adaptation rates (PARA), steady state. A freshly initialized
+ * CDF adapts 8x faster and slows in steps at 16, 64 and 256 symbols (see
+ * rans_cdf_adapt): it learns quickly after a key-frame reset, then averages
+ * over more history. */
+#define RANS_ADAPT_RATE_COEFF  8   /* for transform coefficients */
+#define RANS_ADAPT_RATE_MODE   6   /* for mode decisions */
 
 /* Maximum symbols per CDF */
 #define RANS_MAX_SYMBOLS  256
@@ -28,7 +31,8 @@ typedef uint32_t RansState;
 typedef struct {
     uint16_t cdf[RANS_MAX_SYMBOLS + 1]; /* cdf[i] = cumulative prob of symbols 0..i-1 */
     uint16_t num_symbols;
-    uint8_t  adapt_rate;                /* PARA adaptation rate */
+    uint8_t  adapt_rate;                /* steady-state PARA adaptation rate */
+    uint16_t count;                     /* symbols adapted since init (saturates) */
 } RansCDF;
 
 /* ── Bitstream buffer for rANS ────────────────────────────────────── */
@@ -66,7 +70,8 @@ typedef struct {
 void rans_cdf_init_uniform(RansCDF *cdf, uint16_t num_symbols, uint8_t adapt_rate);
 
 /* Adapt CDF after observing a symbol (PARA exponential moving average).
- * cdf->cdf[i] += ((target - cdf[i]) + (1 << (rate-1))) >> rate */
+ * cdf->cdf[i] += ((target - cdf[i]) + (1 << (rate-1))) >> rate, where
+ * rate = adapt_rate - (count < 16) - (count < 64) - (count < 256), min 3. */
 void rans_cdf_adapt(RansCDF *cdf, uint16_t symbol);
 
 /* Get probability range for a symbol: [cdf_lo, cdf_lo + freq) */

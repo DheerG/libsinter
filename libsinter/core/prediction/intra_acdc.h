@@ -66,4 +66,17 @@ static inline void snt_acdc_predict(int mode, const int16_t *left, const int16_t
     }
 }
 
+/* MPEG-4 Part 2's choice of prediction direction (ISO/IEC 14496-2, 1999,
+ * intra DC and AC prediction): with the DC of the left (A), above-left (B)
+ * and above (C) blocks, predict from above if |A - B| < |B - C|, else from
+ * the left. Returns 1 (above, as SNT_IPRED_VERT), 2 (left, as
+ * SNT_IPRED_HORZ), or 0 if a neighbour is outside the frame. Sinter sends
+ * the mode; this only selects the mode's model (cdf_set.h). */
+static inline int snt_acdc_direction(const int16_t *left, const int16_t *aboveleft,
+                                     const int16_t *above) {
+    if (!left || !aboveleft || !above) return 0;
+    int ab = left[0] - aboveleft[0], bc = aboveleft[0] - above[0];
+    return (ab < 0 ? -ab : ab) < (bc < 0 ? -bc : bc) ? 1 : 2;
+}
+
 #endif /* SNT_INTRA_ACDC_H */

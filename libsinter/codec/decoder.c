@@ -495,7 +495,10 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             int16_t td_pred[64];
             memset(td_pred, 0, sizeof(td_pred));
             if (!block_is_inter) {
-                int imode = DEC(cs->imode[is_inter]);
+                int idir = snt_acdc_direction(bx > 0 ? &acdc[(blk_idx - 1) * SNT_ACDC_STATE] : NULL,
+                                              bx > 0 && by > 0 ? &acdc[(blk_idx - blk_cols - 1) * SNT_ACDC_STATE] : NULL,
+                                              by > 0 ? &acdc[(blk_idx - blk_cols) * SNT_ACDC_STATE] : NULL);
+                int imode = DEC(cs->imode[is_inter][idir]);
                 if (imode >= SNT_NUM_IPRED) imode = SNT_IPRED_DC;  /* damaged stream */
                 snt_acdc_predict(imode,
                                  bx > 0 ? &acdc[(blk_idx - 1) * SNT_ACDC_STATE] : NULL,

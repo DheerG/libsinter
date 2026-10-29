@@ -59,7 +59,8 @@ typedef struct {
     SntModel acm[2][SNT_LEVEL_MAX_CAT + 1];     /* M: magnitude bits, by category */
     SntModel band[2][SNT_NUM_BANDS][2][SNT_PRED_CLASSES];  /* band coded (1) or all zero (0);
                                           by previous band nonzero, prediction class */
-    SntModel imode[2];                 /* intra mode, by frame type (0 key, 1 inter) */
+    SntModel imode[2][3];              /* intra mode, by frame type (0 key, 1 inter) and the
+                                          direction MPEG-4 would choose (snt_acdc_direction) */
     SntModel mbmode[SNT_FLAG_CONTEXTS];  /* macroblock mode (SNT_MB_*), by snt_flag_context */
     SntModel bdir;                     /* B-frame prediction direction - 1 (SNT_DIR_*), or
                                           SNT_BDIR_DIRECT */
@@ -109,7 +110,8 @@ static inline void snt_cdf_set_init_uniform(SntCdfSet *s) {
             snt_model_init(&s->dx[t][i], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         for (int c = 0; c <= SNT_LEVEL_MAX_CAT; c++)
             snt_model_init(&s->dm[t][c], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
-        snt_model_init(&s->imode[t], SNT_NUM_IPRED, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+        for (int d = 0; d < 3; d++)
+            snt_model_init(&s->imode[t][d], SNT_NUM_IPRED, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         for (int k = 0; k < 64; k++) {
             for (int p = 0; p < SNT_PRED_CLASSES; p++)
                 snt_model_init(&s->acz[t][k][p], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);

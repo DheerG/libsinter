@@ -405,7 +405,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         for (int x = 0; x < width; x++)
             output_y[y * stride_y + x] = snt_clip_pixel((int32_t)recon[y * pad_w + x]);
     snt_deblock_luma(output_y, width, height, stride_y, step,
-                     is_inter ? blk_is_skip : NULL, mv_field, blk_cols);
+                         is_inter ? blk_is_skip : NULL, blk_cols);
 
     /* Decode chroma with inter prediction support */
     if (chroma_present && output_u && output_v) {
@@ -518,8 +518,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             }
             free(c_dc_above);
         }
-        snt_deblock_chroma(output_u, cw, ch_h, stride_uv, cstep, is_inter ? blk_is_skip : NULL, mv_field, blk_cols);
-        snt_deblock_chroma(output_v, cw, ch_h, stride_uv, cstep, is_inter ? blk_is_skip : NULL, mv_field, blk_cols);
+        snt_deblock_chroma(output_u, cw, ch_h, stride_uv, cstep, is_inter ? blk_is_skip : NULL, blk_cols);
+        snt_deblock_chroma(output_v, cw, ch_h, stride_uv, cstep, is_inter ? blk_is_skip : NULL, blk_cols);
     }
 
     /* Grain synthesis */

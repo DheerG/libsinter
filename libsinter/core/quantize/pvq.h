@@ -30,7 +30,7 @@ uint32_t pvq_compute_gain(const int16_t *coeffs, int n);
  * Returns: quantized gain level. */
 uint32_t pvq_quantize_gain(uint32_t gain, uint16_t step, int is_intra);
 
-/* Dequantize PVQ gain. Exact: result = level * step. */
+/* Dequantize PVQ gain at the bin centre: level * step + step/8 (0 for level 0). */
 uint32_t pvq_dequantize_gain(uint32_t level, uint16_t step);
 
 /* ── Shape encoding (Fischer's combinatorial enumeration) ─────────── */
@@ -90,7 +90,7 @@ int pvq_shape_bits(int n, uint16_t k);
 /* Quantize DC coefficient with dead-zone. */
 int16_t pvq_quantize_dc(int16_t dc, uint16_t step, int is_intra);
 
-/* Dequantize DC. Exact: result = level * step. */
+/* Dequantize DC at the bin centre: sign * (|level| * step + step/6). */
 int16_t pvq_dequantize_dc(int16_t level, uint16_t step);
 
 #endif /* SNT_PVQ_H */

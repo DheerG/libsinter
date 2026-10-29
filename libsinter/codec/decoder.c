@@ -1,13 +1,13 @@
 /*
  * Sinter Codec — Decoder with rANS entropy coding + inter prediction
  * Mirrors encoder symbol order exactly.
+ * No lapping post-filter: the encoder does not pre-filter (see encoder.c).
  */
 
 #include <string.h>
 #include <stdlib.h>
 #include "decoder.h"
 #include "../util/fixed_point.h"
-#include "../core/transform/lapping.h"
 #include "../core/transform/dct.h"
 #include "../core/quantize/pvq.h"
 #include "../core/quantize/qp_table.h"
@@ -83,15 +83,14 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     RansDecoder rdec;
     rans_dec_init(&rdec, rans_buf, rans_bytes, 1);
 
-    /* ── Init 10 CDFs (must match encoder exactly) ─────────────────── */
-    RansCDF cdf_dc, cdf_ac, cdf_mode, cdf_skip, cdf_gain, cdf_k;
+    /* ── Init 9 CDFs (must match encoder exactly) ──────────────────── */
+    RansCDF cdf_dc, cdf_ac, cdf_mode, cdf_skip, cdf_gain;
     RansCDF cdf_inter, cdf_iskip, cdf_mvx, cdf_mvy;
     rans_cdf_init_uniform(&cdf_dc,   256, RANS_ADAPT_RATE_COEFF);
     rans_cdf_init_uniform(&cdf_ac,   256, RANS_ADAPT_RATE_COEFF);
     rans_cdf_init_uniform(&cdf_mode,   2, RANS_ADAPT_RATE_MODE);
     rans_cdf_init_uniform(&cdf_skip,   2, RANS_ADAPT_RATE_MODE);
     rans_cdf_init_uniform(&cdf_gain, 256, RANS_ADAPT_RATE_COEFF);
-    rans_cdf_init_uniform(&cdf_k,    256, RANS_ADAPT_RATE_COEFF);
     rans_cdf_init_uniform(&cdf_inter,  2, RANS_ADAPT_RATE_MODE);
     rans_cdf_init_uniform(&cdf_iskip,  2, RANS_ADAPT_RATE_MODE);
     rans_cdf_init_uniform(&cdf_mvx, 256, RANS_ADAPT_RATE_COEFF);
@@ -101,8 +100,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     if (is_inter && ctx->cdf_state_valid && ctx->cdf_state) {
         RansCDF *saved = (RansCDF *)ctx->cdf_state;
         cdf_dc = saved[0]; cdf_ac = saved[1]; cdf_mode = saved[2];
-        cdf_skip = saved[3]; cdf_gain = saved[4]; cdf_k = saved[5];
-        cdf_inter = saved[6]; cdf_iskip = saved[7]; cdf_mvx = saved[8]; cdf_mvy = saved[9];
+        cdf_skip = saved[3]; cdf_gain = saved[4];
+        cdf_inter = saved[5]; cdf_iskip = saved[6]; cdf_mvx = saved[7]; cdf_mvy = saved[8];
     }
 
     uint16_t _dec_sym;
@@ -224,15 +223,16 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 int start = band_bounds[b];
                 int n = band_bounds[b + 1] - start;
 
+                float csf_sum = 0;
+                for (int i = 0; i < n; i++)
+                    csf_sum += psy_csf_weight(8, 1 + start + i);
+                uint8_t band_csf = (uint8_t)(csf_sum / n * 255.0f);
+                if (band_csf < 1) band_csf = 1;
+
                 uint16_t mode_sym = DEC(cdf_mode);
 
                 if (mode_sym == 1) {
                     /* Scalar mode */
-                    float csf_sum = 0;
-                    for (int i = 0; i < n; i++)
-                        csf_sum += psy_csf_weight(8, 1 + start + i);
-                    uint8_t band_csf = (uint8_t)(csf_sum / n * 255.0f);
-                    if (band_csf < 1) band_csf = 1;
                     uint16_t eff_step = step;
                     if (band_csf < 128) {
                         eff_step = (uint16_t)((uint32_t)step * 256 / band_csf);
@@ -261,11 +261,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                         else
                             code.gain = (uint32_t)gain_sym;
 
-                        uint16_t k_sym = DEC(cdf_k);
-                        if (k_sym == 255)
-                            code.k = (uint16_t)snt_br_get_expgolomb(&ovr);
-                        else
-                            code.k = k_sym;
+                        /* K is derived, not transmitted (same formula as encoder) */
+                        code.k = pvq_compute_k(code.gain, n, band_csf);
 
                         int shape_bits = pvq_shape_bits(n, code.k);
                         if (shape_bits < 1) shape_bits = 1;
@@ -331,10 +328,6 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         }
         memset(ac_recon_left, 0, sizeof(ac_recon_left));
     }
-
-    /* KEY ONLY: lapping post-filter */
-    if (!is_inter)
-        snt_lap_post_filter_2d_ref(recon, pad_w, pad_h, pad_w, BLK);
 
     /* Copy to output */
     for (int y = 0; y < height; y++)
@@ -452,12 +445,12 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
 
     /* ── Save CDF state for cross-frame carry ─────────────────────── */
     if (!ctx->cdf_state)
-        ctx->cdf_state = malloc(10 * sizeof(RansCDF));
+        ctx->cdf_state = malloc(9 * sizeof(RansCDF));
     {
         RansCDF *saved = (RansCDF *)ctx->cdf_state;
         saved[0] = cdf_dc; saved[1] = cdf_ac; saved[2] = cdf_mode;
-        saved[3] = cdf_skip; saved[4] = cdf_gain; saved[5] = cdf_k;
-        saved[6] = cdf_inter; saved[7] = cdf_iskip; saved[8] = cdf_mvx; saved[9] = cdf_mvy;
+        saved[3] = cdf_skip; saved[4] = cdf_gain;
+        saved[5] = cdf_inter; saved[6] = cdf_iskip; saved[7] = cdf_mvx; saved[8] = cdf_mvy;
     }
     ctx->cdf_state_valid = 1;
 

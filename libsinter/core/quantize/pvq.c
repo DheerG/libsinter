@@ -167,11 +167,14 @@ uint32_t pvq_quantize_gain(uint32_t gain, uint16_t step, int is_intra) {
 }
 
 uint32_t pvq_dequantize_gain(uint32_t level, uint16_t step) {
-    /* Midpoint reconstruction: reconstruct at center of quantization bin
-     * to minimize expected error. (Gary: lower-edge reconstruction was
-     * a textbook quantizer design error costing 6-10 dB.) */
+    /* Reconstruct at the centre of the quantization bin. The quantizer
+     * already rounds to nearest, so level L covers
+     * [L*step - step/2 + offset, L*step + step/2 + offset) and its centre
+     * is L*step + offset. Adding step/2 here as well corrected for rounding
+     * twice and biased every nonzero gain upward by ~step/3.
+     * offset = step/8 is the intra dead-zone, the only one the encoder uses. */
     if (level == 0) return 0;
-    return level * step + step / 2;
+    return level * step + step / 8;
 }
 
 int16_t pvq_quantize_dc(int16_t dc, uint16_t step, int is_intra) {
@@ -186,11 +189,12 @@ int16_t pvq_quantize_dc(int16_t dc, uint16_t step, int is_intra) {
 }
 
 int16_t pvq_dequantize_dc(int16_t level, uint16_t step) {
-    /* Midpoint reconstruction for DC too */
+    /* Bin-centre reconstruction, as for gain: offset = step/6 is the intra
+     * dead-zone used for all DC and scalar AC levels. */
     if (level == 0) return 0;
     int16_t sign = level < 0 ? -1 : 1;
     int16_t abs_level = level < 0 ? -level : level;
-    return sign * (int16_t)(abs_level * step + step / 2);
+    return sign * (int16_t)(abs_level * step + step / 6);
 }
 
 /* ── K parameter computation ──────────────────────────────────────── */

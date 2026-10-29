@@ -81,12 +81,12 @@ static double level_bits(const SntModel *cdf, int16_t level) {
 
 /* Bits for a luma AC level at zigzag index k, coded as binary decisions
  * (levels.h) with the models' current state */
-static double ac_level_bits(SntCdfSet *cs, int t, int k, int16_t v, int z_known) {
+static double ac_level_bits(SntCdfSet *cs, int t, int k, int pc, int16_t v, int z_known) {
     SntLevelBin bins[2 * SNT_LEVEL_MAX_CAT + 4];
     int n = snt_level_bins(v, z_known, bins);
     double bits = 0;
     for (int i = 0; i < n; i++)
-        bits += cdf_bits(snt_level_model(cs, t, k, &bins[i]), bins[i].bit);
+        bits += cdf_bits(snt_level_model(cs, t, k, pc, &bins[i]), bins[i].bit);
     return bits;
 }
 
@@ -211,6 +211,15 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
         for (int i = 1; i < 64; i++)
             coeffs[i] -= td_pred[i];
 
+    /* Contexts from the prediction (inter blocks; levels.h) */
+    uint8_t kcls[64] = {0}, bcls[NUM_BANDS] = {0};
+    if (pred && t == 1) {
+        int16_t p16[64], pdct[64];
+        for (int i = 0; i < 64; i++) p16[i] = pred[i];
+        snt_dct_fwd_2d_ref(p16, BLK, BLK, pdct);
+        snt_pred_classes(pdct, step, snt_zigzag8, band_bounds, NUM_BANDS, kcls, bcls);
+    }
+
     int16_t recon_ac[63];
     memset(recon_ac, 0, sizeof(recon_ac));
     /* Each band is either all zero (flag 0) or has its levels coded (flag
@@ -220,7 +229,7 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
     for (int b = 0; b < NUM_BANDS; b++) {
         int start = band_bounds[b];
         int n = band_bounds[b + 1] - start;
-        SntModel *flag = &cs->band[t][b][prev_nz];
+        SntModel *flag = &cs->band[t][b][prev_nz][bcls[b]];
 
         int16_t band_coeffs[16], s_level[16], s_recon[16];  /* zigzag order */
         double s_bits = cdf_bits(flag, 1);
@@ -231,7 +240,8 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
             s_recon[i] = pvq_dequantize_dc(s_level[i], step);
             /* The last level of a coded band is known nonzero if the
              * others are zero */
-            s_bits += ac_level_bits(cs, t, 1 + start + i, s_level[i], i == n - 1 && !s_nz);
+            s_bits += ac_level_bits(cs, t, 1 + start + i, kcls[1 + start + i], s_level[i],
+                                    i == n - 1 && !s_nz);
             s_nz |= s_level[i] != 0;
         }
 
@@ -250,7 +260,8 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
                     SntLevelBin bins[2 * SNT_LEVEL_MAX_CAT + 4];
                     int nb = snt_level_bins(s_level[i], i == n - 1 && !any, bins);
                     for (int j = 0; j < nb; j++)
-                        rec(sink, snt_level_model(cs, t, 1 + start + i, &bins[j]), bins[j].bit);
+                        rec(sink, snt_level_model(cs, t, 1 + start + i, kcls[1 + start + i], &bins[j]),
+                            bins[j].bit);
                     any |= s_level[i] != 0;
                 }
             }
@@ -698,7 +709,8 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
  *   REC(dc[t], s2u(dc_level))       // DC of residual (inter) or pixels (intra)
  *   // Intra: the mode's coefficient prediction is subtracted first
  *   FOR band b=0..15:
- *     REC(band[t][b][nz], coded)      // nz: previous band (band 0: DC level) nonzero
+ *     REC(band[t][b][nz][pc], coded)  // nz: previous band (band 0: DC level) nonzero;
+ *                                     // pc: prediction class (inter, levels.h)
  *     IF coded: FOR i=0..n-1: the level's binary decisions (levels.h);
  *               the last level's Z decision is skipped if the others are 0
  * FOR each chroma plane (U, V):

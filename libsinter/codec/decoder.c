@@ -207,7 +207,8 @@ static void dec_pred_chroma(const uint8_t *rf, const uint8_t *rb, const uint8_t 
  *     IF inter_flag:
  *       DEC(iskip) → skip_flag
  *       IF skip: prediction with the global motion, continue (B: bi-directional)
- *       IF coded: [B: DEC(bdir)] [P, two or three references: dec_ref], then an MV
+ *       IF coded: [B: DEC(bdir); SNT_BDIR_DIRECT: MVs derived, no deltas]
+ *                 [P, two or three references: dec_ref], then an MV
  *                 delta per used direction
  *   IF intra block: DEC(imode[is_inter_frame]) → mode (SNT_IPRED_*, intra_acdc.h)
  *   DC level's decisions (DC models, context: the left and above blocks' DC
@@ -255,6 +256,17 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     int has_ref2 = has_ref1 && ctx->num_anchors >= 3 && sp_key.coef;
     const SntSplinePlane *ref_b = is_bidi ? &sp_new : (has_ref1 ? &sp_old : &sp_none);
     const SntSplinePlane *ref_2 = has_ref2 ? &sp_key : &sp_none;
+    /* B-frames' direct mode: the newest anchor's motion and the display
+     * distances (snt_direct_mvs); zero motion if the stream lacks it */
+    int trb = (int)(ctx->header.frame_number - ctx->anchor_old_num);
+    int trd = (int)(ctx->anchor_num - ctx->anchor_old_num);
+    int nblk = ((width + BLK - 1) / BLK) * ((height + BLK - 1) / BLK);
+    uint8_t *dctx_dir = (uint8_t *)calloc(nblk, 1);
+    SntMV *dctx_mv = (SntMV *)calloc(nblk, sizeof(SntMV));
+    if (is_bidi && ctx->anchor_dir) {
+        memcpy(dctx_dir, ctx->anchor_dir, nblk);
+        memcpy(dctx_mv, ctx->anchor_mv, sizeof(SntMV) * nblk);
+    }
     uint16_t step = snt_qp_to_step(ctx->header.base_qp);
 
     /* Fixed fields: chroma present, global motion against each reference
@@ -341,7 +353,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         /* Macroblock mode (inter frames, full macroblocks only). The 16x16
          * predictor comes from neighbours outside the macroblock. */
         int bx0 = (mb % mb_cols) * 2, by0 = (mb / mb_cols) * 2;
-        int mb_mode = SNT_MB_SPLIT, mb_dir = SNT_DIR_FWD, mac = 0;
+        int mb_mode = SNT_MB_SPLIT, mb_dir = SNT_DIR_FWD, mac = 0, mb_direct = 0;
         SntMV mb_mvf = {0, 0}, mb_mvb = {0, 0};
         if (is_inter && bx0 + 1 < blk_cols && by0 + 1 < blk_rows) {
             mb_mvf = snt_mv_predict_at(mv_field, blk_cols, bx0, by0);
@@ -367,14 +379,17 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 skip_motion(blk_dir, mv_field, mvb_field, blk_cols, bx0, by0, is_bidi,
                             gmf, gmb, &mb_dir, &mb_mvf, &mb_mvb);
             if (mb_mode == SNT_MB_INTER16) {
-                mb_dir = is_bidi ? DEC(cs->bdir) + 1 : SNT_DIR_FWD;
+                int bd = is_bidi ? DEC(cs->bdir) : 0;
+                /* Direct mode: each block's MVs derived, no MV deltas */
+                mb_direct = bd == SNT_BDIR_DIRECT;
+                mb_dir = is_bidi ? (mb_direct ? SNT_DIR_BI : bd + 1) : SNT_DIR_FWD;
                 if (has_ref1)
                     mb_dir |= dec_ref(&rdec, cs, has_ref2, bx0 > 0 ? blk_dir[by0 * blk_cols + bx0 - 1] : 0);
                 /* An unused direction's MV is zero (H.263 Annex O) */
                 if (!(mb_dir & SNT_DIR_FWD)) mb_mvf = (SntMV){0, 0};
                 if (!(mb_dir & SNT_DIR_BWD)) mb_mvb = (SntMV){0, 0};
-                if (mb_dir & SNT_DIR_FWD) dec_mvd(&rdec, cs, 1, mac, &mb_mvf);
-                if (mb_dir & SNT_DIR_BWD) dec_mvd(&rdec, cs, 1, mac, &mb_mvb);
+                if ((mb_dir & SNT_DIR_FWD) && !mb_direct) dec_mvd(&rdec, cs, 1, mac, &mb_mvf);
+                if ((mb_dir & SNT_DIR_BWD) && !mb_direct) dec_mvd(&rdec, cs, 1, mac, &mb_mvb);
             }
         }
         for (int z = 0; z < 4; z++) {
@@ -417,16 +432,16 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                             best_mv = snt_mv_predict_at(mv_field, blk_cols, bx, by);
                             if (is_bidi)
                                 best_mvb = snt_mv_predict_at(mvb_field, blk_cols, bx, by);
-                            if (is_bidi)
-                                dir = DEC(cs->bdir) + 1;
-                            else
-                                dir = SNT_DIR_FWD;
+                            int bd = is_bidi ? DEC(cs->bdir) : 0, direct = bd == SNT_BDIR_DIRECT;
+                            dir = is_bidi ? (direct ? SNT_DIR_BI : bd + 1) : SNT_DIR_FWD;
                             if (has_ref1)
                                 dir |= dec_ref(&rdec, cs, has_ref2, bx > 0 ? blk_dir[blk_idx - 1] : 0);
                             if (!(dir & SNT_DIR_FWD)) best_mv = (SntMV){0, 0};
                             if (!(dir & SNT_DIR_BWD)) best_mvb = (SntMV){0, 0};
-                            if (dir & SNT_DIR_FWD) dec_mvd(&rdec, cs, 0, ac, &best_mv);
-                            if (dir & SNT_DIR_BWD) dec_mvd(&rdec, cs, 0, ac, &best_mvb);
+                            if (direct)
+                                snt_direct_mvs(dctx_dir[blk_idx], dctx_mv[blk_idx], trb, trd, &best_mv, &best_mvb);
+                            if ((dir & SNT_DIR_FWD) && !direct) dec_mvd(&rdec, cs, 0, ac, &best_mv);
+                            if ((dir & SNT_DIR_BWD) && !direct) dec_mvd(&rdec, cs, 0, ac, &best_mvb);
                         }
                     }
                 } else {
@@ -436,6 +451,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     dir = mb_dir;
                     best_mv = mb_mvf;
                     best_mvb = mb_mvb;
+                    if (mb_direct)
+                        snt_direct_mvs(dctx_dir[blk_idx], dctx_mv[blk_idx], trb, trd, &best_mv, &best_mvb);
                 }
                 blk_is_inter[blk_idx] = block_is_inter;
                 blk_is_skip[blk_idx] = block_is_skip;
@@ -725,6 +742,14 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         }
         ctx->num_refs = 1;
         ctx->num_anchors = is_inter ? ctx->num_anchors + 1 : 1;
+        /* Its motion, for the next B-frames' direct mode */
+        free(ctx->anchor_mv); free(ctx->anchor_dir);
+        ctx->anchor_mv = (SntMV *)malloc(sizeof(SntMV) * blk_cols * blk_rows);
+        ctx->anchor_dir = (uint8_t *)malloc((size_t)blk_cols * blk_rows);
+        memcpy(ctx->anchor_mv, mv_field, sizeof(SntMV) * blk_cols * blk_rows);
+        memcpy(ctx->anchor_dir, blk_dir, (size_t)blk_cols * blk_rows);
+        ctx->anchor_old_num = ctx->anchor_num;
+        ctx->anchor_num = ctx->header.frame_number;
         /* A key frame is also kept as the GOP's long-term reference */
         if (!is_inter) {
             free(ctx->key_y); free(ctx->key_u); free(ctx->key_v); free(ctx->key_coef);
@@ -744,6 +769,8 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     free(luma_nz);
     free(dc_lev);
     free(mv_field);
+    free(dctx_dir);
+    free(dctx_mv);
     free(mvb_field);
     free(blk_dir);
     free(blk_is_inter);

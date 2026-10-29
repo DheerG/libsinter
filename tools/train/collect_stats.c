@@ -46,6 +46,7 @@ static void free_ctx(SntEncoderCtx *c) {
     free(c->last_y); free(c->last_u); free(c->last_v);
     free(c->ref_coef); free(c->ref_old_coef);
     free(c->key_y); free(c->key_u); free(c->key_v); free(c->key_coef);
+    free(c->anchor_mv); free(c->anchor_dir);
 }
 
 static void encode_clip(const char *path, int max_frames, int qp) {

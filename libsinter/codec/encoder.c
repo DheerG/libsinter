@@ -510,6 +510,11 @@ typedef struct {
     int            stride_uv, cw, ch;
     const uint8_t *cref_f[2], *cref_b[2], *cref_2[2];
     uint16_t       cstep;
+    /* B-frames' direct mode: the newest anchor's motion per block, and the
+     * display distances older anchor to B-frame and between the anchors */
+    const SntMV   *anchor_mv;
+    const uint8_t *anchor_dir;
+    int            trb, trd;
     /* Extra MV candidates for the blocks being decided (encoder decisions):
      * the macroblock's 16x16-searched MVs for its 8x8 blocks, the 8x8
      * blocks' MVs for the 16x16 candidate */
@@ -525,6 +530,7 @@ typedef struct {
     int   imode;      /* intra mode (CAND_INTRA) */
     int   dir;        /* SNT_DIR_* (CAND_INTER) */
     SntMV mvf, mvb;   /* MVs (zero for an unused direction) */
+    int   direct;     /* B-frame direct mode (CAND_INTER): MVs derived, not coded */
 } BlockChoice;
 
 /* Source block (0 outside the frame) and its in-frame size */
@@ -736,10 +742,17 @@ static inline int ref_ctx(const EncFrame *f, int bx, int by) {
  * the second one) */
 static inline int two_refs(const EncFrame *f) { return !f->is_bidi && f->ref_b; }
 
+/* Direct-mode MVs of B-frame block (bx, by) (snt_direct_mvs) */
+static void direct_mvs(const EncFrame *f, int bx, int by, SntMV *mvf, SntMV *mvb) {
+    int i = by * f->blk_cols + bx;
+    snt_direct_mvs(f->anchor_dir[i], f->anchor_mv[i], f->trb, f->trd, mvf, mvb);
+}
+
 /* Bits for an inter block's direction (B-frames) or reference (P-frames
  * with two; rctx: ref_ctx) and MV deltas */
 static double inter_mv_bits(const EncFrame *f, int size16, int ac, int rctx, int dir, SntMV mvf,
-                            SntMV mvb, SntMV pf, SntMV pb) {
+                            SntMV mvb, SntMV pf, SntMV pb, int direct) {
+    if (direct) return cdf_bits(&f->cs->bdir, SNT_BDIR_DIRECT);
     double b = f->is_bidi ? cdf_bits(&f->cs->bdir, (uint16_t)(dir - 1)) : 0;
     if (two_refs(f)) {
         b += cdf_bits(&f->cs->ref1[rctx > 0], (dir & (SNT_DIR_REF1 | SNT_DIR_REF2)) != 0);
@@ -815,8 +828,8 @@ static double chroma_cost(const EncFrame *f, int bx, int by, int kind, int dir,
  * direction d at (mvf, mvb), with its mode flags (agreement class ac) and
  * MV deltas; its reconstruction in rec, its DC level in *dc_level */
 static double inter8_cost(const EncFrame *f, int bx, int by, const int16_t *src, int vw, int vh,
-                          int ac, int d, SntMV mvf, SntMV mvb, SntMV pf, SntMV pb, int16_t *rec,
-                          int16_t *dc_level) {
+                          int ac, int d, SntMV mvf, SntMV mvb, SntMV pf, SntMV pb, int direct,
+                          int16_t *rec, int16_t *dc_level) {
     uint8_t p[64];
     int16_t res[64], td0[64] = {0};
     LumaCode lc;
@@ -827,13 +840,14 @@ static double inter8_cost(const EncFrame *f, int bx, int by, const int16_t *src,
     return block_sse(src, lc.recon, vw, vh) + chroma_cost(f, bx, by, CAND_INTER, d, mvf, mvb, lc.nz)
          + f->lambda * (cdf_bits(&f->cs->inter[flag_ctx(f, bx, by, ac)], 1)
                         + cdf_bits(&f->cs->iskip[flag_ctx(f, bx, by, ac)], 0)
-                        + inter_mv_bits(f, 0, ac, ref_ctx(f, bx, by), d, mvf, mvb, pf, pb) + lc.bits);
+                        + inter_mv_bits(f, 0, ac, ref_ctx(f, bx, by), d, mvf, mvb, pf, pb, direct)
+                        + lc.bits);
 }
 
 /* The same for the macroblock whose top-left block is (bx0, by0), coded
  * INTER16 (macroblock mode model by agreement class mac) */
 static double inter16_cost(const EncFrame *f, int bx0, int by0, int mac, int d, SntMV mvf,
-                           SntMV mvb, SntMV pf, SntMV pb) {
+                           SntMV mvb, SntMV pf, SntMV pb, int direct) {
     double dist = 0, bits = 0;
     int16_t dcl[4];  /* the blocks' DC levels */
     for (int z = 0; z < 4; z++) {
@@ -842,7 +856,9 @@ static double inter16_cost(const EncFrame *f, int bx0, int by0, int mac, int d, 
         uint8_t p[64];
         LumaCode lc;
         load_src(f, bx, by, src, &vw, &vh);
-        mc_residual(f, bx, by, d, mvf, mvb, 1, src, vw, vh, p, res);
+        SntMV bmf = mvf, bmb = mvb;
+        if (direct) direct_mvs(f, bx, by, &bmf, &bmb);
+        mc_residual(f, bx, by, d, bmf, bmb, 1, src, vw, vh, p, res);
         /* DC context, with the DC levels of this candidate's blocks inside
          * the macroblock */
         int i = by * f->blk_cols + bx;
@@ -851,11 +867,11 @@ static double inter16_cost(const EncFrame *f, int bx0, int by0, int mac, int d, 
         code_luma(f->cs, NULL, f->step, 1, snt_dc_context(left, above),
                   res, td0, 0, p, &lc);
         dcl[z] = lc.dc_level;
-        dist += block_sse(src, lc.recon, vw, vh) + chroma_cost(f, bx, by, CAND_INTER, d, mvf, mvb, lc.nz);
+        dist += block_sse(src, lc.recon, vw, vh) + chroma_cost(f, bx, by, CAND_INTER, d, bmf, bmb, lc.nz);
         bits += lc.bits;
     }
     return dist + f->lambda * (cdf_bits(&f->cs->mbmode[flag_ctx(f, bx0, by0, mac)], SNT_MB_INTER16) + bits
-                               + inter_mv_bits(f, 1, mac, ref_ctx(f, bx0, by0), d, mvf, mvb, pf, pb));
+                               + inter_mv_bits(f, 1, mac, ref_ctx(f, bx0, by0), d, mvf, mvb, pf, pb, direct));
 }
 
 /* Neighbour k (0-7) of mv at a quarter sample */
@@ -881,7 +897,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
     double best_j = 1e300;
     SntMV zero = {0, 0};
     bc->kind = CAND_INTRA; bc->imode = SNT_IPRED_DC; bc->dir = 0;
-    bc->mvf = zero; bc->mvb = zero;
+    bc->mvf = zero; bc->mvb = zero; bc->direct = 0;
 
     int ac = f->is_inter ? agree_class_block(f, bx, by) : 0;
     int fc = f->is_inter ? flag_ctx(f, bx, by, ac) : 0;
@@ -922,7 +938,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
             /* An unused direction's MV is zero (H.263 Annex O) */
             SntMV mvf = (d & SNT_DIR_FWD) ? cf[c] : zero;
             SntMV mvb = (d & SNT_DIR_BWD) ? cb[c] : zero;
-            j = inter8_cost(f, bx, by, src, vw, vh, ac, d, mvf, mvb, pf, pb, trec, &tdc);
+            j = inter8_cost(f, bx, by, src, vw, vh, ac, d, mvf, mvb, pf, pb, 0, trec, &tdc);
             mv_cand_best(d, j, mvf, mvb, jdir, cf, cb, ncand);
             if (j < ij) {
                 ij = j; id = d; imf = mvf; imb = mvb; idc = tdc;
@@ -941,7 +957,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
             for (int c = 0; c < n1; c++) {
                 if (mv_cand_dup(SNT_DIR_FWD, c1, cz, c)) continue;
                 int d = SNT_DIR_FWD | (r == 1 ? SNT_DIR_REF1 : SNT_DIR_REF2);
-                j = inter8_cost(f, bx, by, src, vw, vh, ac, d, c1[c], zero, pf, pb, trec, &tdc);
+                j = inter8_cost(f, bx, by, src, vw, vh, ac, d, c1[c], zero, pf, pb, 0, trec, &tdc);
                 if (j < ij) {
                     ij = j; id = d; imf = c1[c]; imb = zero; idc = tdc;
                     memcpy(irec, trec, sizeof(irec));
@@ -960,15 +976,27 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
             for (int k = 0; k < 8; k++) {
                 SntMV mvf = dirbit == SNT_DIR_FWD ? mv_neighbour(c0, k) : f0;
                 SntMV mvb = dirbit == SNT_DIR_BWD ? mv_neighbour(c0, k) : b0;
-                j = inter8_cost(f, bx, by, src, vw, vh, ac, id, mvf, mvb, pf, pb, trec, &tdc);
+                j = inter8_cost(f, bx, by, src, vw, vh, ac, id, mvf, mvb, pf, pb, 0, trec, &tdc);
                 if (j < ij) {
                     ij = j; imf = mvf; imb = mvb; idc = tdc;
                     memcpy(irec, trec, sizeof(irec));
                 }
             }
         }
+        /* B-frames: direct mode, MVs derived from the newest anchor's */
+        int idirect = 0;
+        if (f->is_bidi) {
+            SntMV df, db;
+            direct_mvs(f, bx, by, &df, &db);
+            j = inter8_cost(f, bx, by, src, vw, vh, ac, SNT_DIR_BI, df, db, pf, pb, 1, trec, &tdc);
+            if (j < ij) {
+                ij = j; id = SNT_DIR_BI; imf = df; imb = db; idc = tdc; idirect = 1;
+                memcpy(irec, trec, sizeof(irec));
+            }
+        }
         if (ij < best_j) {
             best_j = ij; bc->kind = CAND_INTER; bc->dir = id; bc->mvf = imf; bc->mvb = imb;
+            bc->direct = idirect;
             best_dc = idc;
             memcpy(best_rec, irec, sizeof(best_rec));
         }
@@ -1057,7 +1085,11 @@ static void emit_mvd(EncFrame *f, int size16, int ac, SntMV mv, SntMV mv_pred) {
 
 /* Emit an inter block's direction (B-frames) and MV deltas */
 static void emit_inter_mvs(EncFrame *f, int size16, int ac, int rctx, int dir, SntMV mvf,
-                           SntMV mvb, SntMV pf, SntMV pb) {
+                           SntMV mvb, SntMV pf, SntMV pb, int direct) {
+    if (direct) {
+        rec(f->sink, &f->cs->bdir, SNT_BDIR_DIRECT);
+        return;
+    }
     if (f->is_bidi)
         rec(f->sink, &f->cs->bdir, (uint16_t)(dir - 1));
     if (two_refs(f)) {
@@ -1092,7 +1124,7 @@ static void emit_block(EncFrame *f, int bx, int by, const BlockChoice *bc) {
                 SntMV zero = {0, 0};
                 SntMV mvf = (bc->dir & SNT_DIR_FWD) ? bc->mvf : zero;
                 SntMV mvb = (bc->dir & SNT_DIR_BWD) ? bc->mvb : zero;
-                emit_inter_mvs(f, 0, ac, ref_ctx(f, bx, by), bc->dir, mvf, mvb, pf, pb);
+                emit_inter_mvs(f, 0, ac, ref_ctx(f, bx, by), bc->dir, mvf, mvb, pf, pb, bc->direct);
                 emit_inter_body(f, bx, by, bc->dir, mvf, mvb, 0);
             }
             return;
@@ -1116,6 +1148,7 @@ static void emit_block(EncFrame *f, int bx, int by, const BlockChoice *bc) {
 typedef struct {
     int   dir;
     SntMV mvf, mvb;
+    int   direct;     /* direct mode: each 8x8 block's MVs derived (direct_mvs) */
     double j;
 } Mb16Choice;
 
@@ -1145,6 +1178,7 @@ static double eval_mb16(EncFrame *f, int bx0, int by0, SntMV pf, SntMV pb, SntMV
 
     /* At the searched MVs and the other candidates */
     best->j = 1e300;
+    best->direct = 0;
     SntMV cf[MAX_MV_CAND + 1], cb[MAX_MV_CAND + 1];
     int ncand = mv_candidates(f, bx0, by0, 2, qf, qb, pf, pb, cf, cb);
     double jdir[2] = {1e300, 1e300};
@@ -1154,7 +1188,7 @@ static double eval_mb16(EncFrame *f, int bx0, int by0, SntMV pf, SntMV pb, SntMV
         if (mv_cand_dup(d, cf, cb, c)) continue;
         SntMV mvf = (d & SNT_DIR_FWD) ? cf[c] : zero;
         SntMV mvb = (d & SNT_DIR_BWD) ? cb[c] : zero;
-        double j = inter16_cost(f, bx0, by0, mac, d, mvf, mvb, pf, pb);
+        double j = inter16_cost(f, bx0, by0, mac, d, mvf, mvb, pf, pb, 0);
         mv_cand_best(d, j, mvf, mvb, jdir, cf, cb, ncand);
         if (j < best->j) {
             best->j = j; best->dir = d; best->mvf = mvf; best->mvb = mvb;
@@ -1169,7 +1203,7 @@ static double eval_mb16(EncFrame *f, int bx0, int by0, SntMV pf, SntMV pb, SntMV
         for (int c = 0; c < n1; c++) {
             if (mv_cand_dup(SNT_DIR_FWD, c1, cz, c)) continue;
             int d = SNT_DIR_FWD | (r == 1 ? SNT_DIR_REF1 : SNT_DIR_REF2);
-            double j = inter16_cost(f, bx0, by0, mac, d, c1[c], zero, pf, pb);
+            double j = inter16_cost(f, bx0, by0, mac, d, c1[c], zero, pf, pb, 0);
             if (j < best->j) { best->j = j; best->dir = d; best->mvf = c1[c]; best->mvb = zero; }
         }
     }
@@ -1181,8 +1215,16 @@ static double eval_mb16(EncFrame *f, int bx0, int by0, SntMV pf, SntMV pb, SntMV
         for (int k = 0; k < 8; k++) {
             SntMV mvf = dirbit == SNT_DIR_FWD ? mv_neighbour(c0, k) : f0;
             SntMV mvb = dirbit == SNT_DIR_BWD ? mv_neighbour(c0, k) : b0;
-            double j = inter16_cost(f, bx0, by0, mac, best->dir, mvf, mvb, pf, pb);
+            double j = inter16_cost(f, bx0, by0, mac, best->dir, mvf, mvb, pf, pb, 0);
             if (j < best->j) { best->j = j; best->mvf = mvf; best->mvb = mvb; }
+        }
+    }
+
+    /* B-frames: direct mode, each block's MVs derived from the anchor's */
+    if (f->is_bidi) {
+        double j = inter16_cost(f, bx0, by0, mac, SNT_DIR_BI, zero, zero, pf, pb, 1);
+        if (j < best->j) {
+            best->j = j; best->dir = SNT_DIR_BI; best->mvf = zero; best->mvb = zero; best->direct = 1;
         }
     }
     return d_skip + f->lambda * cdf_bits(&cs->mbmode[flag_ctx(f, bx0, by0, mac)], SNT_MB_SKIP16);
@@ -1242,9 +1284,13 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
         for (int z = 0; z < 4; z++)
             emit_inter_body(f, bx0 + (z & 1), by0 + (z >> 1), sdir, smf, smb, 1);
     } else {
-        emit_inter_mvs(f, 1, mac, ref_ctx(f, bx0, by0), m16.dir, m16.mvf, m16.mvb, pf, pb);
-        for (int z = 0; z < 4; z++)
-            emit_inter_body(f, bx0 + (z & 1), by0 + (z >> 1), m16.dir, m16.mvf, m16.mvb, 0);
+        emit_inter_mvs(f, 1, mac, ref_ctx(f, bx0, by0), m16.dir, m16.mvf, m16.mvb, pf, pb, m16.direct);
+        for (int z = 0; z < 4; z++) {
+            int bx = bx0 + (z & 1), by = by0 + (z >> 1);
+            SntMV mvf = m16.mvf, mvb = m16.mvb;
+            if (m16.direct) direct_mvs(f, bx, by, &mvf, &mvb);
+            emit_inter_body(f, bx, by, m16.dir, mvf, mvb, 0);
+        }
     }
 }
 
@@ -1270,7 +1316,8 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
  *       IF skip: (no more symbols; prediction with the global motion,
  *                 bi-directional in B-frames)
  *       IF coded:
- *         [B-frame: REC(bdir, dir - 1)]
+ *         [B-frame: REC(bdir, dir - 1 or SNT_BDIR_DIRECT); direct: MVs derived
+ *          (snt_direct_mvs), no MV deltas]
  *         [P-frame with two or three references: REC(ref1[left block's ref > 0],
  *          ref > 0), then with three, if ref > 0: REC(ref2[left block's ref == 2], ref == 2)]
  *         FOR each used direction (forward, then backward):
@@ -1450,6 +1497,8 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     { c_decide ? input_u : NULL, c_decide ? input_v : NULL }, stride_uv, cw, ch,
                     { chroma_ref[0], chroma_ref[1] }, { chroma_ref_b[0], chroma_ref_b[1] },
                     { chroma_ref_2[0], chroma_ref_2[1] }, cstep,
+                    ctx->anchor_mv, ctx->anchor_dir,
+                    (int)(fhdr.frame_number - ctx->anchor_old_num), (int)(ctx->anchor_num - ctx->anchor_old_num),
                     {{0, 0}}, {{0, 0}}, 0 };
     int mb_cols = (blk_cols + 1) / 2, mb_rows = (blk_rows + 1) / 2;
     for (int mb = 0; mb < mb_cols * mb_rows; mb++)
@@ -1665,6 +1714,15 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         ctx->ref_h = height;
         ctx->num_refs = 1;
         ctx->num_anchors = is_inter ? ctx->num_anchors + 1 : 1;
+        /* Its motion, for the next B-frames' direct mode (intra in key
+         * frames) */
+        free(ctx->anchor_mv); free(ctx->anchor_dir);
+        ctx->anchor_mv = (SntMV *)malloc(sizeof(SntMV) * total_blocks);
+        ctx->anchor_dir = (uint8_t *)malloc(total_blocks);
+        memcpy(ctx->anchor_mv, mv_field, sizeof(SntMV) * total_blocks);
+        memcpy(ctx->anchor_dir, blk_dir, total_blocks);
+        ctx->anchor_old_num = ctx->anchor_num;
+        ctx->anchor_num = fhdr.frame_number;
         /* A key frame is also kept as the GOP's long-term reference */
         if (!is_inter) {
             free(ctx->key_y); free(ctx->key_u); free(ctx->key_v); free(ctx->key_coef);

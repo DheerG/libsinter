@@ -35,7 +35,6 @@ DECODER_SRC="
   $SRCDIR/core/prediction/mc.c
   $SRCDIR/core/prediction/spline.c
   $SRCDIR/core/filter/deblock.c
-  $SRCDIR/core/prediction/intra_spatial.c
   $SRCDIR/core/partition/quadtree.c
   $SRCDIR/core/grain/grain_synth.c
   $SRCDIR/core/tile/tile.c

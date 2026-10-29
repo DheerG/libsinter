@@ -1,14 +1,15 @@
 /*
- * Sinter Codec — rANS Entropy Coder Tests (Gate 1)
+ * Sinter Codec — Range coder tests
  *
- * Tests: CDF operations, encode/decode round-trip, dual interleaved mode,
- * adaptation, adversarial distributions.
+ * Tests: model initialization and halving, encode/decode round trips
+ * (uniform, skewed, many interleaved models, long random runs that force
+ * carries), trailing-zero trimming, determinism.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "core/entropy/rans.h"
+#include "core/entropy/rangecoder.h"
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -22,382 +23,170 @@ static int tests_passed = 0;
     } \
 } while (0)
 
-/* ── Test: CDF initialization ─────────────────────────────────────── */
-static int test_cdf_init(void) {
-    RansCDF cdf;
-    rans_cdf_init_uniform(&cdf, 4, RANS_ADAPT_RATE_COEFF);
+/* Deterministic pseudo-random numbers (LCG) */
+static uint32_t rng_state = 1;
+static uint32_t rng(void) {
+    rng_state = rng_state * 1103515245u + 12345u;
+    return rng_state >> 8;
+}
 
-    /* Should be uniform: each symbol gets 32768/4 = 8192 */
-    if (cdf.cdf[0] != 0) { printf("  FAIL: cdf[0]=%d\n", cdf.cdf[0]); return 0; }
-    if (cdf.cdf[4] != RANS_PROB_TOTAL) {
-        printf("  FAIL: cdf[4]=%d\n", cdf.cdf[4]); return 0;
+/* Encode n symbols with one model per context ctx[i] (or model 0 when
+ * ctx is NULL), decode them, and compare. Returns the byte count, or -1
+ * on a mismatch. */
+static int roundtrip(const int *syms, const int *ctx, int n, int nsym, int nctx,
+                     int inc, uint32_t limit) {
+    SntModel *em = malloc(sizeof(SntModel) * nctx), *dm = malloc(sizeof(SntModel) * nctx);
+    for (int c = 0; c < nctx; c++) {
+        snt_model_init(&em[c], nsym, 1, inc, limit);
+        snt_model_init(&dm[c], nsym, 1, inc, limit);
     }
+    uint32_t cap = (uint32_t)n * 2 + 64;
+    uint8_t *buf = malloc(cap);
+    SntRangeEnc e;
+    snt_rc_enc_init(&e, buf, cap);
+    for (int i = 0; i < n; i++)
+        snt_rc_encode_sym(&e, &em[ctx ? ctx[i] : 0], syms[i]);
+    uint32_t len = snt_rc_enc_finish(&e);
 
-    /* All frequencies should be equal */
-    for (int i = 0; i < 4; i++) {
-        uint16_t freq = cdf.cdf[i + 1] - cdf.cdf[i];
-        if (freq != 8192) {
-            printf("  FAIL: freq[%d]=%d, expected 8192\n", i, freq);
-            return 0;
+    SntRangeDec d;
+    snt_rc_dec_init(&d, buf, len);
+    int ok = 1;
+    for (int i = 0; i < n && ok; i++) {
+        int s = snt_rc_decode_sym(&d, &dm[ctx ? ctx[i] : 0]);
+        if (s != syms[i]) {
+            printf("  FAIL: symbol %d decoded as %d, expected %d\n", i, s, syms[i]);
+            ok = 0;
         }
+    }
+    free(em); free(dm); free(buf);
+    return ok ? (int)len : -1;
+}
+
+/* ── Test: model initialization ───────────────────────────────────── */
+static int test_model_init(void) {
+    SntModel m;
+    snt_model_init(&m, 4, 1, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
+    if (m.total != 4) { printf("  FAIL: total=%u\n", m.total); return 0; }
+    for (int i = 0; i < 4; i++)
+        if (m.freq[i] != 1) { printf("  FAIL: freq[%d]=%d\n", i, m.freq[i]); return 0; }
+    if (snt_model_cum(&m, 3) != 3) { printf("  FAIL: cum(3)\n"); return 0; }
+    return 1;
+}
+
+/* ── Test: halving keeps counts positive and the total within limit ── */
+static int test_model_halving(void) {
+    SntModel m;
+    snt_model_init(&m, 256, 1, 24, 8192);
+    for (int i = 0; i < 5000; i++) {
+        snt_model_update(&m, i % 3 == 0 ? 7 : 0);
+        if (m.total > 8192) { printf("  FAIL: total %u over limit\n", m.total); return 0; }
+    }
+    uint32_t sum = 0;
+    for (int i = 0; i < 256; i++) {
+        if (m.freq[i] == 0) { printf("  FAIL: freq[%d] = 0\n", i); return 0; }
+        sum += m.freq[i];
+    }
+    if (sum != m.total) { printf("  FAIL: sum %u != total %u\n", sum, m.total); return 0; }
+    if (m.freq[0] <= m.freq[7] || m.freq[7] <= m.freq[1]) {
+        printf("  FAIL: counts do not follow the statistics\n"); return 0;
     }
     return 1;
 }
 
-/* ── Test: CDF lookup ─────────────────────────────────────────────── */
-static int test_cdf_lookup(void) {
-    RansCDF cdf;
-    rans_cdf_init_uniform(&cdf, 4, RANS_ADAPT_RATE_COEFF);
-
-    /* Cumulative 0 -> symbol 0, 8192 -> symbol 1, etc. */
-    if (rans_cdf_lookup(&cdf, 0) != 0) { printf("  FAIL: lookup(0)\n"); return 0; }
-    if (rans_cdf_lookup(&cdf, 8191) != 0) { printf("  FAIL: lookup(8191)\n"); return 0; }
-    if (rans_cdf_lookup(&cdf, 8192) != 1) { printf("  FAIL: lookup(8192)\n"); return 0; }
-    if (rans_cdf_lookup(&cdf, 32767) != 3) { printf("  FAIL: lookup(32767)\n"); return 0; }
+/* ── Test: uniform round trip ─────────────────────────────────────── */
+static int test_rc_uniform(void) {
+    int syms[4000];
+    for (int i = 0; i < 4000; i++) syms[i] = (int)(rng() % 16);
+    int len = roundtrip(syms, NULL, 4000, 16, 1, 24, 8192);
+    if (len < 0) return 0;
+    /* 4 bits per symbol: about 2000 bytes */
+    if (len < 1900 || len > 2100) { printf("  FAIL: %d bytes for 2000 expected\n", len); return 0; }
     return 1;
 }
 
-/* ── Test: single-state rANS round-trip ───────────────────────────── */
-static int test_rans_single_roundtrip(void) {
-    RansCDF cdf;
-    rans_cdf_init_uniform(&cdf, 4, RANS_ADAPT_RATE_COEFF);
-
-    /* Encode 8 symbols */
-    uint16_t symbols[] = {0, 1, 2, 3, 3, 2, 1, 0};
-    int nsym = 8;
-
-    uint16_t rev_buf[256];
-    RansEncoder enc;
-    rans_enc_init(&enc, rev_buf, 256, 0); /* single state */
-
-    /* CRITICAL: encode in REVERSE order (LIFO) */
-    for (int i = nsym - 1; i >= 0; i--) {
-        uint16_t cdf_lo, freq;
-        rans_cdf_symbol_range(&cdf, symbols[i], &cdf_lo, &freq);
-        rans_enc_put(&enc, cdf_lo, freq, (uint32_t)i);
+/* ── Test: skewed source compresses well ──────────────────────────── */
+static int test_rc_skewed(void) {
+    int syms[20000];
+    for (int i = 0; i < 20000; i++) {
+        uint32_t r = rng() % 1000;
+        syms[i] = r < 900 ? 0 : (r < 980 ? 1 : (int)(2 + r % 254));
     }
-    rans_enc_flush(&enc);
+    int len = roundtrip(syms, NULL, 20000, 256, 1, 24, 8192);
+    if (len < 0) return 0;
+    /* Entropy about 0.75 bits/symbol: well under 1 bit */
+    if (len > 20000 / 8) { printf("  FAIL: %d bytes, not compressed\n", len); return 0; }
+    printf("  (%d bytes for 20000 symbols)\n", len);
+    return 1;
+}
 
-    /* Get encoded data */
-    uint32_t enc_len;
-    const uint16_t *enc_data = rans_enc_data(&enc, &enc_len);
-
-    /* Convert to byte stream for decoder */
-    uint8_t byte_buf[512];
-    for (uint32_t i = 0; i < enc_len; i++) {
-        byte_buf[2 * i]     = (uint8_t)(enc_data[i] & 0xFF);
-        byte_buf[2 * i + 1] = (uint8_t)(enc_data[i] >> 8);
+/* ── Test: many interleaved models (as the codec's contexts) ──────── */
+static int test_rc_contexts(void) {
+    enum { N = 30000 };
+    static int syms[N], ctx[N];
+    for (int i = 0; i < N; i++) {
+        ctx[i] = (int)(rng() % 5);
+        syms[i] = ctx[i] == 0 ? (int)(rng() % 2) : (int)((rng() % 3) * ctx[i]);
     }
+    return roundtrip(syms, ctx, N, 256, 5, 24, 2048) >= 0;
+}
 
-    /* Decode in FORWARD order */
-    RansDecoder dec;
-    rans_dec_init(&dec, byte_buf, enc_len * 2, 0);
-
-    /* Reset CDF for decode (must match encoder's initial state) */
-    RansCDF cdf_dec;
-    rans_cdf_init_uniform(&cdf_dec, 4, RANS_ADAPT_RATE_COEFF);
-
-    for (int i = 0; i < nsym; i++) {
-        uint16_t sym = rans_dec_symbol(&dec, &cdf_dec);
-        if (sym != symbols[i]) {
-            printf("  FAIL: symbol %d: decoded %d, expected %d\n", i, sym, symbols[i]);
-            return 0;
-        }
+/* ── Test: long runs of near-certain symbols force carries ────────── */
+static int test_rc_carries(void) {
+    enum { N = 200000 };
+    static int syms[N];
+    for (int t = 0; t < 8; t++) {
+        for (int i = 0; i < N; i++)
+            syms[i] = (rng() % 4096) == 0 ? (int)(1 + rng() % 255) : 255 * (t & 1);
+        if (roundtrip(syms, NULL, N, 256, 1, 32, 65000) < 0) return 0;
     }
     return 1;
 }
 
-/* ── Test: dual interleaved rANS round-trip ───────────────────────── */
-static int test_rans_dual_roundtrip(void) {
-    RansCDF cdf;
-    rans_cdf_init_uniform(&cdf, 8, RANS_ADAPT_RATE_COEFF);
-
-    uint16_t symbols[] = {0, 7, 3, 5, 2, 6, 1, 4, 0, 7, 3, 5};
-    int nsym = 12;
-
-    uint16_t rev_buf[256];
-    RansEncoder enc;
-    rans_enc_init(&enc, rev_buf, 256, 1); /* dual interleaved */
-
-    for (int i = nsym - 1; i >= 0; i--) {
-        uint16_t cdf_lo, freq;
-        rans_cdf_symbol_range(&cdf, symbols[i], &cdf_lo, &freq);
-        rans_enc_put(&enc, cdf_lo, freq, (uint32_t)i);
-    }
-    rans_enc_flush(&enc);
-
-    uint32_t enc_len;
-    const uint16_t *enc_data = rans_enc_data(&enc, &enc_len);
-
-    uint8_t byte_buf[512];
-    for (uint32_t i = 0; i < enc_len; i++) {
-        byte_buf[2 * i]     = (uint8_t)(enc_data[i] & 0xFF);
-        byte_buf[2 * i + 1] = (uint8_t)(enc_data[i] >> 8);
-    }
-
-    RansDecoder dec;
-    rans_dec_init(&dec, byte_buf, enc_len * 2, 1);
-
-    RansCDF cdf_dec;
-    rans_cdf_init_uniform(&cdf_dec, 8, RANS_ADAPT_RATE_COEFF);
-
-    for (int i = 0; i < nsym; i++) {
-        uint16_t sym = rans_dec_symbol(&dec, &cdf_dec);
-        if (sym != symbols[i]) {
-            printf("  FAIL: symbol %d: decoded %d, expected %d\n", i, sym, symbols[i]);
-            return 0;
-        }
-    }
-    return 1;
+/* ── Test: a stream that ends in likely symbols drops zero bytes ──── */
+static int test_rc_trailing(void) {
+    int syms[3] = {0, 0, 0};
+    int len = roundtrip(syms, NULL, 3, 2, 1, 24, 2048);
+    if (len < 0) return 0;
+    if (len > 1) { printf("  FAIL: %d bytes for 3 likely symbols\n", len); return 0; }
+    int one[1] = {1};
+    return roundtrip(one, NULL, 1, 256, 1, 24, 2048) >= 0 &&
+           roundtrip(one, NULL, 0, 256, 1, 24, 2048) == 0;
 }
 
-/* ── Test: rANS with adaptive CDF ─────────────────────────────────── */
-static int test_rans_adaptive(void) {
-    uint16_t symbols[] = {0, 0, 0, 1, 0, 0, 2, 0, 0, 0, 1, 0, 3, 0, 0, 0};
-    int nsym = 16;
-
-    /* Encode with adaptation */
-    RansCDF cdf_enc;
-    rans_cdf_init_uniform(&cdf_enc, 4, RANS_ADAPT_RATE_COEFF);
-
-    uint16_t rev_buf[512];
-    RansEncoder enc;
-    rans_enc_init(&enc, rev_buf, 512, 0);
-
-    /* Record CDF states and encode in reverse */
-    uint16_t cdf_lo_arr[16], freq_arr[16];
-    RansCDF cdf_states[16]; /* save CDF before each symbol */
-
-    /* First pass: compute CDF state for each symbol (forward order) */
-    {
-        RansCDF cdf_tmp;
-        rans_cdf_init_uniform(&cdf_tmp, 4, RANS_ADAPT_RATE_COEFF);
-        for (int i = 0; i < nsym; i++) {
-            memcpy(&cdf_states[i], &cdf_tmp, sizeof(RansCDF));
-            rans_cdf_symbol_range(&cdf_tmp, symbols[i], &cdf_lo_arr[i], &freq_arr[i]);
-            rans_cdf_adapt(&cdf_tmp, symbols[i]);
-        }
-    }
-
-    /* Encode in reverse using saved CDF states */
-    for (int i = nsym - 1; i >= 0; i--) {
-        rans_enc_put(&enc, cdf_lo_arr[i], freq_arr[i], (uint32_t)i);
-    }
-    rans_enc_flush(&enc);
-
-    uint32_t enc_len;
-    const uint16_t *enc_data = rans_enc_data(&enc, &enc_len);
-
-    uint8_t byte_buf[1024];
-    for (uint32_t i = 0; i < enc_len; i++) {
-        byte_buf[2 * i]     = (uint8_t)(enc_data[i] & 0xFF);
-        byte_buf[2 * i + 1] = (uint8_t)(enc_data[i] >> 8);
-    }
-
-    /* Decode with adaptation (forward order) */
-    RansDecoder dec;
-    rans_dec_init(&dec, byte_buf, enc_len * 2, 0);
-
-    RansCDF cdf_dec;
-    rans_cdf_init_uniform(&cdf_dec, 4, RANS_ADAPT_RATE_COEFF);
-
-    for (int i = 0; i < nsym; i++) {
-        uint16_t sym = rans_dec_symbol(&dec, &cdf_dec);
-        rans_cdf_adapt(&cdf_dec, sym);
-        if (sym != symbols[i]) {
-            printf("  FAIL: symbol %d: decoded %d, expected %d\n", i, sym, symbols[i]);
-            return 0;
-        }
-    }
-    return 1;
-}
-
-/* ── Test: adversarial distribution (one symbol nearly certain) ──── */
-static int test_rans_skewed(void) {
-    RansCDF cdf;
-    rans_cdf_init_uniform(&cdf, 4, RANS_ADAPT_RATE_COEFF);
-
-    /* Heavily adapt toward symbol 0 */
-    for (int i = 0; i < 200; i++)
-        rans_cdf_adapt(&cdf, 0);
-
-    /* Verify symbol 0 has high probability but all symbols still encodable */
-    uint16_t cdf_lo, freq;
-    rans_cdf_symbol_range(&cdf, 0, &cdf_lo, &freq);
-    if (freq < RANS_PROB_TOTAL / 2) {
-        printf("  FAIL: symbol 0 should dominate after adaptation, freq=%d\n", freq);
-        return 0;
-    }
-
-    /* All symbols should still have freq >= 1 */
-    for (int i = 0; i < 4; i++) {
-        rans_cdf_symbol_range(&cdf, (uint16_t)i, &cdf_lo, &freq);
-        if (freq == 0) {
-            printf("  FAIL: symbol %d has zero frequency\n", i);
-            return 0;
-        }
-    }
-
-    /* Encode and decode a mixed sequence with skewed CDF */
-    uint16_t symbols[] = {0, 0, 0, 0, 1, 0, 0, 2, 0, 3};
-    int nsym = 10;
-
-    uint16_t rev_buf[256];
-    RansEncoder enc;
-    rans_enc_init(&enc, rev_buf, 256, 0);
-
-    for (int i = nsym - 1; i >= 0; i--) {
-        rans_cdf_symbol_range(&cdf, symbols[i], &cdf_lo, &freq);
-        rans_enc_put(&enc, cdf_lo, freq, (uint32_t)i);
-    }
-    rans_enc_flush(&enc);
-
-    uint32_t enc_len;
-    const uint16_t *enc_data = rans_enc_data(&enc, &enc_len);
-
-    uint8_t byte_buf[512];
-    for (uint32_t i = 0; i < enc_len; i++) {
-        byte_buf[2 * i]     = (uint8_t)(enc_data[i] & 0xFF);
-        byte_buf[2 * i + 1] = (uint8_t)(enc_data[i] >> 8);
-    }
-
-    RansDecoder dec;
-    rans_dec_init(&dec, byte_buf, enc_len * 2, 0);
-
-    for (int i = 0; i < nsym; i++) {
-        uint16_t cum = rans_dec_get(&dec);
-        uint16_t sym = rans_cdf_lookup(&cdf, cum);
-        rans_cdf_symbol_range(&cdf, sym, &cdf_lo, &freq);
-        rans_dec_advance(&dec, cdf_lo, freq);
-        if (sym != symbols[i]) {
-            printf("  FAIL: symbol %d: decoded %d, expected %d\n", i, sym, symbols[i]);
-            return 0;
-        }
-    }
-    return 1;
-}
-
-/* ── Test: random symbols round-trip (stress test) ────────────────── */
-static int test_rans_random(void) {
-    srand(42424);
-    int num_symbols = 16;
-    int nsym = 200;
-
-    RansCDF cdf;
-    rans_cdf_init_uniform(&cdf, (uint16_t)num_symbols, RANS_ADAPT_RATE_COEFF);
-
-    uint16_t symbols[200];
-    for (int i = 0; i < nsym; i++)
-        symbols[i] = (uint16_t)(rand() % num_symbols);
-
-    uint16_t rev_buf[2048];
-    RansEncoder enc;
-    rans_enc_init(&enc, rev_buf, 2048, 1); /* dual */
-
-    for (int i = nsym - 1; i >= 0; i--) {
-        uint16_t cdf_lo, freq;
-        rans_cdf_symbol_range(&cdf, symbols[i], &cdf_lo, &freq);
-        rans_enc_put(&enc, cdf_lo, freq, (uint32_t)i);
-    }
-    rans_enc_flush(&enc);
-
-    uint32_t enc_len;
-    const uint16_t *enc_data = rans_enc_data(&enc, &enc_len);
-
-    uint8_t byte_buf[4096];
-    for (uint32_t i = 0; i < enc_len; i++) {
-        byte_buf[2 * i]     = (uint8_t)(enc_data[i] & 0xFF);
-        byte_buf[2 * i + 1] = (uint8_t)(enc_data[i] >> 8);
-    }
-
-    RansDecoder dec;
-    rans_dec_init(&dec, byte_buf, enc_len * 2, 1);
-
-    /* Must use same CDF as encoder */
-    RansCDF cdf_dec;
-    rans_cdf_init_uniform(&cdf_dec, (uint16_t)num_symbols, RANS_ADAPT_RATE_COEFF);
-
-    for (int i = 0; i < nsym; i++) {
-        uint16_t sym = rans_dec_symbol(&dec, &cdf_dec);
-        if (sym != symbols[i]) {
-            printf("  FAIL: random symbol %d: decoded %d, expected %d\n",
-                   i, sym, symbols[i]);
-            return 0;
-        }
-    }
-
-    printf("  (encoded %d symbols in %u 16-bit words = %.2f bits/symbol)\n",
-           nsym, enc_len, (float)(enc_len * 16) / nsym);
-    return 1;
-}
-
-/* ── Test: bitstream determinism ──────────────────────────────────── */
-static int test_rans_determinism(void) {
-    srand(99999);
-    uint16_t symbols[50];
-    for (int i = 0; i < 50; i++)
-        symbols[i] = (uint16_t)(rand() % 8);
-
-    RansCDF cdf;
-    rans_cdf_init_uniform(&cdf, 8, RANS_ADAPT_RATE_MODE);
-
-    /* Encode twice */
-    uint16_t rev1[256], rev2[256];
-    uint32_t len1, len2;
-
+/* ── Test: identical input gives identical bytes ──────────────────── */
+static int test_rc_determinism(void) {
+    uint8_t a[4096], b[4096];
+    uint32_t la = 0, lb = 0;
     for (int pass = 0; pass < 2; pass++) {
-        uint16_t *rev = (pass == 0) ? rev1 : rev2;
-        RansEncoder enc;
-        rans_enc_init(&enc, rev, 256, 0);
-
-        for (int i = 49; i >= 0; i--) {
-            uint16_t cdf_lo, freq;
-            rans_cdf_symbol_range(&cdf, symbols[i], &cdf_lo, &freq);
-            rans_enc_put(&enc, cdf_lo, freq, (uint32_t)i);
-        }
-        rans_enc_flush(&enc);
-
-        uint32_t len;
-        rans_enc_data(&enc, &len);
-        if (pass == 0) len1 = len; else len2 = len;
+        SntModel m;
+        snt_model_init(&m, 256, 1, 24, 8192);
+        SntRangeEnc e;
+        snt_rc_enc_init(&e, pass ? b : a, 4096);
+        rng_state = 99;
+        for (int i = 0; i < 3000; i++)
+            snt_rc_encode_sym(&e, &m, (int)(rng() % 7));
+        *(pass ? &lb : &la) = snt_rc_enc_finish(&e);
     }
-
-    if (len1 != len2) {
-        printf("  FAIL: different lengths: %u vs %u\n", len1, len2);
-        return 0;
-    }
-
-    /* Compare the actual data regions */
-    uint32_t off1 = 256 - len1;
-    uint32_t off2 = 256 - len2;
-    if (memcmp(&rev1[off1], &rev2[off2], len1 * sizeof(uint16_t)) != 0) {
-        printf("  FAIL: bitstreams differ\n");
-        return 0;
-    }
-
+    if (la != lb || memcmp(a, b, la)) { printf("  FAIL: outputs differ\n"); return 0; }
     return 1;
 }
 
 int main(void) {
-    printf("=== Sinter rANS Entropy Tests ===\n\n");
+    printf("=== Sinter Range Coder Tests ===\n\n");
 
-    printf("--- CDF Operations ---\n");
-    RUN_TEST(test_cdf_init);
-    RUN_TEST(test_cdf_lookup);
+    printf("--- Models ---\n");
+    RUN_TEST(test_model_init);
+    RUN_TEST(test_model_halving);
 
-    printf("\n--- Single-State rANS ---\n");
-    RUN_TEST(test_rans_single_roundtrip);
-
-    printf("\n--- Dual Interleaved rANS ---\n");
-    RUN_TEST(test_rans_dual_roundtrip);
-
-    printf("\n--- Adaptive Coding ---\n");
-    RUN_TEST(test_rans_adaptive);
-    RUN_TEST(test_rans_skewed);
+    printf("\n--- Round Trips ---\n");
+    RUN_TEST(test_rc_uniform);
+    RUN_TEST(test_rc_skewed);
+    RUN_TEST(test_rc_contexts);
 
     printf("\n--- Stress Tests ---\n");
-    RUN_TEST(test_rans_random);
-    RUN_TEST(test_rans_determinism);
+    RUN_TEST(test_rc_carries);
+    RUN_TEST(test_rc_trailing);
+    RUN_TEST(test_rc_determinism);
 
     printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

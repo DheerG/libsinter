@@ -27,7 +27,7 @@ DECODER_SRC="
   $SRCDIR/core/transform/dct.c
   $SRCDIR/core/quantize/pvq.c
   $SRCDIR/core/quantize/qp_table.c
-  $SRCDIR/core/entropy/rans.c
+  $SRCDIR/core/entropy/rangecoder.c
   $SRCDIR/core/bitstream/bitstream.c
   $SRCDIR/core/prediction/intra.c
   $SRCDIR/core/prediction/obmc.c

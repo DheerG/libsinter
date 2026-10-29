@@ -14,7 +14,7 @@
  *
  * .sntr container format:
  *   [4] magic "SNTR"
- *   [4] version (3)
+ *   [4] version (4)
  *   [4] width
  *   [4] height
  *   [4] num_frames
@@ -156,7 +156,7 @@ int main(int argc, char **argv) {
     /* Write container header (placeholder num_frames, updated at end) */
     long header_pos = 0;
     fwrite("SNTR", 1, 4, fout);
-    write32(fout, 3); /* version */
+    write32(fout, 4); /* version */
     write32(fout, (uint32_t)width);
     write32(fout, (uint32_t)height);
     header_pos = ftell(fout);

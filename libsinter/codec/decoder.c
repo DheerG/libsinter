@@ -36,13 +36,13 @@ static int16_t dec_mvd(SntRangeDec *rd, SntModel *cdf, SntBitReader *ovr) {
 }
 
 /* Inter predictions, or zeros for a malformed stream that lacks a reference */
-static void dec_pred_luma(const uint8_t *rf, const uint8_t *rb, int w, int h, int x0, int y0,
+static void dec_pred_luma(const SntSplinePlane *rf, const SntSplinePlane *rb, int x0, int y0,
                           int dir, SntMV mvf, SntMV mvb, uint8_t *pred) {
-    if (((dir & SNT_DIR_FWD) && !rf) || ((dir & SNT_DIR_BWD) && !rb)) {
+    if (((dir & SNT_DIR_FWD) && !rf->coef) || ((dir & SNT_DIR_BWD) && !rb->coef)) {
         memset(pred, 0, 64);
         return;
     }
-    snt_pred_luma8(rf, rb, w, h, x0, y0, dir, mvf, mvb, pred);
+    snt_pred_luma8(rf, rb, x0, y0, dir, mvf, mvb, pred);
 }
 
 static void dec_pred_chroma(const uint8_t *rf, const uint8_t *rb, int w, int h, int x0, int y0,
@@ -97,8 +97,12 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     int is_bidi = (ctx->header.frame_type == SNT_FRAME_BIDI);
     /* P-frames predict from the newest anchor; B-frames forward from the
      * older anchor and backward from the newest */
-    const uint8_t *ref_f = is_bidi ? ctx->ref_old_y : ctx->ref_y;
-    const uint8_t *ref_b = is_bidi ? ctx->ref_y : NULL;
+    int same_ref = ctx->ref_w == width && ctx->ref_h == height;
+    SntSplinePlane sp_new = { ctx->ref_y, same_ref ? ctx->ref_coef : NULL, width, height };
+    SntSplinePlane sp_old = { ctx->ref_old_y, same_ref ? ctx->ref_old_coef : NULL, width, height };
+    SntSplinePlane sp_none = { NULL, NULL, width, height };
+    const SntSplinePlane *ref_f = is_bidi ? &sp_old : &sp_new;
+    const SntSplinePlane *ref_b = is_bidi ? &sp_new : &sp_none;
     uint16_t step = snt_qp_to_step(ctx->header.base_qp);
 
     /* ── SECTION A: Read fixed header ──────────────────────────────── */
@@ -238,7 +242,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     mv_field[blk_idx] = best_mv;
                     mvb_field[blk_idx] = best_mvb;
                     blk_dir[blk_idx] = (uint8_t)dir;
-                    dec_pred_luma(ref_f, ref_b, width, height, px0, py0, dir, best_mv, best_mvb, mc_blk);
+                    dec_pred_luma(ref_f, ref_b, px0, py0, dir, best_mv, best_mvb, mc_blk);
                 }
 
                 if (block_is_skip) {
@@ -554,11 +558,15 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     if (!is_bidi) {
         int cw_dec = width / 2, ch_dec = height / 2;
         free(ctx->ref_old_y); free(ctx->ref_old_u); free(ctx->ref_old_v);
+        free(ctx->ref_old_coef);
         int same_size = ctx->ref_w == width && ctx->ref_h == height;
         ctx->ref_old_y = same_size ? ctx->ref_y : NULL;
         ctx->ref_old_u = same_size ? ctx->ref_u : NULL;
         ctx->ref_old_v = same_size ? ctx->ref_v : NULL;
-        if (!same_size) { free(ctx->ref_y); free(ctx->ref_u); free(ctx->ref_v); }
+        ctx->ref_old_coef = same_size ? ctx->ref_coef : NULL;
+        if (!same_size) {
+            free(ctx->ref_y); free(ctx->ref_u); free(ctx->ref_v); free(ctx->ref_coef);
+        }
         ctx->ref_y = (uint8_t *)malloc((size_t)width * height);
         ctx->ref_u = (uint8_t *)calloc((size_t)cw_dec * ch_dec, 1);
         ctx->ref_v = (uint8_t *)calloc((size_t)cw_dec * ch_dec, 1);
@@ -567,6 +575,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         for (int y = 0; y < height; y++)
             for (int x = 0; x < width; x++)
                 ctx->ref_y[y * width + x] = output_y[y * stride_y + x];
+        ctx->ref_coef = snt_spline_coefs(ctx->ref_y, width, height);
         if (output_u && output_v) {
             for (int y = 0; y < ch_dec; y++)
                 for (int x = 0; x < cw_dec; x++) {

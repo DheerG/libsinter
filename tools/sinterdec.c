@@ -162,5 +162,6 @@ int main(int argc, char **argv) {
     free(bitstream); free(output_y); free(output_u); free(output_v);
     free(ctx.ref_y); free(ctx.ref_u); free(ctx.ref_v); free(ctx.cdf_state);
     free(ctx.ref_old_y); free(ctx.ref_old_u); free(ctx.ref_old_v); free(ctx.cdf_state_b);
+    free(ctx.ref_coef); free(ctx.ref_old_coef);
     return 0;
 }

@@ -74,10 +74,10 @@ SntMV snte_motion_search(const uint8_t *cur, const uint8_t *ref,
 
 /* ── Sub-pixel refinement (half-pel and quarter-pel) ──────────────── */
 /* SAD of the in-frame part of the block against its MC prediction */
-static uint32_t mc_sad(const uint8_t *cur, const uint8_t *ref, int w, int h,
+static uint32_t mc_sad(const uint8_t *cur, const SntSplinePlane *ref, int w, int h,
                        int bx, int by, int blk, SntMV mv) {
     uint8_t pred[SNT_MC_MAX_BLK * SNT_MC_MAX_BLK];
-    snt_mc_luma(ref, w, h, bx, by, mv, blk, blk, pred);
+    snt_mc_luma(ref, bx, by, mv, blk, blk, pred);
     uint32_t sad = 0;
     for (int y = 0; y < blk && by + y < h; y++)
         for (int x = 0; x < blk && bx + x < w; x++) {
@@ -87,7 +87,7 @@ static uint32_t mc_sad(const uint8_t *cur, const uint8_t *ref, int w, int h,
     return sad;
 }
 
-SntMV snte_subpel_refine(const uint8_t *cur, const uint8_t *ref,
+SntMV snte_subpel_refine(const uint8_t *cur, const SntSplinePlane *ref,
                           int frame_w, int frame_h, int bx, int by,
                           int blk_size, SntMV mv, SntMV pred,
                           double lambda, uint32_t *sad_out) {

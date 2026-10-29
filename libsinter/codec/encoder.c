@@ -271,8 +271,8 @@ typedef struct {
     int16_t       *recon;    /* reconstruction so far, pad_w stride */
     int            width, height, pad_w, blk_cols;
     int            is_inter, is_bidi;
-    const uint8_t *ref_f;    /* forward (past) luma reference */
-    const uint8_t *ref_b;    /* backward (future) luma reference, B-frames */
+    const SntSplinePlane *ref_f;  /* forward (past) luma reference */
+    const SntSplinePlane *ref_b;  /* backward (future) luma reference, B-frames */
     uint16_t       step;
     double         lambda;   /* RD_LAMBDA * step^2 */
     SntMV         *mv_field;  /* per block: forward MV */
@@ -335,8 +335,7 @@ static void mv_predictors(const EncFrame *f, int bx, int by, SntMV *pf, SntMV *p
 /* Inter prediction of a block and its residual (0 outside the frame) */
 static void mc_residual(const EncFrame *f, int bx, int by, int dir, SntMV mvf, SntMV mvb,
                         const int16_t *src, int vw, int vh, uint8_t *pred, int16_t *res) {
-    snt_pred_luma8(f->ref_f, f->ref_b, f->width, f->height, bx * BLK, by * BLK,
-                   dir, mvf, mvb, pred);
+    snt_pred_luma8(f->ref_f, f->ref_b, bx * BLK, by * BLK, dir, mvf, mvb, pred);
     for (int dy = 0; dy < BLK; dy++)
         for (int dx = 0; dx < BLK; dx++)
             res[dy * BLK + dx] = (dy < vh && dx < vw) ? src[dy * BLK + dx] - pred[dy * BLK + dx] : 0;
@@ -344,10 +343,10 @@ static void mc_residual(const EncFrame *f, int bx, int by, int dir, SntMV mvf, S
 
 /* Quarter-pel MV for the blk x blk block at (px0, py0) in ref, searched
  * around pred; lambda for SAD decisions = sqrt(lambda) */
-static SntMV search_mv(const EncFrame *f, const uint8_t *ref, int px0, int py0, int blk,
+static SntMV search_mv(const EncFrame *f, const SntSplinePlane *ref, int px0, int py0, int blk,
                        SntMV pred) {
     double lambda_sad = sqrt(RD_LAMBDA) * f->step;
-    SntMV s = snte_motion_search(f->input_y, ref, f->width, px0, py0, blk, 16,
+    SntMV s = snte_motion_search(f->input_y, ref->pix, f->width, px0, py0, blk, 16,
                                  f->width, f->height, pred, lambda_sad);
     return snte_subpel_refine(f->input_y, ref, f->width, f->height, px0, py0, blk,
                               s, pred, lambda_sad, NULL);
@@ -393,7 +392,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
 
         /* Skip: prediction at the predicted MV(s), nothing else coded */
         int sdir = f->is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
-        snt_pred_luma8(f->ref_f, f->ref_b, f->width, f->height, px0, py0, sdir, pf, pb, p);
+        snt_pred_luma8(f->ref_f, f->ref_b, px0, py0, sdir, pf, pb, p);
         for (int k = 0; k < 64; k++) p16[k] = p[k];
         double j = block_sse(src, p16, vw, vh)
                  + f->lambda * (cdf_bits(&cs->inter, 1) + cdf_bits(&cs->iskip, 1));
@@ -808,9 +807,11 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
      * macroblock in Z order (top-left, top-right, bottom-left, bottom-right).
      * P-frames predict from the newest anchor; B-frames forward from the
      * older anchor and backward from the newest. */
+    SntSplinePlane sp_new = { ctx->ref_y, ctx->ref_coef, width, height };
+    SntSplinePlane sp_old = { ctx->ref_old_y, ctx->ref_old_coef, width, height };
     EncFrame ef = { ctx, cs, &sink, input_y, work, recon, width, height, pad_w, blk_cols,
                     is_inter, is_bidi,
-                    is_bidi ? ctx->ref_old_y : ctx->ref_y, is_bidi ? ctx->ref_y : NULL,
+                    is_bidi ? &sp_old : &sp_new, is_bidi ? &sp_new : NULL,
                     step, RD_LAMBDA * (double)step * step, mv_field, mvb_field, blk_dir,
                     blk_is_inter, blk_is_skip, dc_pix, ac_state, coded };
     int mb_cols = (blk_cols + 1) / 2, mb_rows = (blk_rows + 1) / 2;
@@ -1015,9 +1016,12 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     }
     if (!is_bidi) {
         free(ctx->ref_old_y);
+        free(ctx->ref_old_coef);
         ctx->ref_old_y = (ctx->ref_w == width && ctx->ref_h == height) ? ctx->ref_y : NULL;
-        if (!ctx->ref_old_y) free(ctx->ref_y);
+        ctx->ref_old_coef = ctx->ref_old_y ? ctx->ref_coef : NULL;
+        if (!ctx->ref_old_y) { free(ctx->ref_y); free(ctx->ref_coef); }
         ctx->ref_y = rec_y;
+        ctx->ref_coef = snt_spline_coefs(rec_y, width, height);
         if (chroma_rec[0]) {
             free(ctx->ref_old_u); free(ctx->ref_old_v);
             ctx->ref_old_u = ctx->ref_u;

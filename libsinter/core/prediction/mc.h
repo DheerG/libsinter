@@ -26,24 +26,27 @@ void snt_mc_chroma(const uint8_t *ref, int w, int h, int x0, int y0,
 
 /* Inter prediction directions: forward (past reference), backward
  * (future reference, B-frames), or the rounded average of both.
- * SNT_DIR_FWD | SNT_DIR_REF1 (P-frames with two references): forward from
- * the second reference, the anchor before the newest, which the
- * functions below receive as ref_b. */
-enum { SNT_DIR_FWD = 1, SNT_DIR_BWD = 2, SNT_DIR_BI = 3, SNT_DIR_REF1 = 4 };
+ * P-frames with several references: SNT_DIR_FWD | SNT_DIR_REF1 predicts
+ * forward from the second reference, which the functions below receive
+ * as ref_b, and SNT_DIR_FWD | SNT_DIR_REF2 from the third, ref_2. */
+enum { SNT_DIR_FWD = 1, SNT_DIR_BWD = 2, SNT_DIR_BI = 3, SNT_DIR_REF1 = 4, SNT_DIR_REF2 = 8 };
 
 /* Predict the 8x8 luma block at (x0, y0) in direction dir: forward from
- * ref_f at mvf, backward from ref_b at mvb, or (a + b + 1) >> 1. */
+ * ref_f at mvf, backward from ref_b at mvb, or (a + b + 1) >> 1 (P-frames:
+ * forward from ref_b or ref_2, see above; ref_2 may be NULL otherwise). */
 void snt_pred_luma8(const SntSplinePlane *ref_f, const SntSplinePlane *ref_b,
+                    const SntSplinePlane *ref_2,
                     int x0, int y0, int dir, SntMV mvf, SntMV mvb, uint8_t *pred);
 
 /* Sum of absolute differences between two predictions of the 8x8 luma
  * block at (x0, y0): direction dira with MVs (af, ab), and dirb with
  * (bf, bb) */
-uint32_t snt_pred_sad8(const SntSplinePlane *ref_f, const SntSplinePlane *ref_b, int x0, int y0,
+uint32_t snt_pred_sad8(const SntSplinePlane *ref_f, const SntSplinePlane *ref_b,
+                       const SntSplinePlane *ref_2, int x0, int y0,
                        int dira, SntMV af, SntMV ab, int dirb, SntMV bf, SntMV bb);
 
 /* The same for a 4x4 chroma block, with the luma MVs read as 1/8-pel */
-void snt_pred_chroma4(const uint8_t *ref_f, const uint8_t *ref_b, int w, int h,
+void snt_pred_chroma4(const uint8_t *ref_f, const uint8_t *ref_b, const uint8_t *ref_2, int w, int h,
                       int x0, int y0, int dir, SntMV mvf, SntMV mvb, uint8_t *pred);
 
 /* DC of an 8x8 prediction block on the scale of the 8x8 orthonormal DCT's

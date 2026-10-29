@@ -239,7 +239,7 @@ int main(int argc, char **argv) {
         /* Model groups of SntCdfSet: name, first model, number of models */
 #define G(f) fprintf(bf, "group %s %zu %zu\n", #f, offsetof(SntCdfSet, f) / sizeof(SntModel), \
                      sizeof(((SntCdfSet *)0)->f) / sizeof(SntModel))
-        G(dz); G(ds); G(dg); G(dx); G(dm); G(acz); G(acs); G(acg); G(acx); G(acm); G(band); G(imode); G(mbmode); G(bdir); G(ref1);
+        G(dz); G(ds); G(dg); G(dx); G(dm); G(acz); G(acs); G(acg); G(acx); G(acm); G(band); G(imode); G(mbmode); G(bdir); G(ref1); G(ref2);
         G(inter); G(iskip); G(vz); G(vs); G(vg); G(vx); G(vm); G(cflag); G(cz); G(cs); G(cg); G(cx); G(cm);
 #undef G
         fprintf(bf, "frametypes %llu %llu %llu\n", (unsigned long long)type_bytes[0],

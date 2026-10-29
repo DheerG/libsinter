@@ -140,9 +140,11 @@ int main(int argc, char **argv) {
         free(ectx.ref_old_y); free(ectx.ref_old_u); free(ectx.ref_old_v); free(ectx.cdf_state_b);
         free(ectx.last_y); free(ectx.last_u); free(ectx.last_v);
         free(ectx.ref_coef); free(ectx.ref_old_coef);
+        free(ectx.key_y); free(ectx.key_u); free(ectx.key_v); free(ectx.key_coef);
         free(dctx.ref_y); free(dctx.ref_u); free(dctx.ref_v); free(dctx.cdf_state);
         free(dctx.ref_old_y); free(dctx.ref_old_u); free(dctx.ref_old_v); free(dctx.cdf_state_b);
         free(dctx.ref_coef); free(dctx.ref_old_coef); free(dctx.clip_tables);
+        free(dctx.key_y); free(dctx.key_u); free(dctx.key_v); free(dctx.key_coef);
     }
     double sy = 0, su = 0, sv = 0;
     for (int d = 0; d < n; d++) {

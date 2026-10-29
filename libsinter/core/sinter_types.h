@@ -188,6 +188,10 @@ typedef struct {
      * frame included: P-frames also predict from ref_old_* when it is in
      * the same GOP (2 or more) */
     int                 num_anchors;
+    /* The GOP's key frame, kept as P-frames' third reference (long-term,
+     * from the third anchor on) */
+    uint8_t            *key_y, *key_u, *key_v;
+    int32_t            *key_coef;
 } SntEncoderCtx;
 
 /* ── Decoder context ──────────────────────────────────────────────── */
@@ -214,6 +218,9 @@ typedef struct {
     void               *clip_tables;
     /* Anchors decoded since the last key frame (see SntEncoderCtx) */
     int                 num_anchors;
+    /* The GOP's key frame (see SntEncoderCtx) */
+    uint8_t            *key_y, *key_u, *key_v;
+    int32_t            *key_coef;
 } SntDecoderCtx;
 
 /* ── Frame buffer allocation/free ─────────────────────────────────── */

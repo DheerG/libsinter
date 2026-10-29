@@ -61,6 +61,8 @@ typedef struct {
     SntModel imode[2];                 /* intra mode, by frame type (0 key, 1 inter) */
     SntModel mbmode[SNT_FLAG_CONTEXTS];  /* macroblock mode (SNT_MB_*), by snt_flag_context */
     SntModel bdir;                     /* B-frame prediction direction - 1 (SNT_DIR_*) */
+    SntModel ref1[2];                  /* P-frame inter block: from the second reference? by
+                                          whether the left block is */
     SntModel inter[SNT_FLAG_CONTEXTS];   /* inter-frame block: inter (1) or intra, by snt_flag_context */
     SntModel iskip[SNT_FLAG_CONTEXTS];   /* inter block: skipped (1) or coded, by snt_flag_context */
     /* MV deltas as binary decisions (levels.h), by component (x, y); Z and G
@@ -141,6 +143,8 @@ static inline void snt_cdf_set_init_uniform(SntCdfSet *s) {
         snt_model_init(&s->iskip[a], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
     }
     snt_model_init(&s->bdir, 3, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+    for (int r = 0; r < 2; r++)
+        snt_model_init(&s->ref1[r], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
     for (int c = 0; c < 2; c++) {
         for (int z = 0; z < 2; z++)
             for (int x = 0; x < 2; x++)

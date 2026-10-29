@@ -184,6 +184,10 @@ typedef struct {
     int                 clip_tables_send;
     /* Reconstruction of the last coded frame (any type), for checking */
     uint8_t            *last_y, *last_u, *last_v;
+    /* Anchors (key and P-frames) coded since the last key frame, the key
+     * frame included: P-frames also predict from ref_old_* when it is in
+     * the same GOP (2 or more) */
+    int                 num_anchors;
 } SntEncoderCtx;
 
 /* ── Decoder context ──────────────────────────────────────────────── */
@@ -208,6 +212,8 @@ typedef struct {
     int32_t            *ref_coef, *ref_old_coef;
     /* Experiment builds only (codec/cliptables.h): per-clip starting tables */
     void               *clip_tables;
+    /* Anchors decoded since the last key frame (see SntEncoderCtx) */
+    int                 num_anchors;
 } SntDecoderCtx;
 
 /* ── Frame buffer allocation/free ─────────────────────────────────── */

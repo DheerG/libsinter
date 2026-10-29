@@ -48,6 +48,10 @@ void snt_mc_chroma(const uint8_t *ref, int w, int h, int x0, int y0,
 
 void snt_pred_luma8(const SntSplinePlane *ref_f, const SntSplinePlane *ref_b,
                     int x0, int y0, int dir, SntMV mvf, SntMV mvb, uint8_t *pred) {
+    if (dir & SNT_DIR_REF1) {
+        snt_mc_luma(ref_b, x0, y0, mvf, 8, 8, pred);
+        return;
+    }
     if (dir == SNT_DIR_BWD) {
         snt_mc_luma(ref_b, x0, y0, mvb, 8, 8, pred);
         return;
@@ -74,6 +78,10 @@ uint32_t snt_pred_sad8(const SntSplinePlane *ref_f, const SntSplinePlane *ref_b,
 
 void snt_pred_chroma4(const uint8_t *ref_f, const uint8_t *ref_b, int w, int h,
                       int x0, int y0, int dir, SntMV mvf, SntMV mvb, uint8_t *pred) {
+    if (dir & SNT_DIR_REF1) {
+        snt_mc_chroma(ref_b, w, h, x0, y0, mvf, 4, 4, pred);
+        return;
+    }
     if (dir == SNT_DIR_BWD) {
         snt_mc_chroma(ref_b, w, h, x0, y0, mvb, 4, 4, pred);
         return;

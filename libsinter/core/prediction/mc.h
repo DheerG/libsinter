@@ -38,6 +38,22 @@ void snt_pred_luma8(const SntSplinePlane *ref_f, const SntSplinePlane *ref_b,
                     const SntSplinePlane *ref_2,
                     int x0, int y0, int dir, SntMV mvf, SntMV mvb, uint8_t *pred);
 
+/* B-frame direct mode (ISO/IEC 14496-2 B-VOP direct mode, 1999; H.263
+ * Annex G PB-frames, 1996): the MVs of a block whose co-located block in
+ * the newest anchor has direction cdir and forward MV mvc, with trb the
+ * display distance from the older anchor to the B-frame and trd that
+ * between the anchors: forward trb * mvc / trd, backward
+ * (trb - trd) * mvc / trd, divisions truncated as in MPEG-4. A co-located
+ * block that is intra or predicts from another reference counts as zero
+ * motion (MPEG-4 uses zero for an intra one). */
+static inline void snt_direct_mvs(int cdir, SntMV mvc, int trb, int trd, SntMV *mvf, SntMV *mvb) {
+    if (cdir != SNT_DIR_FWD || trd <= 0) mvc = (SntMV){0, 0};
+    mvf->x = (int16_t)(trb * mvc.x / trd);
+    mvf->y = (int16_t)(trb * mvc.y / trd);
+    mvb->x = (int16_t)((trb - trd) * mvc.x / trd);
+    mvb->y = (int16_t)((trb - trd) * mvc.y / trd);
+}
+
 /* Motion of a block, for overlapped prediction */
 typedef struct {
     int   dir;

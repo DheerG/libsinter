@@ -29,6 +29,7 @@
  * difference against the quantizer step: below step/8, below step/2,
  * above. The class selects the mode models. */
 #define SNT_AGREE_CLASSES 3
+#define SNT_BDIR_DIRECT   3   /* bdir symbol: direct mode (snt_direct_mvs), no MV deltas */
 #define SNT_FLAG_CONTEXTS (SNT_AGREE_CLASSES * 3)  /* mode-flag contexts, see snt_flag_context */
 #define SNT_DC_CONTEXTS  10  /* luma DC contexts, see snt_dc_context */
 static inline int snt_agree_class(uint32_t sad, int npix, uint16_t step) {
@@ -60,7 +61,8 @@ typedef struct {
                                           by previous band nonzero, prediction class */
     SntModel imode[2];                 /* intra mode, by frame type (0 key, 1 inter) */
     SntModel mbmode[SNT_FLAG_CONTEXTS];  /* macroblock mode (SNT_MB_*), by snt_flag_context */
-    SntModel bdir;                     /* B-frame prediction direction - 1 (SNT_DIR_*) */
+    SntModel bdir;                     /* B-frame prediction direction - 1 (SNT_DIR_*), or
+                                          SNT_BDIR_DIRECT */
     SntModel ref1[2];                  /* P-frame inter block: from a reference other than the
                                           newest? by whether the left block is */
     SntModel ref2[2];                  /* ... the third (the key frame) rather than the second?
@@ -144,7 +146,7 @@ static inline void snt_cdf_set_init_uniform(SntCdfSet *s) {
         snt_model_init(&s->inter[a], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         snt_model_init(&s->iskip[a], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
     }
-    snt_model_init(&s->bdir, 3, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+    snt_model_init(&s->bdir, 4, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
     for (int r = 0; r < 2; r++) {
         snt_model_init(&s->ref1[r], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         snt_model_init(&s->ref2[r], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);

@@ -192,6 +192,11 @@ typedef struct {
      * from the third anchor on) */
     uint8_t            *key_y, *key_u, *key_v;
     int32_t            *key_coef;
+    /* The newest anchor's motion, per 8x8 block (B-frames' direct mode),
+     * and the display numbers of the newest and older anchors */
+    SntMV              *anchor_mv;
+    uint8_t            *anchor_dir;
+    uint32_t            anchor_num, anchor_old_num;
 } SntEncoderCtx;
 
 /* ── Decoder context ──────────────────────────────────────────────── */
@@ -218,9 +223,12 @@ typedef struct {
     void               *clip_tables;
     /* Anchors decoded since the last key frame (see SntEncoderCtx) */
     int                 num_anchors;
-    /* The GOP's key frame (see SntEncoderCtx) */
+    /* The GOP's key frame, and the newest anchor's motion (see SntEncoderCtx) */
     uint8_t            *key_y, *key_u, *key_v;
     int32_t            *key_coef;
+    SntMV              *anchor_mv;
+    uint8_t            *anchor_dir;
+    uint32_t            anchor_num, anchor_old_num;
 } SntDecoderCtx;
 
 /* ── Frame buffer allocation/free ─────────────────────────────────── */

@@ -245,5 +245,6 @@ done:
     free(ctx.last_y); free(ctx.last_u); free(ctx.last_v);
     free(ctx.ref_coef); free(ctx.ref_old_coef);
     free(ctx.key_y); free(ctx.key_u); free(ctx.key_v); free(ctx.key_coef);
+    free(ctx.anchor_mv); free(ctx.anchor_dir);
     return 0;
 }

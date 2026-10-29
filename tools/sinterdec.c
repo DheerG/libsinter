@@ -164,5 +164,6 @@ int main(int argc, char **argv) {
     free(ctx.ref_old_y); free(ctx.ref_old_u); free(ctx.ref_old_v); free(ctx.cdf_state_b);
     free(ctx.ref_coef); free(ctx.ref_old_coef);
     free(ctx.key_y); free(ctx.key_u); free(ctx.key_v); free(ctx.key_coef);
+    free(ctx.anchor_mv); free(ctx.anchor_dir);
     return 0;
 }

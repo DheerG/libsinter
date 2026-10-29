@@ -201,6 +201,9 @@ typedef struct {
      * choice by GOP position */
     int                 keyint;
 } SntEncoderCtx;
+/* Set when SntEncoderCtx has keyint (tools/eval/harness.c also builds
+ * against older commits) */
+#define SNT_ENCODER_KEYINT 1
 
 /* ── Decoder context ──────────────────────────────────────────────── */
 typedef struct {

@@ -632,6 +632,33 @@ static int agree_class_mb(const EncFrame *f, int bx0, int by0) {
  * (snt_pred_luma8_obmc; an intra neighbour counts as this block's motion).
  * in16: the block is part of a 16x16 candidate, so its neighbours inside
  * the macroblock have its motion. */
+/* Recent plain 8x8 predictions (block position and motion), reused across
+ * the candidates of a block: a block's neighbours' motion is the same for
+ * every candidate. Cleared at each frame (pred_cache_gen). */
+#define PRED_CACHE 16
+static struct {
+    uint32_t  gen;
+    int       bx, by;
+    SntMotion m;
+    uint8_t   pred[64];
+} pred_cache[PRED_CACHE];
+static uint32_t pred_cache_gen;
+static int pred_cache_next;
+
+static const uint8_t *cached_pred8(const EncFrame *f, int bx, int by, SntMotion m) {
+    for (int k = 0; k < PRED_CACHE; k++)
+        if (pred_cache[k].gen == pred_cache_gen && pred_cache[k].bx == bx && pred_cache[k].by == by &&
+            snt_same_motion(pred_cache[k].m, m))
+            return pred_cache[k].pred;
+    int k = pred_cache_next;
+    pred_cache_next = (k + 1) % PRED_CACHE;
+    pred_cache[k].gen = pred_cache_gen;
+    pred_cache[k].bx = bx; pred_cache[k].by = by; pred_cache[k].m = m;
+    snt_pred_luma8(f->ref_f, f->ref_b, f->ref_2, bx * BLK, by * BLK, m.dir, m.mvf, m.mvb,
+                   pred_cache[k].pred);
+    return pred_cache[k].pred;
+}
+
 static void pred_block(const EncFrame *f, int bx, int by, int dir, SntMV mvf, SntMV mvb, int in16,
                        uint8_t *pred) {
     SntMotion cur = { dir, mvf, mvb }, am = cur, lm = cur;
@@ -640,7 +667,14 @@ static void pred_block(const EncFrame *f, int bx, int by, int dir, SntMV mvf, Sn
         am = (SntMotion){ f->blk_dir[ai], f->mv_field[ai], f->mvb_field[ai] };
     if (bx > 0 && !(in16 && (bx & 1)) && f->blk_dir[li])
         lm = (SntMotion){ f->blk_dir[li], f->mv_field[li], f->mvb_field[li] };
-    snt_pred_luma8_obmc(f->ref_f, f->ref_b, f->ref_2, bx * BLK, by * BLK, cur, am, lm, pred);
+    /* As snt_pred_luma8_obmc, with the plain predictions cached */
+    uint8_t q[64];
+    memcpy(q, cached_pred8(f, bx, by, cur), 64);
+    const uint8_t *r = snt_same_motion(am, cur) ? NULL : cached_pred8(f, bx, by, am);
+    uint8_t rr[64];
+    if (r) { memcpy(rr, r, 64); r = rr; }
+    const uint8_t *s = snt_same_motion(lm, cur) ? NULL : cached_pred8(f, bx, by, lm);
+    snt_obmc_blend(q, r, s, pred);
 }
 
 /* Inter prediction of a block (pred_block) and its residual (0 outside
@@ -1376,6 +1410,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         fhdr.base_qp = fhdr.base_qp + B_QP_OFFSET < 63 ? fhdr.base_qp + B_QP_OFFSET : 63;
 
     uint16_t step = snt_qp_to_step(fhdr.base_qp);
+    pred_cache_gen++;  /* new references: the cached predictions are stale */
 
     /* Load pixels into work buffer */
     int16_t *work = (int16_t *)calloc((size_t)pad_w * pad_h, sizeof(int16_t));

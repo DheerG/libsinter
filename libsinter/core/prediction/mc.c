@@ -81,7 +81,7 @@ static const uint8_t obmc_h2[64] = {
     2, 2, 1, 1, 1, 1, 2, 2,  2, 2, 1, 1, 1, 1, 2, 2,  2, 2, 1, 1, 1, 1, 2, 2,  2, 1, 1, 1, 1, 1, 1, 2,
 };
 
-static int same_motion(SntMotion a, SntMotion b) {
+int snt_same_motion(SntMotion a, SntMotion b) {
     return a.dir == b.dir && (!(a.dir & ~SNT_DIR_BWD) || (a.mvf.x == b.mvf.x && a.mvf.y == b.mvf.y)) &&
            (!(a.dir & SNT_DIR_BWD) || (a.mvb.x == b.mvb.x && a.mvb.y == b.mvb.y));
 }
@@ -91,13 +91,17 @@ void snt_pred_luma8_obmc(const SntSplinePlane *ref_f, const SntSplinePlane *ref_
                          SntMotion above, SntMotion left, uint8_t *pred) {
     uint8_t q[64], r[64], s[64];
     snt_pred_luma8(ref_f, ref_b, ref_2, x0, y0, cur.dir, cur.mvf, cur.mvb, q);
-    int ua = !same_motion(above, cur), ul = !same_motion(left, cur);
+    int ua = !snt_same_motion(above, cur), ul = !snt_same_motion(left, cur);
     if (ua) snt_pred_luma8(ref_f, ref_b, ref_2, x0, y0, above.dir, above.mvf, above.mvb, r);
     if (ul) snt_pred_luma8(ref_f, ref_b, ref_2, x0, y0, left.dir, left.mvf, left.mvb, s);
+    snt_obmc_blend(q, ua ? r : NULL, ul ? s : NULL, pred);
+}
+
+void snt_obmc_blend(const uint8_t *q, const uint8_t *r, const uint8_t *s, uint8_t *pred) {
     for (int y = 0; y < 8; y++)
         for (int x = 0; x < 8; x++) {
             int i = y * 8 + x;
-            int rr = (ua && y < 4) ? r[i] : q[i], ss = (ul && x < 4) ? s[i] : q[i];
+            int rr = (r && y < 4) ? r[i] : q[i], ss = (s && x < 4) ? s[i] : q[i];
             pred[i] = (uint8_t)((q[i] * obmc_h0[i] + rr * obmc_h1[i] + ss * obmc_h2[i] + 4) >> 3);
         }
 }

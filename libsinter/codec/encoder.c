@@ -233,6 +233,7 @@ typedef struct {
     double  bits;              /* estimated bits (estimate mode only) */
     int     nz;                /* any nonzero level (the DC or a coded band) */
     int16_t dc_level;          /* the DC level (the next block's DC context) */
+    uint16_t bands;            /* the coded bands, bit b for band b (the next blocks' context) */
 } LumaCode;
 
 /* Code one 8x8 luma block's DC and bands.
@@ -241,11 +242,12 @@ typedef struct {
  *   the DC, plus the first row or column when td_ac. pred: prediction
  *   block added back on reconstruction (NULL for intra).
  * t: context block type (0 intra, 1 inter). da: the DC level's context
- *   (snt_dc_context).
+ *   (snt_dc_context). nb: the coded bands of the left (low 16 bits) and
+ *   above (high 16 bits) blocks, the band flags' context.
  * With a sink, symbols are emitted and models adapt as they go. Without
  * one, nothing is emitted, the models are untouched, and out->bits
  * estimates the cost from their current state. */
-static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t, int da,
+static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t, int da, uint32_t nb,
                       const int16_t *dct_in, const int16_t *td_pred, int td_ac,
                       const uint8_t *pred, LumaCode *out) {
     int16_t coeffs[64];
@@ -336,7 +338,7 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t, int da
         double next[2] = {1e300, 1e300};
         for (int st = 0; st < 2; st++) {
             if (cost[st] >= 1e300) continue;
-            const SntModel *flag = &cs->band[t][b][st][bcls[b]];
+            const SntModel *flag = &cs->band[t][b][st][bcls[b]][((nb >> b) & 1) + ((nb >> (16 + b)) & 1)];
             double jz = cost[st] + j_zero[b] + lambda * cdf_bits(flag, 0);
             if (jz < next[0]) { next[0] = jz; from[b][0] = (uint8_t)st; }
             if (band_nz[b]) {
@@ -371,7 +373,7 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t, int da
     int prev_nz = dc_level != 0;
     for (int b = 0; b < NUM_BANDS; b++) {
         int start = band_bounds[b], n = band_bounds[b + 1] - start;
-        SntModel *flag = &cs->band[t][b][prev_nz][bcls[b]];
+        SntModel *flag = &cs->band[t][b][prev_nz][bcls[b]][((nb >> b) & 1) + ((nb >> (16 + b)) & 1)];
         if (!sink) {
             bits += coded[b] ? cdf_bits(flag, 1) + lev_bits[b] : cdf_bits(flag, 0);
         } else {
@@ -408,6 +410,8 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t, int da
 
     out->nz = dc_level != 0;
     out->dc_level = dc_level;
+    out->bands = 0;
+    for (int b = 0; b < NUM_BANDS; b++) out->bands |= (uint16_t)(coded[b] << b);
     for (int b = 0; b < NUM_BANDS; b++) out->nz |= coded[b];
 
     /* Reconstruct coefficients, then pixels */
@@ -521,6 +525,7 @@ typedef struct {
     uint8_t       *coded;    /* per block: coded yet? */
     uint8_t       *luma_nz;  /* per block: any nonzero luma level? (chroma flag context) */
     int16_t       *dc_lev;   /* per block: luma DC level (the DC context of the blocks right and below) */
+    uint16_t      *bands;    /* per block: coded luma bands (LumaCode.bands) */
     /* Chroma, for the cost of each candidate: source planes (NULL without
      * chroma), their stride and size, references and step */
     const uint8_t *src_c[2];
@@ -565,6 +570,13 @@ static void td_prediction(const EncFrame *f, int bx, int by, int m, int16_t *td_
     int i = by * f->blk_cols + bx;
     snt_acdc_predict(m, bx > 0 ? &f->acdc[(i - 1) * SNT_ACDC_STATE] : NULL,
                      by > 0 ? &f->acdc[(i - f->blk_cols) * SNT_ACDC_STATE] : NULL, td_pred);
+}
+
+/* Band-flag context of block (bx, by): the coded bands of the left and
+ * above blocks (code_luma's nb) */
+static inline uint32_t band_ctx(const EncFrame *f, int bx, int by) {
+    int i = by * f->blk_cols + bx;
+    return (uint32_t)(bx > 0 ? f->bands[i - 1] : 0) | (uint32_t)(by > 0 ? f->bands[i - f->blk_cols] : 0) << 16;
 }
 
 /* DC context of block (bx, by) (snt_dc_context) */
@@ -886,17 +898,19 @@ static double chroma_cost(const EncFrame *f, int bx, int by, int kind, int dir,
 
 /* Cost (distortion + lambda * bits) of 8x8 block (bx, by) coded inter in
  * direction d at (mvf, mvb), with its mode flags (agreement class ac) and
- * MV deltas; its reconstruction in rec, its DC level in *dc_level */
+ * MV deltas; its reconstruction in rec, its DC level and coded bands in
+ * *dc_level and *bands */
 static double inter8_cost(const EncFrame *f, int bx, int by, const int16_t *src, int vw, int vh,
                           int ac, int d, SntMV mvf, SntMV mvb, SntMV pf, SntMV pb, int direct,
-                          int16_t *rec, int16_t *dc_level) {
+                          int16_t *rec, int16_t *dc_level, uint16_t *bands) {
     uint8_t p[64];
     int16_t res[64], td0[64] = {0};
     LumaCode lc;
     mc_residual(f, bx, by, d, mvf, mvb, 0, src, vw, vh, p, res);
-    code_luma(f->cs, NULL, f->step, 1, dc_ctx(f, bx, by), res, td0, 0, p, &lc);
+    code_luma(f->cs, NULL, f->step, 1, dc_ctx(f, bx, by), band_ctx(f, bx, by), res, td0, 0, p, &lc);
     memcpy(rec, lc.recon, sizeof(lc.recon));
     *dc_level = lc.dc_level;
+    *bands = lc.bands;
     return block_sse(src, lc.recon, vw, vh) + chroma_cost(f, bx, by, CAND_INTER, d, mvf, mvb, lc.nz)
          + f->lambda * (cdf_bits(&f->cs->inter[flag_ctx(f, bx, by, ac)], 1)
                         + cdf_bits(&f->cs->iskip[flag_ctx(f, bx, by, ac)], 0)
@@ -909,7 +923,8 @@ static double inter8_cost(const EncFrame *f, int bx, int by, const int16_t *src,
 static double inter16_cost(const EncFrame *f, int bx0, int by0, int mac, int d, SntMV mvf,
                            SntMV mvb, SntMV pf, SntMV pb, int direct) {
     double dist = 0, bits = 0;
-    int16_t dcl[4];  /* the blocks' DC levels */
+    int16_t dcl[4];  /* the blocks' DC levels and coded bands */
+    uint16_t bdl[4];
     for (int z = 0; z < 4; z++) {
         int bx = bx0 + (z & 1), by = by0 + (z >> 1), vw, vh;
         int16_t src[64], res[64], td0[64] = {0};
@@ -919,14 +934,17 @@ static double inter16_cost(const EncFrame *f, int bx0, int by0, int mac, int d, 
         SntMV bmf = mvf, bmb = mvb;
         if (direct) direct_mvs(f, bx, by, &bmf, &bmb);
         mc_residual(f, bx, by, d, bmf, bmb, 1, src, vw, vh, p, res);
-        /* DC context, with the DC levels of this candidate's blocks inside
-         * the macroblock */
+        /* DC and band contexts, with this candidate's blocks inside the
+         * macroblock */
         int i = by * f->blk_cols + bx;
         int left = (z & 1) ? dcl[z - 1] : (bx > 0 ? f->dc_lev[i - 1] : 0);
         int above = (z & 2) ? dcl[z - 2] : (by > 0 ? f->dc_lev[i - f->blk_cols] : 0);
-        code_luma(f->cs, NULL, f->step, 1, snt_dc_context(left, above),
+        uint32_t lb = (z & 1) ? bdl[z - 1] : (bx > 0 ? f->bands[i - 1] : 0);
+        uint32_t ab = (z & 2) ? bdl[z - 2] : (by > 0 ? f->bands[i - f->blk_cols] : 0);
+        code_luma(f->cs, NULL, f->step, 1, snt_dc_context(left, above), lb | ab << 16,
                   res, td0, 0, p, &lc);
         dcl[z] = lc.dc_level;
+        bdl[z] = lc.bands;
         dist += block_sse(src, lc.recon, vw, vh) + chroma_cost(f, bx, by, CAND_INTER, d, bmf, bmb, lc.nz);
         bits += lc.bits;
     }
@@ -951,6 +969,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
     SntCdfSet *cs = f->cs;
     int blk = by * f->blk_cols + bx, px0 = bx * BLK, py0 = by * BLK;
     int16_t src[64], td_pred[64], best_rec[64], best_dc = 0;
+    uint16_t best_bands = 0;
     int vw, vh;
     load_src(f, bx, by, src, &vw, &vh);
 
@@ -978,7 +997,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
                  + f->lambda * (cdf_bits(&cs->inter[fc], 1) + cdf_bits(&cs->iskip[fc], 1));
         if (j < best_j) {
             best_j = j; bc->kind = CAND_SKIP; bc->dir = sdir; bc->mvf = smf; bc->mvb = smb;
-            best_dc = 0;
+            best_dc = 0; best_bands = 0;
             memcpy(best_rec, p16, sizeof(best_rec));
         }
 
@@ -991,6 +1010,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
         int id = 0;
         SntMV imf = zero, imb = zero;
         int16_t irec[64], trec[64], idc = 0, tdc;
+        uint16_t ibands = 0, tbands;
         for (int cand = 0; cand < (f->is_bidi ? 3 * ncand + 1 : ncand); cand++) {
             int d, c;
             mv_cand_index(ncand, cand, &d, &c);
@@ -998,10 +1018,10 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
             /* An unused direction's MV is zero (H.263 Annex O) */
             SntMV mvf = (d & SNT_DIR_FWD) ? cf[c] : zero;
             SntMV mvb = (d & SNT_DIR_BWD) ? cb[c] : zero;
-            j = inter8_cost(f, bx, by, src, vw, vh, ac, d, mvf, mvb, pf, pb, 0, trec, &tdc);
+            j = inter8_cost(f, bx, by, src, vw, vh, ac, d, mvf, mvb, pf, pb, 0, trec, &tdc, &tbands);
             mv_cand_best(d, j, mvf, mvb, jdir, cf, cb, ncand);
             if (j < ij) {
-                ij = j; id = d; imf = mvf; imb = mvb; idc = tdc;
+                ij = j; id = d; imf = mvf; imb = mvb; idc = tdc; ibands = tbands;
                 memcpy(irec, trec, sizeof(irec));
             }
         }
@@ -1017,9 +1037,9 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
             for (int c = 0; c < n1; c++) {
                 if (mv_cand_dup(SNT_DIR_FWD, c1, cz, c)) continue;
                 int d = SNT_DIR_FWD | (r == 1 ? SNT_DIR_REF1 : SNT_DIR_REF2);
-                j = inter8_cost(f, bx, by, src, vw, vh, ac, d, c1[c], zero, pf, pb, 0, trec, &tdc);
+                j = inter8_cost(f, bx, by, src, vw, vh, ac, d, c1[c], zero, pf, pb, 0, trec, &tdc, &tbands);
                 if (j < ij) {
-                    ij = j; id = d; imf = c1[c]; imb = zero; idc = tdc;
+                    ij = j; id = d; imf = c1[c]; imb = zero; idc = tdc; ibands = tbands;
                     memcpy(irec, trec, sizeof(irec));
                 }
             }
@@ -1036,9 +1056,9 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
             for (int k = 0; k < 8; k++) {
                 SntMV mvf = dirbit == SNT_DIR_FWD ? mv_neighbour(c0, k) : f0;
                 SntMV mvb = dirbit == SNT_DIR_BWD ? mv_neighbour(c0, k) : b0;
-                j = inter8_cost(f, bx, by, src, vw, vh, ac, id, mvf, mvb, pf, pb, 0, trec, &tdc);
+                j = inter8_cost(f, bx, by, src, vw, vh, ac, id, mvf, mvb, pf, pb, 0, trec, &tdc, &tbands);
                 if (j < ij) {
-                    ij = j; imf = mvf; imb = mvb; idc = tdc;
+                    ij = j; imf = mvf; imb = mvb; idc = tdc; ibands = tbands;
                     memcpy(irec, trec, sizeof(irec));
                 }
             }
@@ -1048,16 +1068,16 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
         if (f->is_bidi) {
             SntMV df, db;
             direct_mvs(f, bx, by, &df, &db);
-            j = inter8_cost(f, bx, by, src, vw, vh, ac, SNT_DIR_BI, df, db, pf, pb, 1, trec, &tdc);
+            j = inter8_cost(f, bx, by, src, vw, vh, ac, SNT_DIR_BI, df, db, pf, pb, 1, trec, &tdc, &tbands);
             if (j < ij) {
-                ij = j; id = SNT_DIR_BI; imf = df; imb = db; idc = tdc; idirect = 1;
+                ij = j; id = SNT_DIR_BI; imf = df; imb = db; idc = tdc; ibands = tbands; idirect = 1;
                 memcpy(irec, trec, sizeof(irec));
             }
         }
         if (ij < best_j) {
             best_j = ij; bc->kind = CAND_INTER; bc->dir = id; bc->mvf = imf; bc->mvb = imb;
             bc->direct = idirect;
-            best_dc = idc;
+            best_dc = idc; best_bands = ibands;
             memcpy(best_rec, irec, sizeof(best_rec));
         }
     }
@@ -1066,7 +1086,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
     for (int m = 0; m < SNT_NUM_IPRED; m++) {
         td_prediction(f, bx, by, m, td_pred);
         LumaCode lc;
-        code_luma(cs, NULL, f->step, 0, dc_ctx(f, bx, by), src, td_pred, 1, NULL, &lc);
+        code_luma(cs, NULL, f->step, 0, dc_ctx(f, bx, by), band_ctx(f, bx, by), src, td_pred, 1, NULL, &lc);
         double bits = cdf_bits(&cs->imode[f->is_inter][imode_ctx(f, bx, by)], (uint16_t)m) + lc.bits
                     + (f->is_inter ? cdf_bits(&cs->inter[fc], 0) : 0);
         double j = block_sse(src, lc.recon, vw, vh) + f->lambda * bits;
@@ -1074,7 +1094,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
             j += chroma_intra;
         if (j < best_j) {
             best_j = j; bc->kind = CAND_INTRA; bc->imode = m; bc->dir = 0;
-            bc->mvf = zero; bc->mvb = zero; best_dc = lc.dc_level;
+            bc->mvf = zero; bc->mvb = zero; best_dc = lc.dc_level; best_bands = lc.bands;
             memcpy(best_rec, lc.recon, sizeof(best_rec));
         }
     }
@@ -1088,6 +1108,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
         f->mvb_field[blk] = bc->mvb;
         f->blk_dir[blk] = (uint8_t)bc->dir;
         f->dc_lev[blk] = best_dc;
+        f->bands[blk] = best_bands;
         f->blk_is_skip[blk] = bc->kind == CAND_SKIP;
         f->coded[blk] = 1;
     }
@@ -1123,14 +1144,16 @@ static void emit_inter_body(EncFrame *f, int bx, int by, int dir, SntMV mvf, Snt
         for (int k = 0; k < 64; k++) rec[k] = pred[k];
         finish_block(f, bx, by, rec, 1, dir, mvf, mvb);
         f->dc_lev[by * f->blk_cols + bx] = 0;
+        f->bands[by * f->blk_cols + bx] = 0;
         return;
     }
     LumaCode lc;
     memset(td_pred, 0, sizeof(td_pred));
-    code_luma(f->cs, f->sink, f->step, 1, dc_ctx(f, bx, by), res, td_pred, 0, pred, &lc);
+    code_luma(f->cs, f->sink, f->step, 1, dc_ctx(f, bx, by), band_ctx(f, bx, by), res, td_pred, 0, pred, &lc);
     finish_block(f, bx, by, lc.recon, 0, dir, mvf, mvb);
     f->luma_nz[by * f->blk_cols + bx] = (uint8_t)lc.nz;
     f->dc_lev[by * f->blk_cols + bx] = lc.dc_level;
+    f->bands[by * f->blk_cols + bx] = lc.bands;
 }
 
 static void emit_mvd(EncFrame *f, int size16, int ac, SntMV mv, SntMV mv_pred) {
@@ -1198,10 +1221,11 @@ static void emit_block(EncFrame *f, int bx, int by, const BlockChoice *bc) {
     rec(f->sink, &cs->imode[f->is_inter][imode_ctx(f, bx, by)], (uint16_t)bc->imode);
     td_prediction(f, bx, by, bc->imode, td_pred);
     LumaCode lc;
-    code_luma(cs, f->sink, f->step, 0, dc_ctx(f, bx, by), src, td_pred, 1, NULL, &lc);
+    code_luma(cs, f->sink, f->step, 0, dc_ctx(f, bx, by), band_ctx(f, bx, by), src, td_pred, 1, NULL, &lc);
     finish_block(f, bx, by, lc.recon, 0, 0, (SntMV){0, 0}, (SntMV){0, 0});
     f->luma_nz[by * f->blk_cols + bx] = (uint8_t)lc.nz;
     f->dc_lev[by * f->blk_cols + bx] = lc.dc_level;
+    f->bands[by * f->blk_cols + bx] = lc.bands;
 }
 
 /* A 16x16 inter candidate */
@@ -1531,6 +1555,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     uint8_t *coded = (uint8_t *)calloc(total_blocks, 1);
     uint8_t *luma_nz = (uint8_t *)calloc(total_blocks, 1);
     int16_t *dc_lev = (int16_t *)calloc(total_blocks, sizeof(int16_t));
+    uint16_t *bands = (uint16_t *)calloc(total_blocks, sizeof(uint16_t));
 
     /* MV fields (forward, backward) and prediction directions, for MV
      * prediction, chroma and deblocking */
@@ -1562,7 +1587,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     has_ref2 ? &sp_key : NULL,
                     gmf, gmb,
                     step, RD_LAMBDA * (double)step * step, mv_field, mvb_field, blk_dir,
-                    blk_is_inter, blk_is_skip, acdc, coded, luma_nz, dc_lev,
+                    blk_is_inter, blk_is_skip, acdc, coded, luma_nz, dc_lev, bands,
                     { c_decide ? input_u : NULL, c_decide ? input_v : NULL }, stride_uv, cw, ch,
                     { chroma_ref[0], chroma_ref[1] }, { chroma_ref_b[0], chroma_ref_b[1] },
                     { chroma_ref_2[0], chroma_ref_2[1] }, cstep,
@@ -1819,6 +1844,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     free(coded);
     free(luma_nz);
     free(dc_lev);
+    free(bands);
     free(mv_field);
     free(mvb_field);
     free(blk_dir);

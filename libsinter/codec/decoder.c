@@ -334,6 +334,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     uint8_t *coded = (uint8_t *)calloc(total_blocks_d, 1);
     uint8_t *luma_nz = (uint8_t *)calloc(total_blocks_d, 1);  /* any nonzero luma level? */
     int16_t *dc_lev = (int16_t *)calloc(total_blocks_d, sizeof(int16_t));  /* luma DC levels */
+    uint16_t *bands = (uint16_t *)calloc(total_blocks_d, sizeof(uint16_t));  /* coded luma bands */
 
     /* MV field and block flags for chroma inter derivation */
     SntMV *mv_field = (SntMV *)calloc(blk_cols * blk_rows, sizeof(SntMV));   /* forward MVs */
@@ -536,10 +537,14 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             luma_nz[blk_idx] = dc_level != 0;
             int16_t lv[64] = {0};  /* levels so far, zigzag order */
             lv[0] = dc_level;
+            /* Band flags also by how many of the left and above blocks code
+             * the band */
+            uint16_t lb = bx > 0 ? bands[blk_idx - 1] : 0, ab = by > 0 ? bands[blk_idx - blk_cols] : 0;
             for (int b = 0; b < NUM_BANDS; b++) {
                 int start = band_bounds[b];
                 int n = band_bounds[b + 1] - start;
-                int coded = DEC(cs->band[block_is_inter][b][prev_nz][bcls[b]]) == 1;
+                int coded = DEC(cs->band[block_is_inter][b][prev_nz][bcls[b]][((lb >> b) & 1) + ((ab >> b) & 1)]) == 1;
+                bands[blk_idx] |= (uint16_t)(coded << b);
                 int any = 0;
                 for (int i = 0; i < n; i++) {
                     int16_t level = 0;
@@ -771,6 +776,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     free(coded);
     free(luma_nz);
     free(dc_lev);
+    free(bands);
     free(mv_field);
     free(dctx_dir);
     free(dctx_mv);

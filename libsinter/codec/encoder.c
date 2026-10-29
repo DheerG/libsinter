@@ -49,7 +49,9 @@ static inline uint16_t s2u(int16_t v) {
 }
 
 /* ── Rate estimates for encoder decisions (non-normative) ──────────── */
+#ifndef RD_LAMBDA
 #define RD_LAMBDA 0.14  /* lambda = RD_LAMBDA * step^2 (orthonormal DCT, SSE) */
+#endif
 
 /* Key frames are coded this many QP steps finer than inter frames: every
  * frame until the next key frame predicts from them, so their quality pays
@@ -113,6 +115,19 @@ static double ac_level_bits(SntCdfSet *cs, int t, int k, int pc, int16_t v, int 
 /* Number of nonzero levels among the two before zigzag index k */
 static inline int nz_prev2(const int16_t *lv, int k) {
     return (lv[k - 1] != 0) + (k >= 2 && lv[k - 2] != 0);
+}
+
+/* RD-optimized quantization: the candidates for a coefficient's level are
+ * the rounded level l0, one step toward zero, and zero (K. Ramchandran and
+ * M. Vetterli, "Rate-distortion optimal fast thresholding with complete
+ * JPEG/MPEG decoder compatibility", IEEE TIP 3(5), 1994). Returns their
+ * number; zero is left out when no_zero. */
+static int rd_candidates(int16_t l0, int no_zero, int16_t *cand) {
+    int n = 0;
+    if (l0 != 0) cand[n++] = l0;
+    if (l0 > 1 || l0 < -1) cand[n++] = (int16_t)(l0 > 0 ? l0 - 1 : l0 + 1);
+    if (!no_zero || n == 0) cand[n++] = 0;
+    return n;
 }
 
 static double band_sse(const int16_t *a, const int16_t *b, int n) {
@@ -226,18 +241,23 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
     double bits = 0;
     double lambda = RD_LAMBDA * (double)step * step;
 
-    /* DC: transform-domain intra predicts it; other residuals are zero-mean */
+    /* DC: transform-domain intra predicts it; other residuals are zero-mean.
+     * Keep the best zero and the best nonzero candidate: whether the DC
+     * level is zero is the first band flag's context, so it is decided
+     * with the bands below. */
     int16_t dc_pred = pred ? 0 : td_pred[0];
-    int16_t dc_level = pvq_quantize_dc(coeffs[0] - dc_pred, step, 1);
-    if (sink) {
-        uint16_t dc_sym = s2u(dc_level);
-        rec(sink, &cs->dc[t], dc_sym);
-        if (dc_sym == 255)
-            snt_bw_put_sexpgolomb(sink->ov, dc_level);
-    } else {
-        bits += level_bits(&cs->dc[t], dc_level);
+    int16_t dc_cand[2] = {0, 0};  /* by nonzero? */
+    double dc_j[2] = {1e300, 1e300};
+    {
+        int16_t cand[3];
+        int nc = rd_candidates(pvq_quantize_dc(coeffs[0] - dc_pred, step, 1), 0, cand);
+        for (int c = 0; c < nc; c++) {
+            double d = (double)(coeffs[0] - dc_pred) - pvq_dequantize_dc(cand[c], step);
+            double j = d * d + lambda * level_bits(&cs->dc[t], cand[c]);
+            int nz = cand[c] != 0;
+            if (j < dc_j[nz]) { dc_j[nz] = j; dc_cand[nz] = cand[c]; }
+        }
     }
-    out->dc_recon = pvq_dequantize_dc(dc_level, step) + dc_pred;
 
     /* AC prediction (intra VERT and HORZ modes) */
     if (td_ac)
@@ -253,51 +273,103 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
         snt_pred_classes(pdct, step, snt_zigzag8, band_bounds, NUM_BANDS, kcls, bcls);
     }
 
-    int16_t lv[64] = {0};  /* levels so far, zigzag order */
-    lv[0] = dc_level;
-    int16_t recon_ac[63];
-    memset(recon_ac, 0, sizeof(recon_ac));
     /* Each band is either all zero (flag 0) or has its levels coded (flag
-     * 1). Flag context: is the previous band (for band 0, the DC level)
-     * nonzero? Zero bands come in runs. */
-    int prev_nz = dc_level != 0;
+     * 1). First each band's levels if it is coded, chosen coefficient by
+     * coefficient; zigzag order, index 1 first. */
+    int16_t ac[63], s_level[63], s_recon[63];
+    double j_coded[NUM_BANDS], j_zero[NUM_BANDS], lev_bits[NUM_BANDS];
+    int band_nz[NUM_BANDS];
+    int16_t lv[64] = {0};  /* levels so far, zigzag order */
     for (int b = 0; b < NUM_BANDS; b++) {
-        int start = band_bounds[b];
-        int n = band_bounds[b + 1] - start;
-        SntModel *flag = &cs->band[t][b][prev_nz][bcls[b]];
-
-        int16_t band_coeffs[16], s_level[16], s_recon[16];  /* zigzag order */
-        double s_bits = cdf_bits(flag, 1);
+        int start = band_bounds[b], n = band_bounds[b + 1] - start;
         int s_nz = 0;
-        for (int i = 0; i < n; i++) {
-            band_coeffs[i] = coeffs[snt_zigzag8[1 + start + i]];
-            s_level[i] = pvq_quantize_dc(band_coeffs[i], step, 1);
-            s_recon[i] = pvq_dequantize_dc(s_level[i], step);
+        lev_bits[b] = 0;
+        for (int i = start; i < start + n; i++) {
+            int k = 1 + i;
+            ac[i] = coeffs[snt_zigzag8[k]];
             /* The last level of a coded band is known nonzero if the
-             * others are zero */
-            s_bits += ac_level_bits(cs, t, 1 + start + i, kcls[1 + start + i], s_level[i],
-                                    i == n - 1 && !s_nz, b, nz_prev2(lv, 1 + start + i));
-            lv[1 + start + i] = s_level[i];
+             * others are zero, so it can't be zero then */
+            int z_known = i == start + n - 1 && !s_nz;
+            int16_t cand[3];
+            int nc = rd_candidates(pvq_quantize_dc(ac[i], step, 1), z_known, cand);
+            double best = 1e300, best_bits = 0;
+            for (int c = 0; c < nc; c++) {
+                double d = (double)ac[i] - pvq_dequantize_dc(cand[c], step);
+                double cb = ac_level_bits(cs, t, k, kcls[k], cand[c], z_known, b, nz_prev2(lv, k));
+                if (d * d + lambda * cb < best) {
+                    best = d * d + lambda * cb; best_bits = cb; s_level[i] = cand[c];
+                }
+            }
+            s_recon[i] = pvq_dequantize_dc(s_level[i], step);
+            lev_bits[b] += best_bits;
+            lv[k] = s_level[i];
             s_nz |= s_level[i] != 0;
         }
-
-        /* Coded or zero: least distortion + lambda * bits */
         int16_t zeros[16] = {0};
-        int coded = s_nz && band_sse(band_coeffs, s_recon, n) + lambda * s_bits
-                            < band_sse(band_coeffs, zeros, n) + lambda * cdf_bits(flag, 0);
+        band_nz[b] = s_nz;
+        j_coded[b] = band_sse(&ac[start], &s_recon[start], n) + lambda * lev_bits[b];
+        j_zero[b] = band_sse(&ac[start], zeros, n);
+    }
 
-        if (!coded)
-            for (int i = 0; i < n; i++) lv[1 + start + i] = 0;
+    /* Then coded or zero for all bands at once. A band flag's model
+     * depends on whether the band before it (for band 0, the DC level) is
+     * nonzero, since zero bands come in runs; the least total distortion
+     * + lambda * bits is a shortest path through two states per band
+     * (Viterbi), as in trellis quantization (J. Wen, M. Luttrell and
+     * J. Villasenor, "Trellis-based R-D optimal quantization in H.263+",
+     * IEEE TIP 9(8), 2000). */
+    double cost[2] = { dc_j[0], dc_j[1] };
+    uint8_t from[NUM_BANDS][2];
+    for (int b = 0; b < NUM_BANDS; b++) {
+        double next[2] = {1e300, 1e300};
+        for (int st = 0; st < 2; st++) {
+            if (cost[st] >= 1e300) continue;
+            const SntModel *flag = &cs->band[t][b][st][bcls[b]];
+            double jz = cost[st] + j_zero[b] + lambda * cdf_bits(flag, 0);
+            if (jz < next[0]) { next[0] = jz; from[b][0] = (uint8_t)st; }
+            if (band_nz[b]) {
+                double jc = cost[st] + j_coded[b] + lambda * cdf_bits(flag, 1);
+                if (jc < next[1]) { next[1] = jc; from[b][1] = (uint8_t)st; }
+            }
+        }
+        cost[0] = next[0]; cost[1] = next[1];
+    }
+    int coded[NUM_BANDS];
+    int st = cost[1] < cost[0];
+    for (int b = NUM_BANDS - 1; b >= 0; b--) {
+        coded[b] = st;
+        st = from[b][st];
+    }
+    int16_t dc_level = dc_cand[st];
+
+    if (sink) {
+        uint16_t dc_sym = s2u(dc_level);
+        rec(sink, &cs->dc[t], dc_sym);
+        if (dc_sym == 255)
+            snt_bw_put_sexpgolomb(sink->ov, dc_level);
+    } else {
+        bits += level_bits(&cs->dc[t], dc_level);
+    }
+    out->dc_recon = pvq_dequantize_dc(dc_level, step) + dc_pred;
+
+    int16_t recon_ac[63];
+    memset(recon_ac, 0, sizeof(recon_ac));
+    memset(lv, 0, sizeof(lv));
+    lv[0] = dc_level;
+    int prev_nz = dc_level != 0;
+    for (int b = 0; b < NUM_BANDS; b++) {
+        int start = band_bounds[b], n = band_bounds[b + 1] - start;
+        SntModel *flag = &cs->band[t][b][prev_nz][bcls[b]];
         if (!sink) {
-            bits += coded ? s_bits : cdf_bits(flag, 0);
+            bits += coded[b] ? cdf_bits(flag, 1) + lev_bits[b] : cdf_bits(flag, 0);
         } else {
-            rec(sink, flag, (uint16_t)coded);
-            if (coded) {
+            rec(sink, flag, (uint16_t)coded[b]);
+            if (coded[b]) {
                 int any = 0;
-                for (int i = 0; i < n; i++) {
-                    int k = 1 + start + i;
+                for (int i = start; i < start + n; i++) {
+                    int k = 1 + i;
                     SntLevelBin bins[2 * SNT_LEVEL_MAX_CAT + 4];
-                    int nb = snt_level_bins(s_level[i], i == n - 1 && !any, bins);
+                    int nb = snt_level_bins(s_level[i], i == start + n - 1 && !any, bins);
                     for (int j = 0; j < nb; j++) {
 #ifdef SNT_EXPERIMENT_MIXING
                         if (bins[j].kind == 0 || bins[j].kind == 2) {
@@ -312,13 +384,14 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
                         rec(sink, snt_level_model(cs, t, k, kcls[k], &bins[j]), bins[j].bit);
                     }
                     any |= s_level[i] != 0;
+                    lv[k] = s_level[i];
                 }
             }
         }
-        prev_nz = coded;
-        if (coded)
-            for (int i = 0; i < n; i++)
-                recon_ac[start + i] = s_recon[i];
+        prev_nz = coded[b];
+        if (coded[b])
+            for (int i = start; i < start + n; i++)
+                recon_ac[i] = s_recon[i];
     }
 
     /* Reconstruct coefficients, then pixels */

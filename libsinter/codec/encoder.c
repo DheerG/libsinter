@@ -49,13 +49,19 @@ static SntMixState *cur_mix;
 
 /* Key frames are coded this many QP steps finer than inter frames: every
  * frame until the next key frame predicts from them, so their quality pays
- * off repeatedly. The frame header carries the QP actually used. */
-#define KEY_QP_OFFSET 4
+ * off repeatedly. The frame header carries the QP actually used. 5 was
+ * best by BD-rate with the tools of the more-compression branch (3, 4 and
+ * 6 tried; 6 trades 0.1% of luma BD-rate for 1% on SSIM and 0.7% on YUV). */
+#ifndef KEY_QP_OFFSET
+#define KEY_QP_OFFSET 5
+#endif
 
 /* B-frames are coded this many QP steps coarser: nothing predicts from
- * them, so their errors don't propagate. 4 was best by BD-rate (0, 2,
- * 5 and 6 tried). */
-#define B_QP_OFFSET 4
+ * them, so their errors don't propagate. 5 was best by BD-rate with the
+ * tools of the more-compression branch (3, 4 and 6 tried; 4 before). */
+#ifndef B_QP_OFFSET
+#define B_QP_OFFSET 5
+#endif
 
 /* Dependent quantization across the GOP (K. Ramchandran, A. Ortega and
  * M. Vetterli, "Bit allocation for dependent quantization with

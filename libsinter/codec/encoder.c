@@ -26,6 +26,7 @@
 #include "../core/entropy/rangecoder.h"
 #include "../core/prediction/motion_est.h"
 #include "../core/prediction/mc.h"
+#include "../core/prediction/global_motion.h"
 #include "../core/filter/deblock.h"
 #include "../core/prediction/intra_acdc.h"
 #include "../util/fixed_point.h"
@@ -50,6 +51,12 @@ static inline uint16_t s2u(int16_t v) {
  * them, so their errors don't propagate. 4 was best by BD-rate (0, 2,
  * 5 and 6 tried). */
 #define B_QP_OFFSET 4
+
+/* Global motion estimation counts a block as predicted well enough to
+ * skip when its SSE is below GM_SKIP_SSE * lambda */
+#ifndef GM_SKIP_SSE
+#define GM_SKIP_SSE 30
+#endif
 
 /* Ideal cost in bits of coding sym with model m in its current state. */
 static double cdf_bits(const SntModel *m, uint16_t sym) {
@@ -223,6 +230,7 @@ typedef struct {
     int            is_inter, is_bidi;
     const SntSplinePlane *ref_f;  /* forward (past) luma reference */
     const SntSplinePlane *ref_b;  /* backward (future) luma reference, B-frames */
+    SntMV          gmf, gmb;  /* global motion: skipped blocks predict with it */
     uint16_t       step;
     double         lambda;   /* RD_LAMBDA * step^2 */
     SntMV         *mv_field;  /* per block: forward MV */
@@ -307,8 +315,8 @@ static double inter_mv_bits(const EncFrame *f, int dir, SntMV mvf, SntMV mvb,
     return b;
 }
 
-/* Choose a block's mode by trial encoding: each candidate (skip at zero
- * motion; inter at the searched MVs, forward and in B-frames also
+/* Choose a block's mode by trial encoding: each candidate (skip with the
+ * global motion; inter at the searched MVs, forward and in B-frames also
  * backward and bi-directional; intra in each mode) is coded without
  * emitting anything, and the least distortion + lambda * bits wins.
  * Returns that cost. With `provisional`, the winner's reconstruction,
@@ -332,15 +340,15 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
         uint8_t p[64];
         int16_t p16[64], res[64];
 
-        /* Skip: prediction at zero motion (bi-directional in B-frames),
-         * nothing else coded */
+        /* Skip: prediction with the global motion (bi-directional in
+         * B-frames), nothing else coded */
         int sdir = f->is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
-        snt_pred_luma8(f->ref_f, f->ref_b, px0, py0, sdir, zero, zero, p);
+        snt_pred_luma8(f->ref_f, f->ref_b, px0, py0, sdir, f->gmf, f->gmb, p);
         for (int k = 0; k < 64; k++) p16[k] = p[k];
         double j = block_sse(src, p16, vw, vh)
                  + f->lambda * (cdf_bits(&cs->inter, 1) + cdf_bits(&cs->iskip, 1));
         if (j < best_j) {
-            best_j = j; bc->kind = CAND_SKIP; bc->dir = sdir; bc->mvf = zero; bc->mvb = zero;
+            best_j = j; bc->kind = CAND_SKIP; bc->dir = sdir; bc->mvf = f->gmf; bc->mvb = f->gmb;
             memcpy(best_rec, p16, sizeof(best_rec));
         }
 
@@ -455,9 +463,8 @@ static void emit_block(EncFrame *f, int bx, int by, const BlockChoice *bc) {
         if (bc->kind != CAND_INTRA) {
             rec(f->sink, &cs->iskip, bc->kind == CAND_SKIP);
             if (bc->kind == CAND_SKIP) {
-                /* Skip predicts at zero motion */
-                SntMV zero = {0, 0};
-                emit_inter_body(f, bx, by, f->is_bidi ? SNT_DIR_BI : SNT_DIR_FWD, zero, zero, 1);
+                /* Skip predicts with the global motion */
+                emit_inter_body(f, bx, by, f->is_bidi ? SNT_DIR_BI : SNT_DIR_FWD, f->gmf, f->gmb, 1);
             } else {
                 /* An unused direction's MV is zero, as in the decoder */
                 SntMV zero = {0, 0};
@@ -489,7 +496,7 @@ typedef struct {
 } Mb16Choice;
 
 /* 16x16 candidates for the full macroblock whose top-left block is
- * (bx0, by0): skip at zero motion, and inter at
+ * (bx0, by0): skip with the global motion, and inter at
  * 16x16-searched MVs with each 8x8 residual coded (forward; in B-frames
  * also backward and bi-directional). Returns the skip cost and the best
  * inter candidate. */
@@ -513,7 +520,7 @@ static double eval_mb16(EncFrame *f, int bx0, int by0, SntMV pf, SntMV pb, Mb16C
             int vw, vh;
             load_src(f, bx, by, src, &vw, &vh);
             if (d == SNT_DIR_FWD) {
-                mc_residual(f, bx, by, sdir, zero, zero, src, vw, vh, p, res);
+                mc_residual(f, bx, by, sdir, f->gmf, f->gmb, src, vw, vh, p, res);
                 for (int k = 0; k < 64; k++) p16[k] = p[k];
                 d_skip += block_sse(src, p16, vw, vh);
             }
@@ -571,10 +578,9 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
         for (int z = 0; z < 4; z++)
             emit_block(f, bx0 + (z & 1), by0 + (z >> 1), &bc[z]);
     } else if (mode == SNT_MB_SKIP16) {
-        SntMV zero = {0, 0};
         for (int z = 0; z < 4; z++)
             emit_inter_body(f, bx0 + (z & 1), by0 + (z >> 1),
-                            f->is_bidi ? SNT_DIR_BI : SNT_DIR_FWD, zero, zero, 1);
+                            f->is_bidi ? SNT_DIR_BI : SNT_DIR_FWD, f->gmf, f->gmb, 1);
     } else {
         emit_inter_mvs(f, m16.dir, m16.mvf, m16.mvb, pf, pb);
         for (int z = 0; z < 4; z++)
@@ -591,7 +597,7 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
  * FOR each 16x16 macroblock (raster):
  *   IF inter frame AND all four 8x8 blocks inside the frame:
  *     REC(mbmode, m)                // SNT_MB_SPLIT / SKIP16 / INTER16
- *     IF SKIP16:  (all four blocks: MC prediction at zero motion)
+ *     IF SKIP16:  (all four blocks: MC prediction with the global motion)
  *     IF INTER16: [B: REC(bdir, dir - 1)], REC(mvx, mvy) per used direction,
  *                 then FOR each 8x8 block in Z order:
  *                 DC + bands as an inter-coded block (below)
@@ -600,7 +606,7 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
  *     REC(inter, inter_flag)        // 0=intra, 1=inter
  *     IF inter_flag:
  *       REC(iskip, skip_flag)       // 0=coded, 1=skip
- *       IF skip: (no more symbols; prediction at zero motion,
+ *       IF skip: (no more symbols; prediction with the global motion,
  *                 bi-directional in B-frames)
  *       IF coded:
  *         [B-frame: REC(bdir, dir - 1)]
@@ -657,10 +663,30 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         for (int x = 0; x < width; x++)
             work[y * pad_w + x] = (int16_t)input_y[y * stride_y + x];
 
+    /* Global motion of this frame against each reference (encoder's
+     * estimate); skipped blocks predict with it */
+    SntSplinePlane sp_new = { ctx->ref_y, ctx->ref_coef, width, height };
+    SntSplinePlane sp_old = { ctx->ref_old_y, ctx->ref_old_coef, width, height };
+    SntMV gmf = {0, 0}, gmb = {0, 0};
+    if (is_inter) {
+        double skip_sse = GM_SKIP_SSE * RD_LAMBDA * (double)step * step;
+        gmf = snte_global_motion(input_y, is_bidi ? &sp_old : &sp_new, width, height, skip_sse);
+        if (is_bidi)
+            gmb = snte_global_motion(input_y, &sp_new, width, height, skip_sse);
+    }
+
     /* ── SECTION A: Fixed header ──────────────────────────────────── */
     snt_bw_byte_align(&bw);
     snt_bw_put_bits(&bw, (uint32_t)total_blocks, 16);
     snt_bw_put_bits(&bw, (input_u && input_v) ? 1u : 0u, 1);
+    if (is_inter) {
+        snt_bw_put_sexpgolomb(&bw, gmf.x);
+        snt_bw_put_sexpgolomb(&bw, gmf.y);
+    }
+    if (is_bidi) {
+        snt_bw_put_sexpgolomb(&bw, gmb.x);
+        snt_bw_put_sexpgolomb(&bw, gmb.y);
+    }
     snt_bw_byte_align(&bw);
 
     /* ── Range coder and overflow buffers ──────────────────────────── */
@@ -712,11 +738,9 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
      * macroblock in Z order (top-left, top-right, bottom-left, bottom-right).
      * P-frames predict from the newest anchor; B-frames forward from the
      * older anchor and backward from the newest. */
-    SntSplinePlane sp_new = { ctx->ref_y, ctx->ref_coef, width, height };
-    SntSplinePlane sp_old = { ctx->ref_old_y, ctx->ref_old_coef, width, height };
     EncFrame ef = { ctx, cs, &sink, input_y, work, recon, width, height, pad_w, blk_cols,
                     is_inter, is_bidi,
-                    is_bidi ? &sp_old : &sp_new, is_bidi ? &sp_new : NULL,
+                    is_bidi ? &sp_old : &sp_new, is_bidi ? &sp_new : NULL, gmf, gmb,
                     step, RD_LAMBDA * (double)step * step, mv_field, mvb_field, blk_dir,
                     blk_is_inter, blk_is_skip, acdc, coded };
     int mb_cols = (blk_cols + 1) / 2, mb_rows = (blk_rows + 1) / 2;

@@ -34,6 +34,7 @@ DECODER_SRC="
   $SRCDIR/core/prediction/motion_est.c
   $SRCDIR/core/prediction/mc.c
   $SRCDIR/core/prediction/spline.c
+  $SRCDIR/core/prediction/global_motion.c
   $SRCDIR/core/filter/deblock.c
   $SRCDIR/core/partition/quadtree.c
   $SRCDIR/core/grain/grain_synth.c

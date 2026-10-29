@@ -63,7 +63,7 @@ static void dec_pred_chroma(const uint8_t *rf, const uint8_t *rb, int w, int h, 
  *     DEC(inter) → inter_flag
  *     IF inter_flag:
  *       DEC(iskip) → skip_flag
- *       IF skip: prediction at zero motion, continue (B: bi-directional)
+ *       IF skip: prediction with the global motion, continue (B: bi-directional)
  *       IF coded: [B: DEC(bdir)], then DEC(mvx), DEC(mvy) per used direction
  *   IF intra block: DEC(imode[is_inter_frame]) → mode (SNT_IPRED_*, intra_acdc.h)
  *   DEC(dc[t]) → dc_level (residual for inter, absolute for intra)
@@ -108,6 +108,16 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     uint32_t total_blocks = snt_br_get_bits(&br, 16);
     (void)total_blocks;
     uint32_t chroma_present = snt_br_get_bits(&br, 1);
+    /* Global motion against each reference: skipped blocks predict with it */
+    SntMV gmf = {0, 0}, gmb = {0, 0};
+    if (is_inter) {
+        gmf.x = (int16_t)snt_br_get_sexpgolomb(&br);
+        gmf.y = (int16_t)snt_br_get_sexpgolomb(&br);
+    }
+    if (is_bidi) {
+        gmb.x = (int16_t)snt_br_get_sexpgolomb(&br);
+        gmb.y = (int16_t)snt_br_get_sexpgolomb(&br);
+    }
     snt_br_byte_align(&br);
 
     /* ── SECTION B: Read the range-coded payload ───────────────────── */
@@ -173,11 +183,12 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             if (is_bidi)
                 mb_mvb = snt_mv_predict_at(mvb_field, blk_cols, bx0, by0);
             mb_mode = DEC(cs->mbmode);
-            /* SKIP16 predicts at zero motion: bi-directional in B-frames */
+            /* SKIP16 predicts with the global motion: bi-directional in
+             * B-frames */
             mb_dir = is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
             if (mb_mode == SNT_MB_SKIP16) {
-                mb_mvf = (SntMV){0, 0};
-                mb_mvb = (SntMV){0, 0};
+                mb_mvf = gmf;
+                mb_mvb = gmb;
             }
             if (mb_mode == SNT_MB_INTER16) {
                 mb_dir = is_bidi ? DEC(cs->bdir) + 1 : SNT_DIR_FWD;
@@ -210,11 +221,13 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 if (mb_mode == SNT_MB_SPLIT) {
                     block_is_inter = DEC(cs->inter) == 1;
                     if (block_is_inter) {
-                        /* A skip block predicts at zero motion; a coded
-                         * block's MVs are coded against the median of its
-                         * neighbours' (an unused direction's MV is zero) */
+                        /* A skip block predicts with the global motion; a
+                         * coded block's MVs are coded against the median of
+                         * its neighbours' (an unused direction's MV is zero) */
                         block_is_skip = DEC(cs->iskip) == 1;
                         dir = is_bidi ? SNT_DIR_BI : SNT_DIR_FWD;
+                        best_mv = gmf;
+                        best_mvb = gmb;
                         if (!block_is_skip) {
                             best_mv = snt_mv_predict_at(mv_field, blk_cols, bx, by);
                             if (is_bidi)

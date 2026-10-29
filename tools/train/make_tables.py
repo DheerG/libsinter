@@ -13,34 +13,17 @@ from collections import defaultdict
 MIN_COUNT = 200
 counts = defaultdict(lambda: [0] * 256)
 nsets = nclasses = nmodels = 0
+size_of = {}
 for path in sys.argv[1:]:
     for line in open(path):
         f = list(map(int, line.split()))
-        s, c, k, h = f[0], f[1], f[2], f[3:]
+        s, c, k, size_of[k], h = f[0], f[1], f[2], f[3], f[4:]
         acc = counts[(s, c, k)]
         for i, v in enumerate(h):
             acc[i] += v
         nsets, nclasses, nmodels = max(nsets, s + 1), max(nclasses, c + 1), max(nmodels, k + 1)
 
-# Alphabet size of each model: the largest symbol ever seen decides between
-# the coefficient-like (256) and the small alphabets, which are listed here
-# in the struct order of SntCdfSet (cdf_set.h).
-def model_sizes():
-    sizes = []
-    sizes += [256] * 2           # dc[2]
-    sizes += [256] * 8           # ac[2][4]
-    sizes += [2] * (2 * 16 * 2)  # band[2][16][2]
-    sizes += [3] * 2             # imode[2]
-    sizes += [3]                 # mbmode
-    sizes += [3]                 # bdir
-    sizes += [2, 2]              # inter, iskip
-    sizes += [256, 256]          # mvx, mvy
-    sizes += [256] * 2           # cdc[2]
-    sizes += [256] * 6           # cac[2][3]
-    return sizes
-
-sizes = model_sizes()
-assert len(sizes) == nmodels, (len(sizes), nmodels)
+sizes = [size_of[k] for k in range(nmodels)]
 offsets = [0]
 for n in sizes:
     offsets.append(offsets[-1] + n)

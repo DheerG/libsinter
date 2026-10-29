@@ -4,8 +4,8 @@
 
 ```bash
 # 1. A library that counts symbols, and the collector
-make BUILD=build_train CFLAGS="-std=c11 -O2 -I libsinter -DSNT_TRAIN_STATS" build_train/libsinter.a
-gcc -std=c11 -O2 -I libsinter -DSNT_TRAIN_STATS tools/train/collect_stats.c \
+make BUILD=build_train CFLAGS="-std=c11 -O2 -I libsinter -DSNT_TRAIN_STATS -DSNT_NO_TRAINED_TABLES" build_train/libsinter.a
+gcc -std=c11 -O2 -I libsinter -DSNT_TRAIN_STATS -DSNT_NO_TRAINED_TABLES tools/train/collect_stats.c \
     -Lbuild_train -lsinter -lm -o build_train/collect_stats
 
 # 2. Counts from 60 frames of each training clip at seven QPs (one file per clip)
@@ -18,4 +18,4 @@ done
 python3 tools/train/make_tables.py *_cif.stats > libsinter/codec/model_tables.h
 ```
 
-Regenerate the tables whenever the model set in `cdf_set.h` changes (a static assertion in the header catches a mismatch in the number of models) or the encoder's decisions change much.
+The training build starts every model uniform (`SNT_NO_TRAINED_TABLES`), so the counts don't depend on the previous tables. Regenerate the tables whenever the model set in `cdf_set.h` changes (a static assertion in the header catches a mismatch in the number of models) or the encoder's decisions change much.

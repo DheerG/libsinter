@@ -17,9 +17,9 @@
 
 #include "../core/entropy/rangecoder.h"
 #include "../core/prediction/intra_acdc.h"
+#include "levels.h"
 
 #define SNT_NUM_BANDS   16
-#define SNT_AC_GROUPS    4  /* luma AC contexts: band / 4 */
 #define SNT_CAC_GROUPS   3  /* chroma AC contexts: by frequency, see snt_cac_group */
 
 /* Macroblock modes in inter frames (full 16x16 macroblocks only) */
@@ -32,7 +32,12 @@ enum {
 
 typedef struct {
     SntModel dc[2];                    /* luma DC residual, by block type */
-    SntModel ac[2][SNT_AC_GROUPS];     /* luma scalar AC level */
+    /* luma AC levels as binary decisions (levels.h), by block type */
+    SntModel acz[2][64];               /* Z: nonzero?, by zigzag index */
+    SntModel acs[2];                   /* S: negative? */
+    SntModel acg[2][64];               /* G: |v| > 1?, by zigzag index */
+    SntModel acx[2][2][SNT_LEVEL_MAX_CAT];      /* X: category, by low/high index */
+    SntModel acm[2][SNT_LEVEL_MAX_CAT + 1];     /* M: magnitude bits, by category */
     SntModel band[2][SNT_NUM_BANDS][2];  /* band coded (1) or all zero (0); by previous band nonzero */
     SntModel imode[2];                 /* intra mode, by frame type (0 key, 1 inter) */
     SntModel mbmode;                   /* macroblock mode (SNT_MB_*) */
@@ -68,8 +73,16 @@ static inline void snt_cdf_set_init_uniform(SntCdfSet *s) {
         snt_model_init(&s->dc[t], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
         snt_model_init(&s->imode[t], SNT_NUM_IPRED, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         snt_model_init(&s->cdc[t], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
-        for (int g = 0; g < SNT_AC_GROUPS; g++)
-            snt_model_init(&s->ac[t][g], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
+        for (int k = 0; k < 64; k++) {
+            snt_model_init(&s->acz[t][k], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+            snt_model_init(&s->acg[t][k], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+        }
+        snt_model_init(&s->acs[t], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+        for (int i = 0; i < SNT_LEVEL_MAX_CAT; i++)
+            for (int h = 0; h < 2; h++)
+                snt_model_init(&s->acx[t][h][i], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+        for (int c = 0; c <= SNT_LEVEL_MAX_CAT; c++)
+            snt_model_init(&s->acm[t][c], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         for (int g = 0; g < SNT_CAC_GROUPS; g++)
             snt_model_init(&s->cac[t][g], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
         for (int b = 0; b < SNT_NUM_BANDS; b++) {
@@ -85,7 +98,9 @@ static inline void snt_cdf_set_init_uniform(SntCdfSet *s) {
     snt_model_init(&s->mvy, 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
 }
 
+#ifndef SNT_NO_TRAINED_TABLES
 #include "model_tables.h"
+#endif
 
 /* Weight of a trained starting table, in observations (increments):
  * chosen by BD-rate on the tuning clips (16 to 256 were within 0.1%) */
@@ -99,6 +114,9 @@ static inline void snt_cdf_set_init_uniform(SntCdfSet *s) {
  * uniform. */
 static inline void snt_cdf_set_init(SntCdfSet *s, int set, int qp) {
     snt_cdf_set_init_uniform(s);
+#ifdef SNT_NO_TRAINED_TABLES
+    (void)set; (void)qp;  /* training builds start uniform */
+#else
     int cls = snt_model_class(qp);
     SntModel *m = (SntModel *)s;
     for (int k = 0; k < SNT_NUM_MODELS; k++) {
@@ -113,6 +131,18 @@ static inline void snt_cdf_set_init(SntCdfSet *s, int set, int qp) {
             total += m[k].freq[i];
         }
         m[k].total = total;
+    }
+#endif
+}
+
+/* Model for decision b of a luma AC level at zigzag index k (levels.h) */
+static inline SntModel *snt_level_model(SntCdfSet *s, int t, int k, const SntLevelBin *b) {
+    switch (b->kind) {
+    case 0:  return &s->acz[t][k];
+    case 1:  return &s->acs[t];
+    case 2:  return &s->acg[t][k];
+    case 3:  return &s->acx[t][k > SNT_LEVEL_KLOW][b->sub];
+    default: return &s->acm[t][b->sub];
     }
 }
 

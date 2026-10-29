@@ -175,7 +175,9 @@ int main(int argc, char **argv) {
     ectx.header.num_tile_cols = 1;
     ectx.header.num_tile_rows = 1;
     ectx.header.chroma_qp_offset = 4;
+#ifdef SNT_ENCODER_KEYINT
     ectx.keyint = keyint;
+#endif
     ectx.psy_cfg.alpha = 0.5f;
     ectx.psy_cfg.qp_clamp = 6;
     SntDecoderCtx dctx;

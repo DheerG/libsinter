@@ -29,6 +29,7 @@
  * difference against the quantizer step: below step/8, below step/2,
  * above. The class selects the mode models. */
 #define SNT_AGREE_CLASSES 3
+#define SNT_DC_CONTEXTS  10  /* luma DC contexts, see snt_dc_context */
 static inline int snt_agree_class(uint32_t sad, int npix, uint16_t step) {
     uint64_t s8 = 8ull * sad, s2 = 2ull * sad, ns = (uint64_t)npix * step;
     return s8 < ns ? 0 : (s2 < ns ? 1 : 2);
@@ -43,7 +44,11 @@ enum {
 };
 
 typedef struct {
-    SntModel dc[2];                    /* luma DC residual, by block type */
+    /* luma DC level as binary decisions (levels.h), by block type; Z, S and
+     * G also by the DC context (snt_dc_context), G also by sign */
+    SntModel dz[2][SNT_DC_CONTEXTS], ds[2][SNT_DC_CONTEXTS], dg[2][SNT_DC_CONTEXTS][2];
+    SntModel dx[2][SNT_LEVEL_MAX_CAT];       /* X: category */
+    SntModel dm[2][SNT_LEVEL_MAX_CAT + 1];   /* M: magnitude bits, by category */
     /* luma AC levels as binary decisions (levels.h), by block type */
     SntModel acz[2][64][SNT_PRED_CLASSES];  /* Z: nonzero?, by zigzag index, prediction class */
     SntModel acs[2];                   /* S: negative? */
@@ -83,7 +88,16 @@ static inline int snt_model_class(int qp) {
 
 static inline void snt_cdf_set_init_uniform(SntCdfSet *s) {
     for (int t = 0; t < 2; t++) {
-        snt_model_init(&s->dc[t], 256, SNT_RC_INIT_COEFF, SNT_RC_INC_COEFF, SNT_RC_LIMIT_COEFF);
+        for (int a = 0; a < SNT_DC_CONTEXTS; a++) {
+            snt_model_init(&s->dz[t][a], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+            snt_model_init(&s->ds[t][a], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+            for (int n = 0; n < 2; n++)
+                snt_model_init(&s->dg[t][a][n], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+        }
+        for (int i = 0; i < SNT_LEVEL_MAX_CAT; i++)
+            snt_model_init(&s->dx[t][i], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
+        for (int c = 0; c <= SNT_LEVEL_MAX_CAT; c++)
+            snt_model_init(&s->dm[t][c], 2, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         snt_model_init(&s->imode[t], SNT_NUM_IPRED, SNT_RC_INIT_MODE, SNT_RC_INC_MODE, SNT_RC_LIMIT_MODE);
         for (int k = 0; k < 64; k++) {
             for (int p = 0; p < SNT_PRED_CLASSES; p++)
@@ -172,6 +186,33 @@ static inline SntModel *snt_level_model(SntCdfSet *s, int t, int k, int pc, cons
     case 2:  return &s->acg[t][k][pc];
     case 3:  return &s->acx[t][k > SNT_LEVEL_KLOW][b->sub];
     default: return &s->acm[t][b->sub];
+    }
+}
+
+/* Class of a DC level for the next block's DC context, as JPEG classifies
+ * the previous DC difference (T.81 F.1.4.4.1, with its default bounds
+ * L = 0, U = 1): zero, small positive (1, 2), small negative, large
+ * positive, large negative */
+static inline int snt_dc_class(int v) {
+    if (v == 0) return 0;
+    if (v > 0) return v <= 2 ? 1 : 3;
+    return v >= -2 ? 2 : 4;
+}
+
+/* DC context of a luma block: the class of the left block's DC level,
+ * and whether the above block's is nonzero (0 for a missing neighbour) */
+static inline int snt_dc_context(int left, int above) {
+    return snt_dc_class(left) + 5 * (above != 0);
+}
+
+/* Model for decision b of a luma DC level v in DC context da */
+static inline SntModel *snt_dclevel_model(SntCdfSet *s, int t, int da, int16_t v, const SntLevelBin *b) {
+    switch (b->kind) {
+    case 0:  return &s->dz[t][da];
+    case 1:  return &s->ds[t][da];
+    case 2:  return &s->dg[t][da][v < 0];
+    case 3:  return &s->dx[t][b->sub];
+    default: return &s->dm[t][b->sub];
     }
 }
 

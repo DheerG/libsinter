@@ -112,6 +112,16 @@ static double ac_level_bits(SntCdfSet *cs, int t, int k, int pc, int16_t v, int 
     return bits;
 }
 
+/* Bits for a luma DC level v in DC context da, with the models' current
+ * state */
+static double dc_level_bits(SntCdfSet *cs, int t, int da, int16_t v) {
+    SntLevelBin bins[2 * SNT_LEVEL_MAX_CAT + 4];
+    int n = snt_level_bins(v, 0, bins);
+    double bits = 0;
+    for (int i = 0; i < n; i++) bits += cdf_bits(snt_dclevel_model(cs, t, da, v, &bins[i]), bins[i].bit);
+    return bits;
+}
+
 /* Number of nonzero levels among the two before zigzag index k */
 static inline int nz_prev2(const int16_t *lv, int k) {
     return (lv[k - 1] != 0) + (k >= 2 && lv[k - 2] != 0);
@@ -223,6 +233,7 @@ typedef struct {
     int16_t dc_recon;          /* reconstructed DC coefficient */
     double  bits;              /* estimated bits (estimate mode only) */
     int     nz;                /* any nonzero level (the DC or a coded band) */
+    int16_t dc_level;          /* the DC level (the next block's DC context) */
 } LumaCode;
 
 /* Code one 8x8 luma block's DC and bands.
@@ -230,11 +241,12 @@ typedef struct {
  * td_pred: coefficient prediction (intra_acdc.h), used when pred is NULL:
  *   the DC, plus the first row or column when td_ac. pred: prediction
  *   block added back on reconstruction (NULL for intra).
- * t: context block type (0 intra, 1 inter).
+ * t: context block type (0 intra, 1 inter). da: the DC level's context
+ *   (snt_dc_context).
  * With a sink, symbols are emitted and models adapt as they go. Without
  * one, nothing is emitted, the models are untouched, and out->bits
  * estimates the cost from their current state. */
-static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
+static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t, int da,
                       const int16_t *dct_in, const int16_t *td_pred, int td_ac,
                       const uint8_t *pred, LumaCode *out) {
     int16_t coeffs[64];
@@ -254,7 +266,7 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
         int nc = rd_candidates(pvq_quantize_dc(coeffs[0] - dc_pred, step, 1), 0, cand);
         for (int c = 0; c < nc; c++) {
             double d = (double)(coeffs[0] - dc_pred) - pvq_dequantize_dc(cand[c], step);
-            double j = d * d + lambda * level_bits(&cs->dc[t], cand[c]);
+            double j = d * d + lambda * dc_level_bits(cs, t, da, cand[c]);
             int nz = cand[c] != 0;
             if (j < dc_j[nz]) { dc_j[nz] = j; dc_cand[nz] = cand[c]; }
         }
@@ -344,12 +356,12 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
     int16_t dc_level = dc_cand[st];
 
     if (sink) {
-        uint16_t dc_sym = s2u(dc_level);
-        rec(sink, &cs->dc[t], dc_sym);
-        if (dc_sym == 255)
-            snt_bw_put_sexpgolomb(sink->ov, dc_level);
+        SntLevelBin bins[2 * SNT_LEVEL_MAX_CAT + 4];
+        int nb = snt_level_bins(dc_level, 0, bins);
+        for (int k = 0; k < nb; k++)
+            rec(sink, snt_dclevel_model(cs, t, da, dc_level, &bins[k]), bins[k].bit);
     } else {
-        bits += level_bits(&cs->dc[t], dc_level);
+        bits += dc_level_bits(cs, t, da, dc_level);
     }
     out->dc_recon = pvq_dequantize_dc(dc_level, step) + dc_pred;
 
@@ -396,6 +408,7 @@ static void code_luma(SntCdfSet *cs, SymSink *sink, uint16_t step, int t,
     }
 
     out->nz = dc_level != 0;
+    out->dc_level = dc_level;
     for (int b = 0; b < NUM_BANDS; b++) out->nz |= coded[b];
 
     /* Reconstruct coefficients, then pixels */
@@ -506,6 +519,7 @@ typedef struct {
                                 reconstruction, for intra prediction */
     uint8_t       *coded;    /* per block: coded yet? */
     uint8_t       *luma_nz;  /* per block: any nonzero luma level? (chroma flag context) */
+    int16_t       *dc_lev;   /* per block: luma DC level (the DC context of the blocks right and below) */
     /* Chroma, for the cost of each candidate: source planes (NULL without
      * chroma), their stride and size, references and step */
     const uint8_t *src_c[2];
@@ -544,6 +558,12 @@ static void td_prediction(const EncFrame *f, int bx, int by, int m, int16_t *td_
     int i = by * f->blk_cols + bx;
     snt_acdc_predict(m, bx > 0 ? &f->acdc[(i - 1) * SNT_ACDC_STATE] : NULL,
                      by > 0 ? &f->acdc[(i - f->blk_cols) * SNT_ACDC_STATE] : NULL, td_pred);
+}
+
+/* DC context of block (bx, by) (snt_dc_context) */
+static inline int dc_ctx(const EncFrame *f, int bx, int by) {
+    int i = by * f->blk_cols + bx;
+    return snt_dc_context(bx > 0 ? f->dc_lev[i - 1] : 0, by > 0 ? f->dc_lev[i - f->blk_cols] : 0);
 }
 
 /* Record a reconstructed block's coefficients for its neighbours' intra
@@ -753,15 +773,17 @@ static double chroma_cost(const EncFrame *f, int bx, int by, int kind, int dir,
 
 /* Cost (distortion + lambda * bits) of 8x8 block (bx, by) coded inter in
  * direction d at (mvf, mvb), with its mode flags (agreement class ac) and
- * MV deltas; its reconstruction in rec */
+ * MV deltas; its reconstruction in rec, its DC level in *dc_level */
 static double inter8_cost(const EncFrame *f, int bx, int by, const int16_t *src, int vw, int vh,
-                          int ac, int d, SntMV mvf, SntMV mvb, SntMV pf, SntMV pb, int16_t *rec) {
+                          int ac, int d, SntMV mvf, SntMV mvb, SntMV pf, SntMV pb, int16_t *rec,
+                          int16_t *dc_level) {
     uint8_t p[64];
     int16_t res[64], td0[64] = {0};
     LumaCode lc;
     mc_residual(f, bx, by, d, mvf, mvb, src, vw, vh, p, res);
-    code_luma(f->cs, NULL, f->step, 1, res, td0, 0, p, &lc);
+    code_luma(f->cs, NULL, f->step, 1, dc_ctx(f, bx, by), res, td0, 0, p, &lc);
     memcpy(rec, lc.recon, sizeof(lc.recon));
+    *dc_level = lc.dc_level;
     return block_sse(src, lc.recon, vw, vh) + chroma_cost(f, bx, by, CAND_INTER, d, mvf, mvb, lc.nz)
          + f->lambda * (cdf_bits(&f->cs->inter[ac], 1) + cdf_bits(&f->cs->iskip[ac], 0)
                         + inter_mv_bits(f, d, mvf, mvb, pf, pb) + lc.bits);
@@ -772,6 +794,7 @@ static double inter8_cost(const EncFrame *f, int bx, int by, const int16_t *src,
 static double inter16_cost(const EncFrame *f, int bx0, int by0, int mac, int d, SntMV mvf,
                            SntMV mvb, SntMV pf, SntMV pb) {
     double dist = 0, bits = 0;
+    int16_t dcl[4];  /* the blocks' DC levels */
     for (int z = 0; z < 4; z++) {
         int bx = bx0 + (z & 1), by = by0 + (z >> 1), vw, vh;
         int16_t src[64], res[64], td0[64] = {0};
@@ -779,7 +802,14 @@ static double inter16_cost(const EncFrame *f, int bx0, int by0, int mac, int d, 
         LumaCode lc;
         load_src(f, bx, by, src, &vw, &vh);
         mc_residual(f, bx, by, d, mvf, mvb, src, vw, vh, p, res);
-        code_luma(f->cs, NULL, f->step, 1, res, td0, 0, p, &lc);
+        /* DC context, with the DC levels of this candidate's blocks inside
+         * the macroblock */
+        int i = by * f->blk_cols + bx;
+        int left = (z & 1) ? dcl[z - 1] : (bx > 0 ? f->dc_lev[i - 1] : 0);
+        int above = (z & 2) ? dcl[z - 2] : (by > 0 ? f->dc_lev[i - f->blk_cols] : 0);
+        code_luma(f->cs, NULL, f->step, 1, snt_dc_context(left, above),
+                  res, td0, 0, p, &lc);
+        dcl[z] = lc.dc_level;
         dist += block_sse(src, lc.recon, vw, vh) + chroma_cost(f, bx, by, CAND_INTER, d, mvf, mvb, lc.nz);
         bits += lc.bits;
     }
@@ -803,7 +833,7 @@ static inline SntMV mv_neighbour(SntMV mv, int k) {
 static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockChoice *bc) {
     SntCdfSet *cs = f->cs;
     int blk = by * f->blk_cols + bx, px0 = bx * BLK, py0 = by * BLK;
-    int16_t src[64], td_pred[64], best_rec[64];
+    int16_t src[64], td_pred[64], best_rec[64], best_dc = 0;
     int vw, vh;
     load_src(f, bx, by, src, &vw, &vh);
 
@@ -830,6 +860,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
                  + f->lambda * (cdf_bits(&cs->inter[ac], 1) + cdf_bits(&cs->iskip[ac], 1));
         if (j < best_j) {
             best_j = j; bc->kind = CAND_SKIP; bc->dir = sdir; bc->mvf = smf; bc->mvb = smb;
+            best_dc = 0;
             memcpy(best_rec, p16, sizeof(best_rec));
         }
 
@@ -841,7 +872,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
         double jdir[2] = {1e300, 1e300}, ij = 1e300;
         int id = 0;
         SntMV imf = zero, imb = zero;
-        int16_t irec[64], trec[64];
+        int16_t irec[64], trec[64], idc = 0, tdc;
         for (int cand = 0; cand < (f->is_bidi ? 3 * ncand + 1 : ncand); cand++) {
             int d, c;
             mv_cand_index(ncand, cand, &d, &c);
@@ -849,10 +880,10 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
             /* An unused direction's MV is zero (H.263 Annex O) */
             SntMV mvf = (d & SNT_DIR_FWD) ? cf[c] : zero;
             SntMV mvb = (d & SNT_DIR_BWD) ? cb[c] : zero;
-            j = inter8_cost(f, bx, by, src, vw, vh, ac, d, mvf, mvb, pf, pb, trec);
+            j = inter8_cost(f, bx, by, src, vw, vh, ac, d, mvf, mvb, pf, pb, trec, &tdc);
             mv_cand_best(d, j, mvf, mvb, jdir, cf, cb, ncand);
             if (j < ij) {
-                ij = j; id = d; imf = mvf; imb = mvb;
+                ij = j; id = d; imf = mvf; imb = mvb; idc = tdc;
                 memcpy(irec, trec, sizeof(irec));
             }
         }
@@ -868,15 +899,16 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
             for (int k = 0; k < 8; k++) {
                 SntMV mvf = dirbit == SNT_DIR_FWD ? mv_neighbour(c0, k) : f0;
                 SntMV mvb = dirbit == SNT_DIR_BWD ? mv_neighbour(c0, k) : b0;
-                j = inter8_cost(f, bx, by, src, vw, vh, ac, id, mvf, mvb, pf, pb, trec);
+                j = inter8_cost(f, bx, by, src, vw, vh, ac, id, mvf, mvb, pf, pb, trec, &tdc);
                 if (j < ij) {
-                    ij = j; imf = mvf; imb = mvb;
+                    ij = j; imf = mvf; imb = mvb; idc = tdc;
                     memcpy(irec, trec, sizeof(irec));
                 }
             }
         }
         if (ij < best_j) {
             best_j = ij; bc->kind = CAND_INTER; bc->dir = id; bc->mvf = imf; bc->mvb = imb;
+            best_dc = idc;
             memcpy(best_rec, irec, sizeof(best_rec));
         }
     }
@@ -885,7 +917,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
     for (int m = 0; m < SNT_NUM_IPRED; m++) {
         td_prediction(f, bx, by, m, td_pred);
         LumaCode lc;
-        code_luma(cs, NULL, f->step, 0, src, td_pred, 1, NULL, &lc);
+        code_luma(cs, NULL, f->step, 0, dc_ctx(f, bx, by), src, td_pred, 1, NULL, &lc);
         double bits = cdf_bits(&cs->imode[f->is_inter], (uint16_t)m) + lc.bits
                     + (f->is_inter ? cdf_bits(&cs->inter[ac], 0) : 0);
         double j = block_sse(src, lc.recon, vw, vh) + f->lambda * bits;
@@ -893,7 +925,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
             j += chroma_intra;
         if (j < best_j) {
             best_j = j; bc->kind = CAND_INTRA; bc->imode = m; bc->dir = 0;
-            bc->mvf = zero; bc->mvb = zero;
+            bc->mvf = zero; bc->mvb = zero; best_dc = lc.dc_level;
             memcpy(best_rec, lc.recon, sizeof(best_rec));
         }
     }
@@ -906,6 +938,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
         f->mv_field[blk] = bc->mvf;
         f->mvb_field[blk] = bc->mvb;
         f->blk_dir[blk] = (uint8_t)bc->dir;
+        f->dc_lev[blk] = best_dc;
         f->coded[blk] = 1;
     }
     return best_j;
@@ -939,13 +972,15 @@ static void emit_inter_body(EncFrame *f, int bx, int by, int dir, SntMV mvf, Snt
     if (skip) {
         for (int k = 0; k < 64; k++) rec[k] = pred[k];
         finish_block(f, bx, by, rec, 1, dir, mvf, mvb);
+        f->dc_lev[by * f->blk_cols + bx] = 0;
         return;
     }
     LumaCode lc;
     memset(td_pred, 0, sizeof(td_pred));
-    code_luma(f->cs, f->sink, f->step, 1, res, td_pred, 0, pred, &lc);
+    code_luma(f->cs, f->sink, f->step, 1, dc_ctx(f, bx, by), res, td_pred, 0, pred, &lc);
     finish_block(f, bx, by, lc.recon, 0, dir, mvf, mvb);
     f->luma_nz[by * f->blk_cols + bx] = (uint8_t)lc.nz;
+    f->dc_lev[by * f->blk_cols + bx] = lc.dc_level;
 }
 
 static void emit_mvd(EncFrame *f, SntMV mv, SntMV mv_pred) {
@@ -1001,9 +1036,10 @@ static void emit_block(EncFrame *f, int bx, int by, const BlockChoice *bc) {
     rec(f->sink, &cs->imode[f->is_inter], (uint16_t)bc->imode);
     td_prediction(f, bx, by, bc->imode, td_pred);
     LumaCode lc;
-    code_luma(cs, f->sink, f->step, 0, src, td_pred, 1, NULL, &lc);
+    code_luma(cs, f->sink, f->step, 0, dc_ctx(f, bx, by), src, td_pred, 1, NULL, &lc);
     finish_block(f, bx, by, lc.recon, 0, 0, (SntMV){0, 0}, (SntMV){0, 0});
     f->luma_nz[by * f->blk_cols + bx] = (uint8_t)lc.nz;
+    f->dc_lev[by * f->blk_cols + bx] = lc.dc_level;
 }
 
 /* A 16x16 inter candidate */
@@ -1153,7 +1189,8 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
  *         FOR each used direction (forward, then backward):
  *           REC(mvx, s2u(mvd_x)), REC(mvy, s2u(mvd_y))
  *   IF intra block: REC(imode[is_inter_frame], mode)  // SNT_IPRED_* (intra_acdc.h)
- *   REC(dc[t], s2u(dc_level))       // DC of residual (inter) or pixels (intra)
+ *   DC level's binary decisions (levels.h, DC models; Z, S, G by the left
+ *     and above blocks' DC levels, snt_dc_context)  // residual (inter) or pixels (intra)
  *   // Intra: the mode's coefficient prediction is subtracted first
  *   FOR band b=0..15:
  *     REC(band[t][b][nz][pc], coded)  // nz: previous band (band 0: DC level) nonzero;
@@ -1287,6 +1324,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     int16_t *acdc = (int16_t *)calloc((size_t)total_blocks * SNT_ACDC_STATE, sizeof(int16_t));
     uint8_t *coded = (uint8_t *)calloc(total_blocks, 1);
     uint8_t *luma_nz = (uint8_t *)calloc(total_blocks, 1);
+    int16_t *dc_lev = (int16_t *)calloc(total_blocks, sizeof(int16_t));
 
     /* MV fields (forward, backward) and prediction directions, for MV
      * prediction, chroma and deblocking */
@@ -1314,7 +1352,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     is_inter, is_bidi,
                     is_bidi ? &sp_old : &sp_new, is_bidi ? &sp_new : NULL, gmf, gmb,
                     step, RD_LAMBDA * (double)step * step, mv_field, mvb_field, blk_dir,
-                    blk_is_inter, blk_is_skip, acdc, coded, luma_nz,
+                    blk_is_inter, blk_is_skip, acdc, coded, luma_nz, dc_lev,
                     { c_decide ? input_u : NULL, c_decide ? input_v : NULL }, stride_uv, cw, ch,
                     { chroma_ref[0], chroma_ref[1] }, { chroma_ref_b[0], chroma_ref_b[1] }, cstep,
                     {{0, 0}}, {{0, 0}}, 0 };
@@ -1548,6 +1586,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     free(acdc);
     free(coded);
     free(luma_nz);
+    free(dc_lev);
     free(mv_field);
     free(mvb_field);
     free(blk_dir);

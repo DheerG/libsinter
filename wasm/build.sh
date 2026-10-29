@@ -32,6 +32,7 @@ DECODER_SRC="
   $SRCDIR/core/prediction/intra.c
   $SRCDIR/core/prediction/obmc.c
   $SRCDIR/core/prediction/motion_est.c
+  $SRCDIR/core/prediction/mc.c
   $SRCDIR/core/partition/quadtree.c
   $SRCDIR/core/grain/grain_synth.c
   $SRCDIR/core/tile/tile.c

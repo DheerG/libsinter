@@ -18,12 +18,14 @@
 #include <stdlib.h>
 #include <math.h>
 #include "encoder.h"
+#include "cdf_set.h"
 #include "../core/transform/dct.h"
 #include "../core/quantize/pvq.h"
 #include "../core/quantize/qp_table.h"
 #include "../core/bitstream/bitstream.h"
 #include "../core/entropy/rans.h"
 #include "../core/prediction/motion_est.h"
+#include "../core/prediction/mc.h"
 #include "../util/fixed_point.h"
 #include "../perceptual/activity_mask.h"
 #include "../perceptual/csf_weights.h"
@@ -36,33 +38,71 @@ static inline uint16_t s2u(int16_t v) {
     return (u > 254) ? 255 : (uint16_t)u;
 }
 
+/* ── Rate estimates for encoder decisions (non-normative) ──────────── */
+#define RD_LAMBDA 0.14  /* lambda = RD_LAMBDA * step^2 (orthonormal DCT, SSE) */
+
+/* Ideal cost in bits of coding sym with cdf in its current state. */
+static double cdf_bits(const RansCDF *cdf, uint16_t sym) {
+    uint16_t lo, freq;
+    rans_cdf_symbol_range(cdf, sym, &lo, &freq);
+    return -log2((double)freq / RANS_PROB_TOTAL);
+}
+
+/* Length of the order-0 exp-Golomb code for v. */
+static int expgolomb_len(uint32_t v) {
+    int prefix = 0;
+    for (uint32_t c = v + 1; c > 1; c >>= 1) prefix++;
+    return 2 * prefix + 1;
+}
+
+/* Bits for a signed level: rANS symbol, plus overflow bits on escape. */
+static double level_bits(const RansCDF *cdf, int16_t level) {
+    uint16_t sym = s2u(level);
+    double bits = cdf_bits(cdf, sym);
+    if (sym == 255)
+        bits += expgolomb_len(level >= 0 ? 2u * level : (uint32_t)(-2 * level - 1));
+    return bits;
+}
+
+static double band_sse(const int16_t *a, const int16_t *b, int n) {
+    double sse = 0;
+    for (int i = 0; i < n; i++) {
+        double d = (double)a[i] - b[i];
+        sse += d * d;
+    }
+    return sse;
+}
+
 /* ── Symbol range recording ───────────────────────────────────────── */
 typedef struct { uint16_t cdf_lo; uint16_t freq; } SymRange;
 
 /*
  * Symbol emission order (normative, must match decoder exactly):
  *
+ * Contexts (cdf_set.h): t = block type (0 intra, 1 inter-coded),
+ * ct = chroma block type (1 if inter-predicted).
+ *
  * FOR each luma block (raster: by, bx):
  *   IF inter frame:
- *     REC(cdf_inter, inter_flag)    // 0=intra, 1=inter
+ *     REC(inter, inter_flag)        // 0=intra, 1=inter
  *     IF inter_flag:
- *       REC(cdf_iskip, skip_flag)   // 0=coded, 1=skip
- *       IF skip: (no more symbols, copy ref block)
+ *       REC(iskip, skip_flag)       // 0=coded, 1=skip
+ *       IF skip: (no more symbols, MC prediction at the predicted MV)
  *       IF coded:
- *         REC(cdf_mvx, s2u(mvd_x))
- *         REC(cdf_mvy, s2u(mvd_y))
- *   REC(cdf_dc, s2u(dc_level))     // DC of residual (inter) or pixels (intra)
+ *         REC(mvx, s2u(mvd_x))
+ *         REC(mvy, s2u(mvd_y))
+ *   REC(dc[t], s2u(dc_level))       // DC of residual (inter) or pixels (intra)
  *   // Low-AC prediction subtracted before band processing (key frames only)
  *   FOR band b=0..15:
- *     REC(cdf_mode, mode)
- *     IF scalar: FOR i=0..n-1: REC(cdf_ac, s2u(level))
- *     IF PVQ:    REC(cdf_skip, skip)
- *                IF !skip: REC(cdf_gain, min(gain,255))
+ *     REC(mode[t][b], mode)
+ *     IF scalar: FOR i=0..n-1: REC(ac[t][b/4], s2u(level))
+ *     IF PVQ:    REC(skip[t][b], skip)
+ *                IF !skip: REC(gain[t], min(gain,255))
  *                          (K is not sent: decoder derives it with pvq_compute_k)
  * FOR each chroma plane (U, V):
  *   FOR each 4x4 block:
- *     REC(cdf_dc, s2u(dc_level))
- *     FOR i=1..15: REC(cdf_ac, s2u(level))
+ *     REC(cdc[ct], s2u(dc_level))
+ *     FOR i=1..15: REC(cac[ct][snt_cac_group(i)], s2u(level))
  */
 
 int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
@@ -119,26 +159,12 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     SntBitWriter ov;
     snt_bw_init(&ov, ov_buf, ov_cap);
 
-    /* ── Init 9 CDFs (5 intra + 4 inter) ──────────────────────────── */
-    RansCDF cdf_dc, cdf_ac, cdf_mode, cdf_skip, cdf_gain;
-    RansCDF cdf_inter, cdf_iskip, cdf_mvx, cdf_mvy;
-    rans_cdf_init_uniform(&cdf_dc,   256, RANS_ADAPT_RATE_COEFF);
-    rans_cdf_init_uniform(&cdf_ac,   256, RANS_ADAPT_RATE_COEFF);
-    rans_cdf_init_uniform(&cdf_mode,   2, RANS_ADAPT_RATE_MODE);
-    rans_cdf_init_uniform(&cdf_skip,   2, RANS_ADAPT_RATE_MODE);
-    rans_cdf_init_uniform(&cdf_gain, 256, RANS_ADAPT_RATE_COEFF);
-    rans_cdf_init_uniform(&cdf_inter,  2, RANS_ADAPT_RATE_MODE);
-    rans_cdf_init_uniform(&cdf_iskip,  2, RANS_ADAPT_RATE_MODE);
-    rans_cdf_init_uniform(&cdf_mvx, 256, RANS_ADAPT_RATE_COEFF);
-    rans_cdf_init_uniform(&cdf_mvy, 256, RANS_ADAPT_RATE_COEFF);
-
-    /* Cross-frame CDF carry: restore from previous frame for inter */
-    if (is_inter && ctx->cdf_state_valid && ctx->cdf_state) {
-        RansCDF *saved = (RansCDF *)ctx->cdf_state;
-        cdf_dc = saved[0]; cdf_ac = saved[1]; cdf_mode = saved[2];
-        cdf_skip = saved[3]; cdf_gain = saved[4];
-        cdf_inter = saved[5]; cdf_iskip = saved[6]; cdf_mvx = saved[7]; cdf_mvy = saved[8];
-    }
+    /* ── Entropy contexts: reset on key frames, carried across inter ── */
+    if (!ctx->cdf_state)
+        ctx->cdf_state = malloc(sizeof(SntCdfSet));
+    SntCdfSet *cs = (SntCdfSet *)ctx->cdf_state;
+    if (!is_inter || !ctx->cdf_state_valid)
+        snt_cdf_set_init(cs);
 
     #define REC(cdf, sym) do { \
         rans_cdf_symbol_range(&(cdf), (sym), &ranges[rc].cdf_lo, &ranges[rc].freq); \
@@ -172,46 +198,48 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
             int block_is_inter = 0;
             int block_is_skip = 0;
             SntMV best_mv = {0, 0};
+            uint8_t mc_blk[BLK * BLK];  /* MC prediction (skip and inter coded blocks) */
 
             /* ── Inter mode decision ──────────────────────────── */
             if (is_inter) {
-                /* Compute SAD for skip (MV=0).
+                /* MV prediction from spatial neighbors (also used by the
+                 * search, which charges each candidate for its MV delta) */
+                const SntMV *left_mv = (bx > 0) ? &mv_field[blk_idx - 1] : NULL;
+                const SntMV *above_mv = (by > 0) ? &mv_field[blk_idx - blk_cols] : NULL;
+                const SntMV *above_right_mv = (by > 0 && bx + 1 < blk_cols) ?
+                    &mv_field[blk_idx - blk_cols + 1] : NULL;
+                SntMV mv_pred = snt_mv_predict(left_mv, above_mv, above_right_mv);
+
+                /* SAD for skip, which predicts at mv_pred (so a block moving
+                 * with its neighbours costs only the two flags).
                  * Note: input accessed at stride width (not stride_y) to match
                  * ref buffer stride. Correct when stride_y == width (CLI). */
+                snt_mc_luma(ctx->ref_y, width, height, px0, py0, mv_pred, BLK, BLK, mc_blk);
                 uint32_t skip_sad = 0;
                 for (int dy = 0; dy < BLK; dy++)
                     for (int dx = 0; dx < BLK; dx++) {
                         int py = py0 + dy, px_v = px0 + dx;
                         if (py < height && px_v < width) {
                             int diff = (int)input_y[py * width + px_v]
-                                     - (int)ctx->ref_y[py * width + px_v];
+                                     - (int)mc_blk[dy * BLK + dx];
                             skip_sad += (uint32_t)(diff < 0 ? -diff : diff);
                         }
                     }
+
+                /* lambda for SAD-domain decisions = sqrt(mode lambda) */
+                double lambda_sad = sqrt(RD_LAMBDA) * step;
 
                 /* Motion search: cur uses stride_y, ref uses width.
                  * Both must use the same stride for snte_motion_search.
                  * We pass width — correct when stride_y == width (CLI). */
                 SntMV search_mv = snte_motion_search(
                     input_y, ctx->ref_y, width,
-                    px0, py0, BLK, 16, width, height);
-                /* Motion search returns 1/8-pel; extract integer-pel */
-                int mv_ipx = search_mv.x / 8;
-                int mv_ipy = search_mv.y / 8;
-
-                /* SAD at best MV */
-                uint32_t inter_sad = 0;
-                for (int dy = 0; dy < BLK; dy++)
-                    for (int dx = 0; dx < BLK; dx++) {
-                        int py = py0 + dy, px_v = px0 + dx;
-                        int ry = py + mv_ipy, rx = px_v + mv_ipx;
-                        if (py < height && px_v < width &&
-                            ry >= 0 && ry < height && rx >= 0 && rx < width) {
-                            int diff = (int)input_y[py * width + px_v]
-                                     - (int)ctx->ref_y[ry * width + rx];
-                            inter_sad += (uint32_t)(diff < 0 ? -diff : diff);
-                        }
-                    }
+                    px0, py0, BLK, 16, width, height, mv_pred, lambda_sad);
+                /* Refine to quarter-pel; inter_sad is the SAD at the result */
+                uint32_t inter_sad;
+                SntMV qmv = snte_subpel_refine(input_y, ctx->ref_y, width, height,
+                                               px0, py0, BLK, search_mv, mv_pred,
+                                               lambda_sad, &inter_sad);
 
                 /* Rough intra SAD (vs flat DC) */
                 int32_t mean = 0;
@@ -238,17 +266,17 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                  * (Jens-Rainer: step*BLK was too conservative, step*BLK*2 catches
                  * more near-static blocks without visible artifacts.) */
                 uint32_t skip_threshold = (uint32_t)step * BLK * 2;
-                uint32_t mv_cost = (uint32_t)(abs(mv_ipx) + abs(mv_ipy)) * 4;
+                double mv_cost = lambda_sad * (snte_mvd_bits(qmv.x - mv_pred.x) +
+                                               snte_mvd_bits(qmv.y - mv_pred.y));
 
                 if (skip_sad <= skip_threshold) {
                     block_is_inter = 1;
                     block_is_skip = 1;
-                    best_mv.x = 0; best_mv.y = 0;
+                    best_mv = mv_pred;
                 } else if (inter_sad + mv_cost < intra_sad) {
                     block_is_inter = 1;
                     block_is_skip = 0;
-                    best_mv.x = (int16_t)mv_ipx;
-                    best_mv.y = (int16_t)mv_ipy;
+                    best_mv = qmv;
                 } else {
                     block_is_inter = 0;
                 }
@@ -258,28 +286,26 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                 blk_is_skip[blk_idx] = block_is_skip;
 
                 /* REC: inter_flag */
-                REC(cdf_inter, block_is_inter ? 1 : 0);
+                REC(cs->inter, block_is_inter ? 1 : 0);
 
                 if (block_is_inter) {
                     /* REC: skip_flag */
-                    REC(cdf_iskip, block_is_skip ? 1 : 0);
+                    REC(cs->iskip, block_is_skip ? 1 : 0);
 
                     if (block_is_skip) {
-                        /* Copy reference block to recon */
+                        /* Copy the MC prediction to recon */
+                        snt_mc_luma(ctx->ref_y, width, height, px0, py0, best_mv, BLK, BLK, mc_blk);
                         for (int dy = 0; dy < BLK; dy++)
                             for (int dx = 0; dx < BLK; dx++) {
                                 int py = py0 + dy, px_v = px0 + dx;
                                 if (py < height && px_v < width)
-                                    recon[py * pad_w + px_v] =
-                                        (int16_t)ctx->ref_y[py * width + px_v];
+                                    recon[py * pad_w + px_v] = mc_blk[dy * BLK + dx];
                             }
                         mv_field[blk_idx] = best_mv;
-                        /* Reset prediction state for skip blocks.
-                         * Skip blocks don't go through DCT, so there's no
-                         * reconstructed DC/AC to store. Next block predicts
-                         * from 0 instead of actual recon. (Gary: document this.) */
-                        dc_recon_left = 0;
-                        dc_recon_above[bx] = 0;
+                        /* Neighbours predict their DC from this block's
+                         * pixel-domain DC; AC prediction is key-frame only. */
+                        dc_recon_left = snt_pred_dc8(mc_blk);
+                        dc_recon_above[bx] = dc_recon_left;
                         for (int p = 0; p < NUM_PRED_AC; p++) {
                             ac_recon_left[p] = 0;
                             ac_recon_above[bx * NUM_PRED_AC + p] = 0;
@@ -287,25 +313,18 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                         continue; /* skip to next block */
                     }
 
-                    /* MV prediction from spatial neighbors */
-                    const SntMV *left_mv = (bx > 0) ? &mv_field[blk_idx - 1] : NULL;
-                    const SntMV *above_mv = (by > 0) ? &mv_field[blk_idx - blk_cols] : NULL;
-                    const SntMV *above_right_mv = (by > 0 && bx + 1 < blk_cols) ?
-                        &mv_field[blk_idx - blk_cols + 1] : NULL;
-                    SntMV mv_pred = snt_mv_predict(left_mv, above_mv, above_right_mv);
-
-                    /* MV delta (integer-pel, stored directly, not 1/8-pel) */
+                    /* MV delta (quarter-pel) */
                     int16_t mvd_x = best_mv.x - mv_pred.x;
                     int16_t mvd_y = best_mv.y - mv_pred.y;
 
                     /* REC: MV deltas */
                     uint16_t mvx_sym = s2u(mvd_x);
-                    REC(cdf_mvx, mvx_sym);
+                    REC(cs->mvx, mvx_sym);
                     if (mvx_sym == 255)
                         snt_bw_put_sexpgolomb(&ov, mvd_x);
 
                     uint16_t mvy_sym = s2u(mvd_y);
-                    REC(cdf_mvy, mvy_sym);
+                    REC(cs->mvy, mvy_sym);
                     if (mvy_sym == 255)
                         snt_bw_put_sexpgolomb(&ov, mvd_y);
 
@@ -316,16 +335,14 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
             /* ── DCT input: residual (inter) or pixels (intra) ──── */
             int16_t dct_input[64];
             if (block_is_inter && !block_is_skip) {
-                /* Inter coded: DCT of residual = cur - MC prediction */
+                snt_mc_luma(ctx->ref_y, width, height, px0, py0, best_mv, BLK, BLK, mc_blk);
+                /* Inter coded: DCT of residual = cur - MC prediction
+                 * (zero outside the frame) */
                 for (int dy = 0; dy < BLK; dy++)
                     for (int dx = 0; dx < BLK; dx++) {
                         int py = py0 + dy, px_v = px0 + dx;
-                        int ry = py + best_mv.y, rx = px_v + best_mv.x;
-                        int16_t cur_val = (py < height && px_v < width) ?
-                            work[py * pad_w + px_v] : 0;
-                        int16_t ref_val = (ry >= 0 && ry < height && rx >= 0 && rx < width) ?
-                            (int16_t)ctx->ref_y[ry * width + rx] : 0;
-                        dct_input[dy * BLK + dx] = cur_val - ref_val;
+                        dct_input[dy * BLK + dx] = (py < height && px_v < width) ?
+                            work[py * pad_w + px_v] - mc_blk[dy * BLK + dx] : 0;
                     }
             } else {
                 /* Intra (key or inter-frame intra): use work buffer directly */
@@ -337,9 +354,12 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
             int16_t coeffs[64];
             snt_dct_fwd_2d_ref(dct_input, BLK, BLK, coeffs);
 
-            /* DC prediction */
+            /* DC prediction. Inter residuals are zero-mean and predict 0;
+             * intra blocks predict from the neighbours' pixel-domain DC. */
             int16_t dc_pred = 0;
-            if (bx > 0 && by > 0)
+            if (block_is_inter)
+                dc_pred = 0;
+            else if (bx > 0 && by > 0)
                 dc_pred = (dc_recon_left + dc_recon_above[bx] + 1) >> 1;
             else if (bx > 0)
                 dc_pred = dc_recon_left;
@@ -350,13 +370,14 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
             int16_t dc_level = pvq_quantize_dc(dc_residual, step, 1);
 
             uint16_t dc_sym = s2u(dc_level);
-            REC(cdf_dc, dc_sym);
+            REC(cs->dc[block_is_inter], dc_sym);
             if (dc_sym == 255)
                 snt_bw_put_sexpgolomb(&ov, dc_level);
 
             int16_t dc_recon = pvq_dequantize_dc(dc_level, step) + dc_pred;
-            dc_recon_left = dc_recon;
-            dc_recon_above[bx] = dc_recon;
+            /* Neighbours see the pixel-domain DC (inter: add the prediction's DC) */
+            dc_recon_left = block_is_inter ? dc_recon + snt_pred_dc8(mc_blk) : dc_recon;
+            dc_recon_above[bx] = dc_recon_left;
 
             /* Low-AC prediction (key frames only — inter residuals don't benefit) */
             int16_t ac_pred[64];
@@ -389,51 +410,62 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                 if (band_csf < 1) band_csf = 1;
 
                 int16_t *band_coeffs = &coeffs[1 + start];
-                int32_t max_sq = 0, sum_sq = 0;
-                for (int i = 0; i < n; i++) {
-                    int32_t sq = (int32_t)band_coeffs[i] * band_coeffs[i];
-                    sum_sq += sq;
-                    if (sq > max_sq) max_sq = sq;
+                int t = block_is_inter;
+
+                /* Scalar candidate (CSF-weighted step on high bands) */
+                uint16_t eff_step = step;
+                if (band_csf < 128) {
+                    eff_step = (uint16_t)((uint32_t)step * 256 / band_csf);
+                    if (eff_step > 3072) eff_step = 3072;
                 }
-                int use_scalar = (sum_sq > 0 && max_sq * 10 > sum_sq * 6);
+                int16_t s_level[16], s_recon[16];
+                double s_bits = cdf_bits(&cs->mode[t][b], 1);
+                for (int i = 0; i < n; i++) {
+                    s_level[i] = pvq_quantize_dc(band_coeffs[i], eff_step, 1);
+                    s_recon[i] = pvq_dequantize_dc(s_level[i], eff_step);
+                    s_bits += level_bits(&cs->ac[t][b / 4], s_level[i]);
+                }
 
-                uint16_t mode_sym = use_scalar ? 1 : 0;
-                REC(cdf_mode, mode_sym);
+                /* PVQ candidate */
+                SntPVQCode code;
+                int16_t p_recon[16];
+                pvq_encode(band_coeffs, n, step, 1, band_csf, &code, p_recon);
+                uint16_t gain_sym = (code.gain > 255) ? 255 : (uint16_t)code.gain;
+                int shape_bits = 0;
+                double p_bits = cdf_bits(&cs->mode[t][b], 0)
+                              + cdf_bits(&cs->skip[t][b], code.skip ? 1 : 0);
+                if (!code.skip) {
+                    /* K = pvq_compute_k(gain, n, band_csf): the decoder
+                     * has all three inputs, so K is not transmitted. */
+                    shape_bits = pvq_shape_bits(n, code.k);
+                    if (shape_bits < 1) shape_bits = 1;
+                    if (shape_bits > 64) shape_bits = 64;
+                    p_bits += cdf_bits(&cs->gain[t], gain_sym) + shape_bits;
+                    if (gain_sym == 255) p_bits += expgolomb_len(code.gain);
+                }
 
-                int16_t band_recon[16];
+                /* Mode decision: minimum distortion + lambda * bits.
+                 * (The old energy-concentration heuristic picked PVQ for
+                 * bands where it cost far more than it saved.) */
+                double lambda = RD_LAMBDA * (double)step * step;
+                int use_scalar = band_sse(band_coeffs, s_recon, n) + lambda * s_bits
+                              <= band_sse(band_coeffs, p_recon, n) + lambda * p_bits;
+                const int16_t *band_recon = use_scalar ? s_recon : p_recon;
 
+                REC(cs->mode[t][b], use_scalar ? 1 : 0);
                 if (use_scalar) {
-                    uint16_t eff_step = step;
-                    if (band_csf < 128) {
-                        eff_step = (uint16_t)((uint32_t)step * 256 / band_csf);
-                        if (eff_step > 3072) eff_step = 3072;
-                    }
                     for (int i = 0; i < n; i++) {
-                        int16_t level = pvq_quantize_dc(band_coeffs[i], eff_step, 1);
-                        uint16_t ac_sym = s2u(level);
-                        REC(cdf_ac, ac_sym);
+                        uint16_t ac_sym = s2u(s_level[i]);
+                        REC(cs->ac[t][b / 4], ac_sym);
                         if (ac_sym == 255)
-                            snt_bw_put_sexpgolomb(&ov, level);
-                        band_recon[i] = pvq_dequantize_dc(level, eff_step);
+                            snt_bw_put_sexpgolomb(&ov, s_level[i]);
                     }
                 } else {
-                    SntPVQCode code;
-                    pvq_encode(band_coeffs, n, step, 1, band_csf, &code, band_recon);
-
-                    uint16_t skip_sym = code.skip ? 1 : 0;
-                    REC(cdf_skip, skip_sym);
-
+                    REC(cs->skip[t][b], code.skip ? 1 : 0);
                     if (!code.skip) {
-                        uint16_t gain_sym = (code.gain > 255) ? 255 : (uint16_t)code.gain;
-                        REC(cdf_gain, gain_sym);
+                        REC(cs->gain[t], gain_sym);
                         if (gain_sym == 255)
                             snt_bw_put_expgolomb(&ov, code.gain);
-
-                        /* K = pvq_compute_k(gain, n, band_csf): the decoder
-                         * has all three inputs, so K is not transmitted. */
-                        int shape_bits = pvq_shape_bits(n, code.k);
-                        if (shape_bits < 1) shape_bits = 1;
-                        if (shape_bits > 64) shape_bits = 64;
                         if (shape_bits > 32) {
                             snt_bw_put_bits(&ov, (uint32_t)(code.shape_idx >> 32), shape_bits - 32);
                             snt_bw_put_bits(&ov, (uint32_t)(code.shape_idx & 0xFFFFFFFF), 32);
@@ -479,12 +511,8 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                 for (int dx = 0; dx < BLK; dx++) {
                     int py = py0 + dy, px_v = px0 + dx;
                     int16_t val = recon_blk[dy * BLK + dx];
-                    if (block_is_inter && !block_is_skip) {
-                        int ry = py + best_mv.y, rx = px_v + best_mv.x;
-                        int16_t ref_val = (ry >= 0 && ry < height && rx >= 0 && rx < width) ?
-                            (int16_t)ctx->ref_y[ry * width + rx] : 0;
-                        val += ref_val;
-                    }
+                    if (block_is_inter && !block_is_skip)
+                        val += mc_blk[dy * BLK + dx];
                     recon[py * pad_w + px_v] = val;
                 }
         }
@@ -536,14 +564,17 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     int c_is_skip = is_inter && blk_is_skip[luma_blk_idx];
                     int c_is_inter = is_inter && blk_is_inter[luma_blk_idx];
 
-                    /* Chroma skip: copy from reference (implicit from luma skip) */
+                    /* Chroma skip (implicit from luma skip): MC prediction at
+                     * the luma block's MV, which is its predicted MV */
                     if (c_is_skip && cr) {
                         uint8_t *c_ref_out = chroma_rec[plane];
+                        uint8_t c_skip[16];
+                        snt_mc_chroma(cr, cw, ch, cbx, cby, mv_field[luma_blk_idx], 4, 4, c_skip);
                         for (int dy = 0; dy < 4; dy++)
                             for (int dx = 0; dx < 4; dx++) {
                                 int py = cby + dy, px = cbx + dx;
                                 if (py < ch && px < cw && c_ref_out)
-                                    c_ref_out[py*cw+px] = cr[py*cw+px];
+                                    c_ref_out[py*cw+px] = c_skip[dy*4+dx];
                             }
                         c_dc_left = 0;
                         c_dc_above[ci] = 0;
@@ -552,19 +583,16 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
 
                     /* Build 4x4 block input */
                     int16_t cblock[16];
+                    uint8_t c_mc[16];  /* chroma MC prediction (inter only) */
                     if (c_is_inter && cr) {
-                        /* Chroma inter: residual = cur - mc_ref at luma_mv/2 */
-                        SntMV luma_mv = mv_field[luma_blk_idx];
-                        int cmvx = luma_mv.x / 2, cmvy = luma_mv.y / 2;
+                        /* Chroma inter: the luma MV (quarter-pel) is the
+                         * chroma MV in 1/8-pel units */
+                        snt_mc_chroma(cr, cw, ch, cbx, cby, mv_field[luma_blk_idx], 4, 4, c_mc);
                         for (int dy = 0; dy < 4; dy++)
                             for (int dx = 0; dx < 4; dx++) {
                                 int py = cby + dy, px = cbx + dx;
-                                int ry = py + cmvy, rx = px + cmvx;
-                                int16_t cur_val = (py < ch && px < cw) ?
-                                    (int16_t)cp[py*stride_uv+px] : 128;
-                                int16_t ref_val = (ry >= 0 && ry < ch && rx >= 0 && rx < cw && cr) ?
-                                    (int16_t)cr[ry*cw+rx] : 128;
-                                cblock[dy*4+dx] = cur_val - ref_val;
+                                cblock[dy*4+dx] = (py < ch && px < cw) ?
+                                    (int16_t)cp[py*stride_uv+px] - c_mc[dy*4+dx] : 0;
                             }
                     } else {
                         /* Intra: center by subtracting 128 */
@@ -576,6 +604,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                             }
                     }
 
+                    int c_bt = (c_is_inter && cr) ? 1 : 0;  /* chroma context: inter-predicted? */
                     int16_t ccoeffs[16];
                     snt_dct_fwd_2d_ref(cblock, 4, 4, ccoeffs);
 
@@ -589,7 +618,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     int16_t cdc_level = pvq_quantize_dc(dc_res, cstep, 1);
 
                     uint16_t cdc_sym = s2u(cdc_level);
-                    REC(cdf_dc, cdc_sym);
+                    REC(cs->cdc[c_bt], cdc_sym);
                     if (cdc_sym == 255)
                         snt_bw_put_sexpgolomb(&ov, cdc_level);
 
@@ -602,7 +631,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     for (int i = 1; i < 16; i++) {
                         int16_t ac_level = pvq_quantize_dc(ccoeffs[i], cstep, 1);
                         uint16_t ac_sym = s2u(ac_level);
-                        REC(cdf_ac, ac_sym);
+                        REC(cs->cac[c_bt][snt_cac_group(i)], ac_sym);
                         if (ac_sym == 255)
                             snt_bw_put_sexpgolomb(&ov, ac_level);
                         crecon_coeffs[i] = pvq_dequantize_dc(ac_level, cstep);
@@ -619,12 +648,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                                 if (py < ch && px < cw) {
                                     int32_t val = (int32_t)crecon_blk[dy*4+dx];
                                     if (c_is_inter && cr) {
-                                        SntMV luma_mv = mv_field[luma_blk_idx];
-                                        int cmvx = luma_mv.x / 2, cmvy = luma_mv.y / 2;
-                                        int ry = py + cmvy, rx = px + cmvx;
-                                        int16_t rv = (ry >= 0 && ry < ch && rx >= 0 && rx < cw) ?
-                                            (int16_t)cr[ry*cw+rx] : 128;
-                                        val += rv;
+                                        val += c_mc[dy*4+dx];
                                     } else {
                                         val += 128;
                                     }
@@ -671,15 +695,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     snt_bw_byte_align(&bw);
     *bs_len = snt_bw_bytes_written(&bw);
 
-    /* ── Save CDF state for cross-frame carry ─────────────────────── */
-    if (!ctx->cdf_state)
-        ctx->cdf_state = malloc(9 * sizeof(RansCDF));
-    {
-        RansCDF *saved = (RansCDF *)ctx->cdf_state;
-        saved[0] = cdf_dc; saved[1] = cdf_ac; saved[2] = cdf_mode;
-        saved[3] = cdf_skip; saved[4] = cdf_gain;
-        saved[5] = cdf_inter; saved[6] = cdf_iskip; saved[7] = cdf_mvx; saved[8] = cdf_mvy;
-    }
+    /* CDFs in ctx->cdf_state now carry into the next inter frame */
     ctx->cdf_state_valid = 1;
 
     /* ── Store reconstructed frame as reference ────────────────────── */

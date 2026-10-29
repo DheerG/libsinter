@@ -17,6 +17,7 @@ CORE_SRC = \
 	$(SRC_DIR)/core/prediction/intra.c \
 	$(SRC_DIR)/core/prediction/obmc.c \
 	$(SRC_DIR)/core/prediction/motion_est.c \
+	$(SRC_DIR)/core/prediction/mc.c \
 	$(SRC_DIR)/core/partition/quadtree.c \
 	$(SRC_DIR)/core/grain/grain_synth.c \
 	$(SRC_DIR)/core/tile/tile.c \

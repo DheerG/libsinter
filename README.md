@@ -4,25 +4,45 @@ An experimental, vibecoded video codec built from scratch using [Claude Code](ht
 
 **This was a learning experiment**, not a production codec. The goal was to test one-shot agent team workflows on a domain I had zero prior experience in — and to see how far a simulated expert team could push a novel architecture. Write-up: [One-Shot Wonder](https://dheer.co/one-shot-wonder/) | [Claude Agent Teams](https://dheer.co/claude-agent-teams/)
 
-Later phases fixed bugs and improved compression, measuring every change against x264 and keeping only the changes that helped. The last phase rebuilt the format so that every tool the decoder runs comes from a publication before 2004, or is new and was searched for in patents first (see [Where the tools come from](#where-the-tools-come-from)).
+In October 2026 the codec was reworked with Claude Code: bugs fixed, compression tools added, and the format rebuilt so that every tool the decoder runs comes from a publication before 2004, or is new and was searched for in patents first (see [Where the tools come from](#where-the-tools-come-from)). Every change was measured against x264.
 
 ## Results
 
-On real camera footage, Sinter needs **about 1.2–1.3x the bitrate of H.264 (x264)** for the same luma quality. The original experiment needed 10.5–17.6x.
+On real camera footage, Sinter now needs **about 1.2–1.3x the bitrate of H.264 (x264)** for the same luma quality. The original experiment needed 10.5–17.6x.
 
-| Clip | Original | After bug fixes | Before B-frames etc. | Before clean format | Now |
-|------|----------|-----------------|----------------------|---------------------|-----|
-| Foreman | 14.5x | 8.3x | 2.0x | 1.44x | **1.24x** |
-| Mobile & Calendar | 10.5x | 8.1x | 2.1x | 1.38x | **1.28x** |
-| Akiyo | 17.6x | 7.7x | 1.9x | 1.45x | **1.21x** |
-| Bus (held out) | – | – | 1.76x | 1.43x | **1.32x** |
-| News (held out) | – | – | 1.77x | 1.37x | **1.17x** |
+| Clip | Original experiment | October 2026 |
+|------|---------------------|--------------|
+| Foreman | 14.5x | **1.24x** |
+| Mobile & Calendar | 10.5x | **1.28x** |
+| Akiyo | 17.6x | **1.21x** |
+| Bus (held out) | – | **1.32x** |
+| News (held out) | – | **1.17x** |
 
-Each figure is the bitrate Sinter needs to match x264's luma PSNR (BD-rate), on the Xiph CIF test sequences (352x288, first 150 frames). x264 runs at `-preset medium -tune psnr` (which includes its adaptive B-frames) with the same 30-frame keyframe interval. Bus and News were never used for tuning; they were measured once, at the end of each phase. Counting chroma (YUV PSNR) gives 1.26–1.37x; SSIM gives 1.21–1.33x.
+Each figure is the bitrate Sinter needs to match x264's luma PSNR (BD-rate), on the Xiph CIF test sequences (352x288, first 150 frames). x264 runs at `-preset medium -tune psnr` (which includes its adaptive B-frames) with the same 30-frame keyframe interval. Bus and News were never used for tuning. Counting chroma (YUV PSNR) gives 1.26–1.37x; SSIM gives 1.21–1.33x.
 
-"Before clean format" used tools close to H.264's (a 6-tap interpolation filter, skip at the median-predicted vector, pixel-domain intra modes, H.264-style deblocking) and rANS. Replacing them with older, published tools and then winning the bits back left Sinter better on every clip.
+The original write-up reported 18.6x from a two-point comparison on a synthetic 256x256 clip. [SCOREBOARD.md](SCOREBOARD.md) and [docs/TECHNICAL_REFERENCE.md](docs/TECHNICAL_REFERENCE.md) record that original design and have not been updated.
 
-The original write-up reported 18.6x from a two-point comparison on a synthetic 256x256 clip. [SCOREBOARD.md](SCOREBOARD.md) and [docs/TECHNICAL_REFERENCE.md](docs/TECHNICAL_REFERENCE.md) record that original design and have not been updated for the changes below.
+## Examples
+
+Left to right: the source, Sinter, and x264 at the same file size. Frame 44 (a B-frame), cropped and zoomed 3x. Here x264 uses its default tuning, 2-pass, at Sinter's bitrate. Each clip also has a side-by-side video of the full 5 seconds, in the same order.
+
+**Foreman**: Sinter 265 kbps, 35.0 dB; x264 264 kbps, 35.4 dB.
+
+![Foreman, frame 44: source, Sinter, x264](docs/images/foreman.png)
+
+[Watch the side-by-side video](docs/videos/foreman.mp4)
+
+**Mobile & Calendar**: Sinter 893 kbps, 31.0 dB; x264 888 kbps, 32.0 dB.
+
+![Mobile & Calendar, frame 44: source, Sinter, x264](docs/images/mobile.png)
+
+[Watch the side-by-side video](docs/videos/mobile.mp4)
+
+**Bus** (held out): Sinter 821 kbps, 32.3 dB; x264 822 kbps, 33.6 dB.
+
+![Bus, frame 44: source, Sinter, x264](docs/images/bus.png)
+
+[Watch the side-by-side video](docs/videos/bus.mp4)
 
 ## What's in It
 
@@ -74,7 +94,7 @@ The entropy models' starting tables are trained on ten Xiph CIF clips that are n
 The original "why the gap exists" estimates were the expert team's guesses. Measured instead:
 
 - With x264 limited to the original Sinter's toolset (no B-frames, one reference frame, full-pel motion, CAVLC, no deblocking), x264 needed 2.2–3.5x its normal bitrate. The original Sinter needed another 2.1–3.5x on top of that. So about half of the original gap was missing tools, and half was bugs and implementation.
-- The largest single wins were: choosing PVQ or scalar per band by rate-distortion cost (41%), quarter-pel motion (30%), B-frames (14%), skip blocks that follow motion (10%), mode decisions by trial encoding (8%) and 16x16 macroblocks (5%). Each is measured against the step before it. In the clean-format phase, the range coder (3.6%), the smaller frame header (2.5%), global motion (2.1%), MPEG-1's skip rule (1.8%), binary level decisions (1.8%) and trained starting tables (1.6%) did the most.
+- The largest single gains in October 2026 came from quarter-pel motion, B-frames, skipped blocks that follow the motion, and mode decisions by trial encoding. The git history gives every change with its measured effect.
 
 What x264 still has that Sinter doesn't: multiple reference frames, adaptive B-frame placement, more partition shapes (16x8, 8x16, 4x4) and transform sizes, weighted prediction, and look-ahead rate control (MB-tree).
 
@@ -98,7 +118,7 @@ Built with [Claude Code](https://claude.ai/code). The expert team was assembled 
 
 Plus a principal engineer (facilitator) and patent reviewer. All personas simulated by Claude.
 
-The later phases (bug fixes, compression work and the clean format) were also done with Claude Code, without personas: each change was measured by BD-rate against x264 on the Xiph clips and kept only if it helped, except the clean-format replacements, which were kept for their sources. The last two phases ran autonomously toward fixed targets. The git history records each change, its measured effect, and the changes tried and dropped.
+The October 2026 improvements were also done with Claude Code, without personas, much of it autonomously toward fixed targets: each change was measured by BD-rate against x264 on the Xiph clips and kept only if it helped, except replacements made for their sources. The git history records each change, its measured effect, and the changes tried and dropped.
 
 ## Requirements
 

@@ -23,7 +23,7 @@
 /* Macroblock modes in inter frames (full 16x16 macroblocks only) */
 enum {
     SNT_MB_SPLIT   = 0,  /* four 8x8 blocks, each with its own mode */
-    SNT_MB_SKIP16  = 1,  /* all four blocks predicted at the MB's predicted MV */
+    SNT_MB_SKIP16  = 1,  /* all four blocks predicted at zero motion */
     SNT_MB_INTER16 = 2,  /* one MV for the MB; each 8x8 residual coded */
     SNT_NUM_MB_MODES = 3
 };

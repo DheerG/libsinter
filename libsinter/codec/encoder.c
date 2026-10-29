@@ -63,9 +63,15 @@ static SntMixState *cur_mix;
 #define GM_SKIP_SSE 30
 #endif
 
-/* Ideal cost in bits of coding sym with model m in its current state. */
+/* Ideal cost in bits of coding sym with model m in its current state:
+ * log2(total) - log2(freq), from a table of log2 of the counts */
+#define LOG2_TABLE (1 << 17)
 static double cdf_bits(const SntModel *m, uint16_t sym) {
-    return -log2((double)m->freq[sym] / m->total);
+    static float log2_of[LOG2_TABLE];
+    if (log2_of[2] == 0)
+        for (int i = 1; i < LOG2_TABLE; i++) log2_of[i] = (float)log2((double)i);
+    if (m->total >= LOG2_TABLE) return -log2((double)m->freq[sym] / m->total);
+    return (double)log2_of[m->total] - log2_of[m->freq[sym]];
 }
 
 /* Bits for a luma AC level at zigzag index k, coded as binary decisions

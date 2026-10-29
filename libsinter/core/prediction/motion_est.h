@@ -43,6 +43,20 @@ SntMV snte_subpel_refine(const uint8_t *cur, const uint8_t *ref,
 SntMV snt_mv_predict(const SntMV *left_mv, const SntMV *above_mv,
                       const SntMV *above_right_mv);
 
+/* Median MV predictor for block (bx, by) from its left, above and
+ * above-right neighbours in mv_field, each used only if coded[] says it
+ * has already been coded (blocks are coded in macroblock Z order, so the
+ * above-right neighbour may not be). */
+static inline SntMV snt_mv_predict_at(const SntMV *mv_field, const uint8_t *coded,
+                                      int blk_cols, int bx, int by) {
+    int i = by * blk_cols + bx;
+    const SntMV *l  = (bx > 0 && coded[i - 1]) ? &mv_field[i - 1] : NULL;
+    const SntMV *a  = (by > 0 && coded[i - blk_cols]) ? &mv_field[i - blk_cols] : NULL;
+    const SntMV *ar = (by > 0 && bx + 1 < blk_cols && coded[i - blk_cols + 1]) ?
+                      &mv_field[i - blk_cols + 1] : NULL;
+    return snt_mv_predict(l, a, ar);
+}
+
 /* Compute SAD (Sum of Absolute Differences) for motion search. */
 uint32_t snt_sad(const uint8_t *a, int a_stride,
                   const uint8_t *b, int b_stride,

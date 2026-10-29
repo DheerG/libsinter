@@ -29,11 +29,20 @@ static inline int16_t u2s(uint16_t s) {
     return (s % 2 == 0) ? (int16_t)(s / 2) : -(int16_t)((s + 1) / 2);
 }
 
+/* Decode one MV-delta component (escape: signed exp-Golomb overflow) */
+static int16_t dec_mvd(RansDecoder *rd, RansCDF *cdf, SntBitReader *ovr) {
+    uint16_t sym = rans_dec_symbol(rd, cdf);
+    rans_cdf_adapt(cdf, sym);
+    return sym == 255 ? (int16_t)snt_br_get_sexpgolomb(ovr) : u2s(sym);
+}
+
 /*
  * Symbol consumption order (must match encoder exactly):
  *
- * FOR each luma block (raster: by, bx):
- *   IF inter frame:
+ * FOR each 16x16 macroblock (raster):
+ *   IF inter frame AND full macroblock: DEC(mbmode); IF INTER16: DEC(mvx, mvy)
+ *   FOR each 8x8 block in Z order (SKIP16/INTER16: no per-block mode symbols):
+ *   IF inter frame (split macroblock):
  *     DEC(inter) → inter_flag
  *     IF inter_flag:
  *       DEC(iskip) → skip_flag
@@ -103,12 +112,14 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
 
     /* ── Decode luma blocks ────────────────────────────────────────── */
     int16_t *recon = (int16_t *)calloc((size_t)pad_w * pad_h, sizeof(int16_t));
-    int16_t *dc_recon_above = (int16_t *)calloc(blk_cols, sizeof(int16_t));
-    int16_t dc_recon_left = 0;
     #define NUM_PRED_AC 4
     static const int pred_ac_idx[NUM_PRED_AC] = {1, 8, 2, 9};
-    int16_t *ac_recon_above = (int16_t *)calloc((size_t)blk_cols * NUM_PRED_AC, sizeof(int16_t));
-    int16_t ac_recon_left[NUM_PRED_AC] = {0};
+    int total_blocks_d = blk_cols * blk_rows;
+    /* Per-block state for neighbours' prediction: pixel-domain DC, low AC
+     * (key frames), and whether the block is coded yet */
+    int16_t *dc_pix = (int16_t *)calloc(total_blocks_d, sizeof(int16_t));
+    int16_t *ac_state = (int16_t *)calloc((size_t)total_blocks_d * NUM_PRED_AC, sizeof(int16_t));
+    uint8_t *coded = (uint8_t *)calloc(total_blocks_d, 1);
 
     /* MV field and block flags for chroma inter derivation */
     SntMV *mv_field = (SntMV *)calloc(blk_cols * blk_rows, sizeof(SntMV));
@@ -118,9 +129,27 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     #define NUM_BANDS 16
     static const int band_bounds[NUM_BANDS + 1] = {0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,59,63};
 
-    for (int by = 0; by < blk_rows; by++) {
-        dc_recon_left = 0;
-        for (int bx = 0; bx < blk_cols; bx++) {
+    /* Blocks are coded in 16x16 macroblocks in raster order, and the four
+     * 8x8 blocks of a macroblock in Z order (top-left, top-right,
+     * bottom-left, bottom-right). */
+    int mb_cols = (blk_cols + 1) / 2, mb_rows = (blk_rows + 1) / 2;
+    for (int mb = 0; mb < mb_cols * mb_rows; mb++) {
+        /* Macroblock mode (inter frames, full macroblocks only). The 16x16
+         * predictor comes from neighbours outside the macroblock. */
+        int bx0 = (mb % mb_cols) * 2, by0 = (mb / mb_cols) * 2;
+        int mb_mode = SNT_MB_SPLIT;
+        SntMV mv_pred16 = {0, 0}, mv16 = {0, 0};
+        if (is_inter && bx0 + 1 < blk_cols && by0 + 1 < blk_rows) {
+            mv_pred16 = snt_mv_predict_at(mv_field, coded, blk_cols, bx0, by0);
+            mb_mode = DEC(cs->mbmode);
+            if (mb_mode == SNT_MB_INTER16) {
+                mv16.x = dec_mvd(&rdec, &cs->mvx, &ovr) + mv_pred16.x;
+                mv16.y = dec_mvd(&rdec, &cs->mvy, &ovr) + mv_pred16.y;
+            }
+        }
+        for (int z = 0; z < 4; z++) {
+            int bx = (mb % mb_cols) * 2 + (z & 1), by = (mb / mb_cols) * 2 + (z >> 1);
+            if (bx >= blk_cols || by >= blk_rows) continue;
             int blk_idx = by * blk_cols + bx;
             int px0 = bx * BLK, py0 = by * BLK;
             int block_is_inter = 0;
@@ -130,65 +159,47 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
 
             /* ── Inter mode decode ────────────────────────────── */
             if (is_inter) {
-                uint16_t inter_sym = DEC(cs->inter);
-                block_is_inter = (inter_sym == 1);
-                blk_is_inter[blk_idx] = block_is_inter;
-
-                if (block_is_inter) {
-                    /* MV prediction from spatial neighbors */
-                    const SntMV *left_mv = (bx > 0) ? &mv_field[blk_idx - 1] : NULL;
-                    const SntMV *above_mv = (by > 0) ? &mv_field[blk_idx - blk_cols] : NULL;
-                    const SntMV *above_right_mv = (by > 0 && bx + 1 < blk_cols) ?
-                        &mv_field[blk_idx - blk_cols + 1] : NULL;
-                    SntMV mv_pred = snt_mv_predict(left_mv, above_mv, above_right_mv);
-
-                    uint16_t skip_sym = DEC(cs->iskip);
-                    block_is_skip = (skip_sym == 1);
-                    blk_is_skip[blk_idx] = block_is_skip;
-
-                    if (block_is_skip) {
-                        /* Skip predicts at mv_pred; copy the MC prediction to recon */
-                        best_mv = mv_pred;
-                        if (ctx->ref_y)
-                            snt_mc_luma(ctx->ref_y, width, height, px0, py0, best_mv, BLK, BLK, mc_blk);
-                        else
-                            memset(mc_blk, 0, sizeof(mc_blk));  /* malformed: inter frame, no reference */
-                        for (int dy = 0; dy < BLK; dy++)
-                            for (int dx = 0; dx < BLK; dx++) {
-                                int py = py0 + dy, px_v = px0 + dx;
-                                if (py < height && px_v < width)
-                                    recon[py * pad_w + px_v] = mc_blk[dy * BLK + dx];
-                            }
-                        mv_field[blk_idx] = best_mv;
-                        /* Neighbours predict their DC from this block's
-                         * pixel-domain DC; AC prediction is key-frame only. */
-                        dc_recon_left = snt_pred_dc8(mc_blk);
-                        dc_recon_above[bx] = dc_recon_left;
-                        for (int p = 0; p < NUM_PRED_AC; p++) {
-                            ac_recon_left[p] = 0;
-                            ac_recon_above[bx * NUM_PRED_AC + p] = 0;
+                if (mb_mode == SNT_MB_SPLIT) {
+                    block_is_inter = DEC(cs->inter) == 1;
+                    if (block_is_inter) {
+                        /* MV prediction from spatial neighbors */
+                        SntMV mv_pred = snt_mv_predict_at(mv_field, coded, blk_cols, bx, by);
+                        block_is_skip = DEC(cs->iskip) == 1;
+                        best_mv = mv_pred;  /* skip predicts at mv_pred */
+                        if (!block_is_skip) {
+                            best_mv.x = dec_mvd(&rdec, &cs->mvx, &ovr) + mv_pred.x;
+                            best_mv.y = dec_mvd(&rdec, &cs->mvy, &ovr) + mv_pred.y;
                         }
-                        continue;
                     }
-
-                    /* Decode MV deltas */
-                    uint16_t mvx_sym = DEC(cs->mvx);
-                    int16_t mvd_x;
-                    if (mvx_sym == 255)
-                        mvd_x = (int16_t)snt_br_get_sexpgolomb(&ovr);
-                    else
-                        mvd_x = u2s(mvx_sym);
-
-                    uint16_t mvy_sym = DEC(cs->mvy);
-                    int16_t mvd_y;
-                    if (mvy_sym == 255)
-                        mvd_y = (int16_t)snt_br_get_sexpgolomb(&ovr);
-                    else
-                        mvd_y = u2s(mvy_sym);
-
-                    best_mv.x = mvd_x + mv_pred.x;
-                    best_mv.y = mvd_y + mv_pred.y;
+                } else {
+                    /* 16x16 skip or inter: every block takes the MB's MV */
+                    block_is_inter = 1;
+                    block_is_skip = (mb_mode == SNT_MB_SKIP16);
+                    best_mv = block_is_skip ? mv_pred16 : mv16;
+                }
+                blk_is_inter[blk_idx] = block_is_inter;
+                blk_is_skip[blk_idx] = block_is_skip;
+                if (block_is_inter)
                     mv_field[blk_idx] = best_mv;
+
+                if (block_is_skip) {
+                    /* Copy the MC prediction to recon */
+                    if (ctx->ref_y)
+                        snt_mc_luma(ctx->ref_y, width, height, px0, py0, best_mv, BLK, BLK, mc_blk);
+                    else
+                        memset(mc_blk, 0, sizeof(mc_blk));  /* malformed: inter frame, no reference */
+                    for (int dy = 0; dy < BLK; dy++)
+                        for (int dx = 0; dx < BLK; dx++) {
+                            int py = py0 + dy, px_v = px0 + dx;
+                            if (py < height && px_v < width)
+                                recon[py * pad_w + px_v] = mc_blk[dy * BLK + dx];
+                        }
+                    /* Neighbours predict their DC from this block's
+                     * pixel-domain DC; AC prediction is key-frame only. */
+                    dc_pix[blk_idx] = snt_pred_dc8(mc_blk);
+                    memset(&ac_state[blk_idx * NUM_PRED_AC], 0, NUM_PRED_AC * sizeof(int16_t));
+                    coded[blk_idx] = 1;
+                    continue;
                 }
             }
 
@@ -220,11 +231,11 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             if (has_pred_blk)
                 dc_pred = 0;
             else if (bx > 0 && by > 0)
-                dc_pred = (dc_recon_left + dc_recon_above[bx] + 1) >> 1;
+                dc_pred = (dc_pix[blk_idx - 1] + dc_pix[blk_idx - blk_cols] + 1) >> 1;
             else if (bx > 0)
-                dc_pred = dc_recon_left;
+                dc_pred = dc_pix[blk_idx - 1];
             else if (by > 0)
-                dc_pred = dc_recon_above[bx];
+                dc_pred = dc_pix[blk_idx - blk_cols];
 
             uint16_t dc_sym = DEC(cs->dc[block_is_inter]);
             int16_t dc_level;
@@ -236,8 +247,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             int16_t dc_recon_val = pvq_dequantize_dc(dc_level, step) + dc_pred;
             recon_coeffs[0] = dc_recon_val;
             /* Neighbours see the pixel-domain DC (add the prediction block's DC) */
-            dc_recon_left = has_pred_blk ? dc_recon_val + snt_pred_dc8(mc_blk) : dc_recon_val;
-            dc_recon_above[bx] = dc_recon_left;
+            dc_pix[blk_idx] = has_pred_blk ? dc_recon_val + snt_pred_dc8(mc_blk) : dc_recon_val;
 
             /* Band processing */
             for (int b = 0; b < NUM_BANDS; b++) {
@@ -313,9 +323,9 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     int idx = pred_ac_idx[p];
                     int16_t pred_val = 0;
                     if (idx < 8 && bx > 0)
-                        pred_val = ac_recon_left[p];
+                        pred_val = ac_state[(blk_idx - 1) * NUM_PRED_AC + p];
                     else if (idx >= 8 && by > 0)
-                        pred_val = ac_recon_above[bx * NUM_PRED_AC + p];
+                        pred_val = ac_state[(blk_idx - blk_cols) * NUM_PRED_AC + p];
                     recon_coeffs[idx] += pred_val;
                 }
             }
@@ -344,13 +354,11 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                     snt_dct_fwd_2d_ref(recon_blk, BLK, BLK, full);
                     src = full;
                 }
-                for (int p = 0; p < NUM_PRED_AC; p++) {
-                    ac_recon_left[p] = src[pred_ac_idx[p]];
-                    ac_recon_above[bx * NUM_PRED_AC + p] = src[pred_ac_idx[p]];
-                }
+                for (int p = 0; p < NUM_PRED_AC; p++)
+                    ac_state[blk_idx * NUM_PRED_AC + p] = src[pred_ac_idx[p]];
             }
+            coded[blk_idx] = 1;
         }
-        memset(ac_recon_left, 0, sizeof(ac_recon_left));
     }
 
     /* Copy to output */
@@ -498,8 +506,9 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     ctx->num_refs = 1;
 
     free(recon);
-    free(dc_recon_above);
-    free(ac_recon_above);
+    free(dc_pix);
+    free(ac_state);
+    free(coded);
     free(mv_field);
     free(blk_is_inter);
     free(blk_is_skip);

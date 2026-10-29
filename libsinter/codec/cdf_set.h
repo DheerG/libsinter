@@ -20,6 +20,14 @@
 #define SNT_AC_GROUPS    4  /* luma AC contexts: band / 4 */
 #define SNT_CAC_GROUPS   3  /* chroma AC contexts: by frequency, see snt_cac_group */
 
+/* Macroblock modes in inter frames (full 16x16 macroblocks only) */
+enum {
+    SNT_MB_SPLIT   = 0,  /* four 8x8 blocks, each with its own mode */
+    SNT_MB_SKIP16  = 1,  /* all four blocks predicted at the MB's predicted MV */
+    SNT_MB_INTER16 = 2,  /* one MV for the MB; each 8x8 residual coded */
+    SNT_NUM_MB_MODES = 3
+};
+
 typedef struct {
     RansCDF dc[2];                    /* luma DC residual, by block type */
     RansCDF ac[2][SNT_AC_GROUPS];     /* luma scalar AC level */
@@ -27,6 +35,7 @@ typedef struct {
     RansCDF skip[2][SNT_NUM_BANDS];   /* PVQ band skip */
     RansCDF gain[2];                  /* PVQ gain */
     RansCDF imode[2];                 /* intra mode, by frame type (0 key, 1 inter) */
+    RansCDF mbmode;                   /* macroblock mode (SNT_MB_*) */
     RansCDF inter, iskip, mvx, mvy;   /* inter-frame block modes and MV deltas */
     RansCDF cdc[2];                   /* chroma DC residual, by block type */
     RansCDF cac[2][SNT_CAC_GROUPS];   /* chroma AC level */
@@ -54,6 +63,7 @@ static inline void snt_cdf_set_init(SntCdfSet *s) {
             rans_cdf_init_uniform(&s->skip[t][b], 2, RANS_ADAPT_RATE_MODE);
         }
     }
+    rans_cdf_init_uniform(&s->mbmode, SNT_NUM_MB_MODES, RANS_ADAPT_RATE_MODE);
     rans_cdf_init_uniform(&s->inter,  2, RANS_ADAPT_RATE_MODE);
     rans_cdf_init_uniform(&s->iskip,  2, RANS_ADAPT_RATE_MODE);
     rans_cdf_init_uniform(&s->mvx,  256, RANS_ADAPT_RATE_COEFF);

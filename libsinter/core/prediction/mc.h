@@ -44,4 +44,13 @@ static inline int16_t snt_pred_dc8(const uint8_t *blk) {
     return (int16_t)((s + 4) >> 3);
 }
 
+/* DC of a 4x4 chroma prediction block relative to 128, on the scale of
+ * the 4x4 orthonormal DCT's DC coefficient (sum / 4). Chroma intra blocks
+ * code pixels - 128, so neighbours compare like with like. */
+static inline int16_t snt_pred_dc4c(const uint8_t *blk) {
+    int32_t s = -128 * 16;
+    for (int i = 0; i < 16; i++) s += blk[i];
+    return (int16_t)(s >= 0 ? (s + 2) / 4 : -((-s + 2) / 4));
+}
+
 #endif /* SNT_MC_H */

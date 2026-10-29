@@ -470,14 +470,22 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                                 if (py < ch_h && px < cw)
                                     chroma_out[plane][py*stride_uv+px] = c_skip[dy*4+dx];
                             }
-                        c_dc_left = 0;
-                        c_dc_above[ci] = 0;
+                        c_dc_left = snt_pred_dc4c(c_skip);
+                        c_dc_above[ci] = c_dc_left;
                         continue;
                     }
 
                     int c_bt = (c_is_inter && cr) ? 1 : 0;  /* chroma context: inter-predicted? */
+                    uint8_t c_mc[16];  /* chroma MC prediction: luma MVs as 1/8-pel */
+                    if (c_bt)
+                        dec_pred_chroma(cr, crb, cw, ch_h, cbx, cby, blk_dir[luma_blk_idx],
+                                        mv_field[luma_blk_idx], mvb_field[luma_blk_idx], c_mc);
+                    /* DC prediction: intra blocks from the neighbours'
+                     * pixel-domain DC; inter residuals are zero-mean */
                     int16_t c_dc_pred = 0;
-                    if (cbx > 0 && cby > 0)
+                    if (c_bt)
+                        c_dc_pred = 0;
+                    else if (cbx > 0 && cby > 0)
                         c_dc_pred = (c_dc_left + c_dc_above[ci] + 1) >> 1;
                     else if (cbx > 0) c_dc_pred = c_dc_left;
                     else if (cby > 0) c_dc_pred = c_dc_above[ci];
@@ -490,8 +498,9 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                         cdc_level = u2s(cdc_sym);
 
                     int16_t cdc_recon = pvq_dequantize_dc(cdc_level, cstep) + c_dc_pred;
-                    c_dc_left = cdc_recon;
-                    c_dc_above[ci] = cdc_recon;
+                    /* Neighbours see the pixel-domain DC (inter: add the prediction's) */
+                    c_dc_left = c_bt ? cdc_recon + snt_pred_dc4c(c_mc) : cdc_recon;
+                    c_dc_above[ci] = c_dc_left;
 
                     int16_t ccoeffs[16];
                     ccoeffs[0] = cdc_recon;
@@ -507,11 +516,6 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
 
                     int16_t cblock[16];
                     snt_dct_inv_2d_ref(ccoeffs, 4, cblock, 4);
-
-                    uint8_t c_mc[16];  /* chroma MC prediction: luma MVs as 1/8-pel */
-                    if (c_is_inter && cr)
-                        dec_pred_chroma(cr, crb, cw, ch_h, cbx, cby, blk_dir[luma_blk_idx],
-                                        mv_field[luma_blk_idx], mvb_field[luma_blk_idx], c_mc);
 
                     /* Output: add MC reference for inter, add 128 for intra */
                     for (int dy = 0; dy < 4; dy++)

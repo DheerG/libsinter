@@ -888,8 +888,8 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                                 if (py < ch && px < cw && c_ref_out)
                                     c_ref_out[py*cw+px] = c_skip[dy*4+dx];
                             }
-                        c_dc_left = 0;
-                        c_dc_above[ci] = 0;
+                        c_dc_left = snt_pred_dc4c(c_skip);
+                        c_dc_above[ci] = c_dc_left;
                         continue;
                     }
 
@@ -921,8 +921,12 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     int16_t ccoeffs[16];
                     snt_dct_fwd_2d_ref(cblock, 4, 4, ccoeffs);
 
+                    /* DC prediction: intra blocks from the neighbours'
+                     * pixel-domain DC; inter residuals are zero-mean */
                     int16_t c_dc_pred = 0;
-                    if (cbx > 0 && cby > 0)
+                    if (c_bt)
+                        c_dc_pred = 0;
+                    else if (cbx > 0 && cby > 0)
                         c_dc_pred = (c_dc_left + c_dc_above[ci] + 1) >> 1;
                     else if (cbx > 0) c_dc_pred = c_dc_left;
                     else if (cby > 0) c_dc_pred = c_dc_above[ci];
@@ -936,8 +940,9 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                         snt_bw_put_sexpgolomb(&ov, cdc_level);
 
                     int16_t cdc_recon = pvq_dequantize_dc(cdc_level, cstep) + c_dc_pred;
-                    c_dc_left = cdc_recon;
-                    c_dc_above[ci] = cdc_recon;
+                    /* Neighbours see the pixel-domain DC (inter: add the prediction's) */
+                    c_dc_left = c_bt ? cdc_recon + snt_pred_dc4c(c_mc) : cdc_recon;
+                    c_dc_above[ci] = c_dc_left;
 
                     int16_t crecon_coeffs[16];
                     crecon_coeffs[0] = cdc_recon;

@@ -430,6 +430,11 @@ typedef struct {
     int16_t       *acdc;     /* per block: SNT_ACDC_STATE coefficients of the
                                 reconstruction, for intra prediction */
     uint8_t       *coded;    /* per block: coded yet? */
+    /* Extra MV candidates for the blocks being decided (encoder decisions):
+     * the macroblock's 16x16-searched MVs for its 8x8 blocks, the 8x8
+     * blocks' MVs for the 16x16 candidate */
+    SntMV          xf[4], xb[4];
+    int            nx;
 } EncFrame;
 
 enum { CAND_SKIP, CAND_INTER, CAND_INTRA };
@@ -543,6 +548,58 @@ static SntMV search_mv(const EncFrame *f, const SntSplinePlane *ref, int px0, in
                               s, pred, lambda_sad, NULL);
 }
 
+/* MV candidates for an inter block whose top-left 8x8 block is (bx, by),
+ * besides the searched ones (cf[0], cb[0]): the predicted MVs (no MV
+ * delta), the skip motion, the MVs of the inter blocks to the left, above
+ * and above right, and f's extra candidates. Returns their number, the
+ * searched ones included. w_blocks: the block's width in 8x8 blocks. */
+#define MAX_MV_CAND 10
+static int mv_candidates(const EncFrame *f, int bx, int by, int w_blocks,
+                         SntMV qf, SntMV qb, SntMV pf, SntMV pb, SntMV *cf, SntMV *cb) {
+    int n = 0, sdir;
+    SntMV smf, smb;
+    cf[n] = qf; cb[n++] = qb;
+    cf[n] = pf; cb[n++] = pb;
+    skip_motion(f, bx, by, &sdir, &smf, &smb);
+    cf[n] = smf; cb[n++] = smb;
+    int i = by * f->blk_cols + bx;
+    if (bx > 0 && f->blk_dir[i - 1]) { cf[n] = f->mv_field[i - 1]; cb[n++] = f->mvb_field[i - 1]; }
+    if (by > 0) {
+        int a = i - f->blk_cols, ar = a + w_blocks;
+        if (f->blk_dir[a]) { cf[n] = f->mv_field[a]; cb[n++] = f->mvb_field[a]; }
+        if (bx + w_blocks < f->blk_cols && f->coded[ar] && f->blk_dir[ar]) {
+            cf[n] = f->mv_field[ar]; cb[n++] = f->mvb_field[ar];
+        }
+    }
+    for (int x = 0; x < f->nx; x++) { cf[n] = f->xf[x]; cb[n++] = f->xb[x]; }
+    return n;
+}
+
+static inline int mv_eq(SntMV a, SntMV b) { return a.x == b.x && a.y == b.y; }
+
+/* Is candidate c, in direction d, the same as an earlier one? */
+static int mv_cand_dup(int d, const SntMV *cf, const SntMV *cb, int c) {
+    for (int e = 0; e < c; e++)
+        if ((!(d & SNT_DIR_FWD) || mv_eq(cf[e], cf[c])) && (!(d & SNT_DIR_BWD) || mv_eq(cb[e], cb[c])))
+            return 1;
+    return 0;
+}
+
+/* Trial order of the inter candidates: each candidate forward, then
+ * backward, then bi-directional (B-frames), then bi-directional from the
+ * best forward and the best backward candidate, held in slot ncand */
+static void mv_cand_index(int ncand, int cand, int *d, int *c) {
+    if (cand < 3 * ncand) { *d = SNT_DIR_FWD + cand / ncand; *c = cand % ncand; }
+    else { *d = SNT_DIR_BI; *c = ncand; }
+}
+
+/* Keep the best forward and backward candidates (cost j) in slot ncand */
+static void mv_cand_best(int d, double j, SntMV mvf, SntMV mvb, double *jdir,
+                         SntMV *cf, SntMV *cb, int ncand) {
+    if (d == SNT_DIR_FWD && j < jdir[0]) { jdir[0] = j; cf[ncand] = mvf; }
+    if (d == SNT_DIR_BWD && j < jdir[1]) { jdir[1] = j; cb[ncand] = mvb; }
+}
+
 /* Bits for an inter block's direction (B-frames) and MV deltas */
 static double inter_mv_bits(const EncFrame *f, int dir, SntMV mvf, SntMV mvb,
                             SntMV pf, SntMV pb) {
@@ -552,6 +609,48 @@ static double inter_mv_bits(const EncFrame *f, int dir, SntMV mvf, SntMV mvb,
     if (dir & SNT_DIR_BWD)
         b += level_bits(&f->cs->mvx, mvb.x - pb.x) + level_bits(&f->cs->mvy, mvb.y - pb.y);
     return b;
+}
+
+/* Cost (distortion + lambda * bits) of 8x8 block (bx, by) coded inter in
+ * direction d at (mvf, mvb), with its mode flags (agreement class ac) and
+ * MV deltas; its reconstruction in rec */
+static double inter8_cost(const EncFrame *f, int bx, int by, const int16_t *src, int vw, int vh,
+                          int ac, int d, SntMV mvf, SntMV mvb, SntMV pf, SntMV pb, int16_t *rec) {
+    uint8_t p[64];
+    int16_t res[64], td0[64] = {0};
+    LumaCode lc;
+    mc_residual(f, bx, by, d, mvf, mvb, src, vw, vh, p, res);
+    code_luma(f->cs, NULL, f->step, 1, res, td0, 0, p, &lc);
+    memcpy(rec, lc.recon, sizeof(lc.recon));
+    return block_sse(src, lc.recon, vw, vh)
+         + f->lambda * (cdf_bits(&f->cs->inter[ac], 1) + cdf_bits(&f->cs->iskip[ac], 0)
+                        + inter_mv_bits(f, d, mvf, mvb, pf, pb) + lc.bits);
+}
+
+/* The same for the macroblock whose top-left block is (bx0, by0), coded
+ * INTER16 (macroblock mode model by agreement class mac) */
+static double inter16_cost(const EncFrame *f, int bx0, int by0, int mac, int d, SntMV mvf,
+                           SntMV mvb, SntMV pf, SntMV pb) {
+    double dist = 0, bits = 0;
+    for (int z = 0; z < 4; z++) {
+        int bx = bx0 + (z & 1), by = by0 + (z >> 1), vw, vh;
+        int16_t src[64], res[64], td0[64] = {0};
+        uint8_t p[64];
+        LumaCode lc;
+        load_src(f, bx, by, src, &vw, &vh);
+        mc_residual(f, bx, by, d, mvf, mvb, src, vw, vh, p, res);
+        code_luma(f->cs, NULL, f->step, 1, res, td0, 0, p, &lc);
+        dist += block_sse(src, lc.recon, vw, vh);
+        bits += lc.bits;
+    }
+    return dist + f->lambda * (cdf_bits(&f->cs->mbmode[mac], SNT_MB_INTER16) + bits
+                               + inter_mv_bits(f, d, mvf, mvb, pf, pb));
+}
+
+/* Neighbour k (0-7) of mv at a quarter sample */
+static inline SntMV mv_neighbour(SntMV mv, int k) {
+    if (k >= 4) k++;
+    return (SntMV){ (int16_t)(mv.x + k % 3 - 1), (int16_t)(mv.y + k / 3 - 1) };
 }
 
 /* Choose a block's mode by trial encoding: each candidate (skip with the
@@ -578,7 +677,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
         SntMV pf, pb;
         mv_predictors(f, bx, by, &pf, &pb);
         uint8_t p[64];
-        int16_t p16[64], res[64];
+        int16_t p16[64];
 
         /* Skip: prediction with the global motion (bi-directional in
          * B-frames), nothing else coded */
@@ -594,23 +693,51 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
             memcpy(best_rec, p16, sizeof(best_rec));
         }
 
-        /* Inter coded at the searched MVs */
+        /* Inter coded at the searched MVs and the other candidates */
         SntMV qf = search_mv(f, f->ref_f, px0, py0, BLK, pf);
         SntMV qb = f->is_bidi ? search_mv(f, f->ref_b, px0, py0, BLK, pb) : zero;
-        for (int d = SNT_DIR_FWD; d <= (f->is_bidi ? SNT_DIR_BI : SNT_DIR_FWD); d++) {
+        SntMV cf[MAX_MV_CAND + 1], cb[MAX_MV_CAND + 1];
+        int ncand = mv_candidates(f, bx, by, 1, qf, qb, pf, pb, cf, cb);
+        double jdir[2] = {1e300, 1e300}, ij = 1e300;
+        int id = 0;
+        SntMV imf = zero, imb = zero;
+        int16_t irec[64], trec[64];
+        for (int cand = 0; cand < (f->is_bidi ? 3 * ncand + 1 : ncand); cand++) {
+            int d, c;
+            mv_cand_index(ncand, cand, &d, &c);
+            if (mv_cand_dup(d, cf, cb, c)) continue;
             /* An unused direction's MV is zero (H.263 Annex O) */
-            SntMV mvf = (d & SNT_DIR_FWD) ? qf : zero, mvb = (d & SNT_DIR_BWD) ? qb : zero;
-            LumaCode lc;
-            mc_residual(f, bx, by, d, mvf, mvb, src, vw, vh, p, res);
-            memset(td_pred, 0, sizeof(td_pred));
-            code_luma(cs, NULL, f->step, 1, res, td_pred, 0, p, &lc);
-            j = block_sse(src, lc.recon, vw, vh)
-              + f->lambda * (cdf_bits(&cs->inter[ac], 1) + cdf_bits(&cs->iskip[ac], 0)
-                             + inter_mv_bits(f, d, mvf, mvb, pf, pb) + lc.bits);
-            if (j < best_j) {
-                best_j = j; bc->kind = CAND_INTER; bc->dir = d; bc->mvf = mvf; bc->mvb = mvb;
-                memcpy(best_rec, lc.recon, sizeof(best_rec));
+            SntMV mvf = (d & SNT_DIR_FWD) ? cf[c] : zero;
+            SntMV mvb = (d & SNT_DIR_BWD) ? cb[c] : zero;
+            j = inter8_cost(f, bx, by, src, vw, vh, ac, d, mvf, mvb, pf, pb, trec);
+            mv_cand_best(d, j, mvf, mvb, jdir, cf, cb, ncand);
+            if (j < ij) {
+                ij = j; id = d; imf = mvf; imb = mvb;
+                memcpy(irec, trec, sizeof(irec));
             }
+        }
+
+        /* The best inter candidate, refined by the same cost: the 8
+         * quarter-sample neighbours of each MV it uses, the other MV held
+         * (for bi-directional prediction, as in S.-W. Wu and A. Gersho,
+         * "Joint estimation of forward and backward motion vectors for
+         * interpolative prediction of video", IEEE TIP 3(5), 1994) */
+        for (int dirbit = SNT_DIR_FWD; dirbit <= SNT_DIR_BWD; dirbit <<= 1) {
+            if (!(id & dirbit)) continue;
+            SntMV c0 = dirbit == SNT_DIR_FWD ? imf : imb, f0 = imf, b0 = imb;
+            for (int k = 0; k < 8; k++) {
+                SntMV mvf = dirbit == SNT_DIR_FWD ? mv_neighbour(c0, k) : f0;
+                SntMV mvb = dirbit == SNT_DIR_BWD ? mv_neighbour(c0, k) : b0;
+                j = inter8_cost(f, bx, by, src, vw, vh, ac, id, mvf, mvb, pf, pb, trec);
+                if (j < ij) {
+                    ij = j; imf = mvf; imb = mvb;
+                    memcpy(irec, trec, sizeof(irec));
+                }
+            }
+        }
+        if (ij < best_j) {
+            best_j = ij; bc->kind = CAND_INTER; bc->dir = id; bc->mvf = imf; bc->mvb = imb;
+            memcpy(best_rec, irec, sizeof(best_rec));
         }
     }
 
@@ -747,43 +874,51 @@ typedef struct {
  * 16x16-searched MVs with each 8x8 residual coded (forward; in B-frames
  * also backward and bi-directional). Returns the skip cost and the best
  * inter candidate. */
-static double eval_mb16(EncFrame *f, int bx0, int by0, SntMV pf, SntMV pb, int mac,
-                        Mb16Choice *best) {
+static double eval_mb16(EncFrame *f, int bx0, int by0, SntMV pf, SntMV pb, SntMV qf, SntMV qb,
+                        int mac, Mb16Choice *best) {
     SntCdfSet *cs = f->cs;
-    int px0 = bx0 * BLK, py0 = by0 * BLK;
     int sdir;
     SntMV smf, smb, zero = {0, 0};
     skip_motion(f, bx0, by0, &sdir, &smf, &smb);
-    SntMV qf = search_mv(f, f->ref_f, px0, py0, 16, pf);
-    SntMV qb = f->is_bidi ? search_mv(f, f->ref_b, px0, py0, 16, pb) : zero;
 
     double d_skip = 0;
+    for (int z = 0; z < 4; z++) {
+        int bx = bx0 + (z & 1), by = by0 + (z >> 1), vw, vh;
+        int16_t src[64], res[64], p16[64];
+        uint8_t p[64];
+        load_src(f, bx, by, src, &vw, &vh);
+        mc_residual(f, bx, by, sdir, smf, smb, src, vw, vh, p, res);
+        for (int k = 0; k < 64; k++) p16[k] = p[k];
+        d_skip += block_sse(src, p16, vw, vh);
+    }
+
+    /* At the searched MVs and the other candidates */
     best->j = 1e300;
-    for (int d = SNT_DIR_FWD; d <= (f->is_bidi ? SNT_DIR_BI : SNT_DIR_FWD); d++) {
-        SntMV mvf = (d & SNT_DIR_FWD) ? qf : zero, mvb = (d & SNT_DIR_BWD) ? qb : zero;
-        double d_inter = 0, bits = 0;
-        for (int z = 0; z < 4; z++) {
-            int bx = bx0 + (z & 1), by = by0 + (z >> 1);
-            int16_t src[64], res[64], p16[64], td0[64];
-            uint8_t p[64];
-            int vw, vh;
-            load_src(f, bx, by, src, &vw, &vh);
-            if (d == SNT_DIR_FWD) {
-                mc_residual(f, bx, by, sdir, smf, smb, src, vw, vh, p, res);
-                for (int k = 0; k < 64; k++) p16[k] = p[k];
-                d_skip += block_sse(src, p16, vw, vh);
-            }
-            LumaCode lc;
-            memset(td0, 0, sizeof(td0));
-            mc_residual(f, bx, by, d, mvf, mvb, src, vw, vh, p, res);
-            code_luma(cs, NULL, f->step, 1, res, td0, 0, p, &lc);
-            d_inter += block_sse(src, lc.recon, vw, vh);
-            bits += lc.bits;
-        }
-        double j = d_inter + f->lambda * (cdf_bits(&cs->mbmode[mac], SNT_MB_INTER16) + bits
-                                          + inter_mv_bits(f, d, mvf, mvb, pf, pb));
+    SntMV cf[MAX_MV_CAND + 1], cb[MAX_MV_CAND + 1];
+    int ncand = mv_candidates(f, bx0, by0, 2, qf, qb, pf, pb, cf, cb);
+    double jdir[2] = {1e300, 1e300};
+    for (int cand = 0; cand < (f->is_bidi ? 3 * ncand + 1 : ncand); cand++) {
+        int d, c;
+        mv_cand_index(ncand, cand, &d, &c);
+        if (mv_cand_dup(d, cf, cb, c)) continue;
+        SntMV mvf = (d & SNT_DIR_FWD) ? cf[c] : zero;
+        SntMV mvb = (d & SNT_DIR_BWD) ? cb[c] : zero;
+        double j = inter16_cost(f, bx0, by0, mac, d, mvf, mvb, pf, pb);
+        mv_cand_best(d, j, mvf, mvb, jdir, cf, cb, ncand);
         if (j < best->j) {
             best->j = j; best->dir = d; best->mvf = mvf; best->mvb = mvb;
+        }
+    }
+
+    /* Refined as for 8x8 blocks (decide_block) */
+    for (int dirbit = SNT_DIR_FWD; dirbit <= SNT_DIR_BWD; dirbit <<= 1) {
+        if (!(best->dir & dirbit)) continue;
+        SntMV c0 = dirbit == SNT_DIR_FWD ? best->mvf : best->mvb, f0 = best->mvf, b0 = best->mvb;
+        for (int k = 0; k < 8; k++) {
+            SntMV mvf = dirbit == SNT_DIR_FWD ? mv_neighbour(c0, k) : f0;
+            SntMV mvb = dirbit == SNT_DIR_BWD ? mv_neighbour(c0, k) : b0;
+            double j = inter16_cost(f, bx0, by0, mac, best->dir, mvf, mvb, pf, pb);
+            if (j < best->j) { best->j = j; best->mvf = mvf; best->mvb = mvb; }
         }
     }
     return d_skip + f->lambda * cdf_bits(&cs->mbmode[mac], SNT_MB_SKIP16);
@@ -812,12 +947,20 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
     SntMV pf, pb;
     mv_predictors(f, bx0, by0, &pf, &pb);
     int mac = agree_class_mb(f, bx0, by0);  /* before the blocks' provisional state */
+    SntMV zero = {0, 0};
+    SntMV qf = search_mv(f, f->ref_f, bx0 * BLK, by0 * BLK, 16, pf);
+    SntMV qb = f->is_bidi ? search_mv(f, f->ref_b, bx0 * BLK, by0 * BLK, 16, pb) : zero;
     BlockChoice bc[4];
     double j_split = f->lambda * cdf_bits(&f->cs->mbmode[mac], SNT_MB_SPLIT);
+    f->xf[0] = qf; f->xb[0] = qb; f->nx = 1;
     for (int z = 0; z < 4; z++)
         j_split += decide_block(f, bx0 + (z & 1), by0 + (z >> 1), 1, &bc[z]);
+    f->nx = 0;
+    for (int z = 0; z < 4; z++)
+        if (bc[z].kind == CAND_INTER) { f->xf[f->nx] = bc[z].mvf; f->xb[f->nx++] = bc[z].mvb; }
     Mb16Choice m16;
-    double j_skip = eval_mb16(f, bx0, by0, pf, pb, mac, &m16);
+    double j_skip = eval_mb16(f, bx0, by0, pf, pb, qf, qb, mac, &m16);
+    f->nx = 0;
 
     int mode = SNT_MB_SPLIT;
     if (j_skip < j_split && j_skip <= m16.j) mode = SNT_MB_SKIP16;
@@ -1010,7 +1153,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
                     is_inter, is_bidi,
                     is_bidi ? &sp_old : &sp_new, is_bidi ? &sp_new : NULL, gmf, gmb,
                     step, RD_LAMBDA * (double)step * step, mv_field, mvb_field, blk_dir,
-                    blk_is_inter, blk_is_skip, acdc, coded };
+                    blk_is_inter, blk_is_skip, acdc, coded, {{0, 0}}, {{0, 0}}, 0 };
     int mb_cols = (blk_cols + 1) / 2, mb_rows = (blk_rows + 1) / 2;
     for (int mb = 0; mb < mb_cols * mb_rows; mb++)
         code_macroblock(&ef, mb % mb_cols, mb / mb_cols, blk_rows);

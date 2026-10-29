@@ -241,7 +241,7 @@ typedef struct {
     int   kind;       /* CAND_* */
     int   imode;      /* intra mode (CAND_INTRA) */
     int   dir;        /* SNT_DIR_* (CAND_INTER) */
-    SntMV mvf, mvb;   /* MVs (an unused direction keeps its predictor) */
+    SntMV mvf, mvb;   /* MVs (zero for an unused direction) */
 } BlockChoice;
 
 /* Source block (0 outside the frame) and its in-frame size */
@@ -271,8 +271,8 @@ static void store_acdc(EncFrame *f, int blk, const int16_t *rec) {
 
 /* Predicted forward and backward MVs of block (bx, by) */
 static void mv_predictors(const EncFrame *f, int bx, int by, SntMV *pf, SntMV *pb) {
-    *pf = snt_mv_predict_at(f->mv_field, f->coded, f->blk_cols, bx, by);
-    *pb = f->is_bidi ? snt_mv_predict_at(f->mvb_field, f->coded, f->blk_cols, bx, by)
+    *pf = snt_mv_predict_at(f->mv_field, f->blk_cols, bx, by);
+    *pb = f->is_bidi ? snt_mv_predict_at(f->mvb_field, f->blk_cols, bx, by)
                      : (SntMV){0, 0};
 }
 
@@ -348,7 +348,8 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
         SntMV qf = search_mv(f, f->ref_f, px0, py0, BLK, pf);
         SntMV qb = f->is_bidi ? search_mv(f, f->ref_b, px0, py0, BLK, pb) : zero;
         for (int d = SNT_DIR_FWD; d <= (f->is_bidi ? SNT_DIR_BI : SNT_DIR_FWD); d++) {
-            SntMV mvf = (d & SNT_DIR_FWD) ? qf : pf, mvb = (d & SNT_DIR_BWD) ? qb : pb;
+            /* An unused direction's MV is zero (H.263 Annex O) */
+            SntMV mvf = (d & SNT_DIR_FWD) ? qf : zero, mvb = (d & SNT_DIR_BWD) ? qb : zero;
             LumaCode lc;
             mc_residual(f, bx, by, d, mvf, mvb, src, vw, vh, p, res);
             memset(td_pred, 0, sizeof(td_pred));
@@ -458,9 +459,10 @@ static void emit_block(EncFrame *f, int bx, int by, const BlockChoice *bc) {
                 SntMV zero = {0, 0};
                 emit_inter_body(f, bx, by, f->is_bidi ? SNT_DIR_BI : SNT_DIR_FWD, zero, zero, 1);
             } else {
-                /* An unused direction keeps its predictor, as in the decoder */
-                SntMV mvf = (bc->dir & SNT_DIR_FWD) ? bc->mvf : pf;
-                SntMV mvb = (bc->dir & SNT_DIR_BWD) ? bc->mvb : pb;
+                /* An unused direction's MV is zero, as in the decoder */
+                SntMV zero = {0, 0};
+                SntMV mvf = (bc->dir & SNT_DIR_FWD) ? bc->mvf : zero;
+                SntMV mvb = (bc->dir & SNT_DIR_BWD) ? bc->mvb : zero;
                 emit_inter_mvs(f, bc->dir, mvf, mvb, pf, pb);
                 emit_inter_body(f, bx, by, bc->dir, mvf, mvb, 0);
             }
@@ -502,7 +504,7 @@ static double eval_mb16(EncFrame *f, int bx0, int by0, SntMV pf, SntMV pb, Mb16C
     double d_skip = 0;
     best->j = 1e300;
     for (int d = SNT_DIR_FWD; d <= (f->is_bidi ? SNT_DIR_BI : SNT_DIR_FWD); d++) {
-        SntMV mvf = (d & SNT_DIR_FWD) ? qf : pf, mvb = (d & SNT_DIR_BWD) ? qb : pb;
+        SntMV mvf = (d & SNT_DIR_FWD) ? qf : zero, mvb = (d & SNT_DIR_BWD) ? qb : zero;
         double d_inter = 0, bits = 0;
         for (int z = 0; z < 4; z++) {
             int bx = bx0 + (z & 1), by = by0 + (z >> 1);

@@ -38,24 +38,30 @@ SntMV snte_subpel_refine(const uint8_t *cur, const SntSplinePlane *ref,
                           int blk_size, SntMV mv, SntMV pred,
                           double lambda, uint32_t *sad_out);
 
-/* MV prediction: median of spatial neighbors (AMVP-style).
- * left_mv, above_mv, above_right_mv: neighbor MVs (NULL if unavailable).
- * Returns predicted MV. */
+/* Median of three neighbours' MVs, component by component. */
 SntMV snt_mv_predict(const SntMV *left_mv, const SntMV *above_mv,
                       const SntMV *above_right_mv);
 
-/* Median MV predictor for block (bx, by) from its left, above and
- * above-right neighbours in mv_field, each used only if coded[] says it
- * has already been coded (blocks are coded in macroblock Z order, so the
- * above-right neighbour may not be). */
-static inline SntMV snt_mv_predict_at(const SntMV *mv_field, const uint8_t *coded,
-                                      int blk_cols, int bx, int by) {
+/* MV predictor of 8x8 block (bx, by), as in H.263 (section 6.1.1 and
+ * Annex F, 1996): the median of three candidates, MV1 left, MV2 above
+ * and MV3 above-right, except that within a 16x16 macroblock the top-left
+ * block takes MV3 from the next macroblock (two blocks right) and the
+ * bottom-right block takes it from the top-left block. At the left edge
+ * MV1 is zero; at the top edge MV2 and MV3 are MV1; at the right edge MV3
+ * is zero. Intra and skipped blocks hold zero MVs in mv_field, so they
+ * count as zero candidates. A 16x16 macroblock's predictor is its
+ * top-left block's. */
+static inline SntMV snt_mv_predict_at(const SntMV *mv_field, int blk_cols, int bx, int by) {
+    SntMV zero = {0, 0};
     int i = by * blk_cols + bx;
-    const SntMV *l  = (bx > 0 && coded[i - 1]) ? &mv_field[i - 1] : NULL;
-    const SntMV *a  = (by > 0 && coded[i - blk_cols]) ? &mv_field[i - blk_cols] : NULL;
-    const SntMV *ar = (by > 0 && bx + 1 < blk_cols && coded[i - blk_cols + 1]) ?
-                      &mv_field[i - blk_cols + 1] : NULL;
-    return snt_mv_predict(l, a, ar);
+    int zx = bx & 1, zy = by & 1;
+    SntMV mv1 = bx > 0 ? mv_field[i - 1] : zero;
+    if (by == 0 && !zy)
+        return mv1;  /* MV2 = MV3 = MV1: the median is MV1 */
+    SntMV mv2 = mv_field[i - blk_cols];
+    int x3 = zx == 0 && zy == 0 ? bx + 2 : (zx && zy ? bx - 1 : bx + 1);
+    SntMV mv3 = x3 < blk_cols ? mv_field[i - blk_cols + (x3 - bx)] : zero;
+    return snt_mv_predict(&mv1, &mv2, &mv3);
 }
 
 /* Compute SAD (Sum of Absolute Differences) for motion search. */

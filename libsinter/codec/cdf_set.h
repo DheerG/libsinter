@@ -31,8 +31,8 @@ enum {
 typedef struct {
     RansCDF dc[2];                    /* luma DC residual, by block type */
     RansCDF ac[2][SNT_AC_GROUPS];     /* luma scalar AC level */
-    RansCDF mode[2][SNT_NUM_BANDS];   /* band mode: 0 = PVQ, 1 = scalar */
-    RansCDF skip[2][SNT_NUM_BANDS];   /* PVQ band skip */
+    RansCDF mode[2][SNT_NUM_BANDS][2];  /* band mode: 0 = PVQ, 1 = scalar; by previous band nonzero */
+    RansCDF skip[2][SNT_NUM_BANDS][2];  /* PVQ band skip; by previous band nonzero */
     RansCDF gain[2];                  /* PVQ gain */
     RansCDF imode[2];                 /* intra mode, by frame type (0 key, 1 inter) */
     RansCDF mbmode;                   /* macroblock mode (SNT_MB_*) */
@@ -60,8 +60,10 @@ static inline void snt_cdf_set_init(SntCdfSet *s) {
         for (int g = 0; g < SNT_CAC_GROUPS; g++)
             rans_cdf_init_uniform(&s->cac[t][g], 256, RANS_ADAPT_RATE_COEFF);
         for (int b = 0; b < SNT_NUM_BANDS; b++) {
-            rans_cdf_init_uniform(&s->mode[t][b], 2, RANS_ADAPT_RATE_MODE);
-            rans_cdf_init_uniform(&s->skip[t][b], 2, RANS_ADAPT_RATE_MODE);
+            for (int z = 0; z < 2; z++) {
+                rans_cdf_init_uniform(&s->mode[t][b][z], 2, RANS_ADAPT_RATE_MODE);
+                rans_cdf_init_uniform(&s->skip[t][b][z], 2, RANS_ADAPT_RATE_MODE);
+            }
         }
     }
     rans_cdf_init_uniform(&s->mbmode, SNT_NUM_MB_MODES, RANS_ADAPT_RATE_MODE);

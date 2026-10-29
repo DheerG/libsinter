@@ -299,7 +299,9 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
             /* Neighbours see the pixel-domain DC (add the prediction block's DC) */
             dc_pix[blk_idx] = has_pred_blk ? dc_recon_val + snt_pred_dc8(mc_blk) : dc_recon_val;
 
-            /* Band processing */
+            /* Band processing. Band flags take the previous band's (band 0:
+             * the DC level's) zero/nonzero status as context. */
+            int prev_nz = dc_level != 0;
             for (int b = 0; b < NUM_BANDS; b++) {
                 int start = band_bounds[b];
                 int n = band_bounds[b + 1] - start;
@@ -310,7 +312,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                 uint8_t band_csf = (uint8_t)(csf_sum / n * 255.0f);
                 if (band_csf < 1) band_csf = 1;
 
-                uint16_t mode_sym = DEC(cs->mode[block_is_inter][b]);
+                uint16_t mode_sym = DEC(cs->mode[block_is_inter][b][prev_nz]);
 
                 if (mode_sym == 1) {
                     /* Scalar mode */
@@ -319,6 +321,7 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                         eff_step = (uint16_t)((uint32_t)step * 256 / band_csf);
                         if (eff_step > 3072) eff_step = 3072;
                     }
+                    int nz = 0;
                     for (int i = 0; i < n; i++) {
                         uint16_t ac_sym = DEC(cs->ac[block_is_inter][b / 4]);
                         int16_t level;
@@ -326,11 +329,14 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
                             level = (int16_t)snt_br_get_sexpgolomb(&ovr);
                         else
                             level = u2s(ac_sym);
+                        nz |= level != 0;
                         recon_coeffs[snt_zigzag8[1 + start + i]] = pvq_dequantize_dc(level, eff_step);
                     }
+                    prev_nz = nz;
                 } else {
                     /* PVQ mode */
-                    uint16_t skip_sym = DEC(cs->skip[block_is_inter][b]);
+                    uint16_t skip_sym = DEC(cs->skip[block_is_inter][b][prev_nz]);
+                    prev_nz = !skip_sym;
 
                     if (!skip_sym) {
                         SntPVQCode code;

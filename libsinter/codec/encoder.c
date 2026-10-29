@@ -580,6 +580,15 @@ static inline int flag_ctx(const EncFrame *f, int bx, int by, int ac) {
     return snt_flag_context(ac, bx > 0 && f->blk_is_skip[i - 1], by > 0 && f->blk_is_skip[i - f->blk_cols]);
 }
 
+/* Intra-mode context of block (bx, by): the direction MPEG-4 would choose
+ * (snt_acdc_direction) */
+static inline int imode_ctx(const EncFrame *f, int bx, int by) {
+    int i = by * f->blk_cols + bx;
+    return snt_acdc_direction(bx > 0 ? &f->acdc[(i - 1) * SNT_ACDC_STATE] : NULL,
+                              bx > 0 && by > 0 ? &f->acdc[(i - f->blk_cols - 1) * SNT_ACDC_STATE] : NULL,
+                              by > 0 ? &f->acdc[(i - f->blk_cols) * SNT_ACDC_STATE] : NULL);
+}
+
 /* Record a reconstructed block's coefficients for its neighbours' intra
  * prediction */
 static void store_acdc(EncFrame *f, int blk, const int16_t *rec) {
@@ -1058,7 +1067,7 @@ static double decide_block(EncFrame *f, int bx, int by, int provisional, BlockCh
         td_prediction(f, bx, by, m, td_pred);
         LumaCode lc;
         code_luma(cs, NULL, f->step, 0, dc_ctx(f, bx, by), src, td_pred, 1, NULL, &lc);
-        double bits = cdf_bits(&cs->imode[f->is_inter], (uint16_t)m) + lc.bits
+        double bits = cdf_bits(&cs->imode[f->is_inter][imode_ctx(f, bx, by)], (uint16_t)m) + lc.bits
                     + (f->is_inter ? cdf_bits(&cs->inter[fc], 0) : 0);
         double j = block_sse(src, lc.recon, vw, vh) + f->lambda * bits;
         if (f->is_inter)
@@ -1186,7 +1195,7 @@ static void emit_block(EncFrame *f, int bx, int by, const BlockChoice *bc) {
     int16_t src[64], td_pred[64];
     int vw, vh;
     load_src(f, bx, by, src, &vw, &vh);
-    rec(f->sink, &cs->imode[f->is_inter], (uint16_t)bc->imode);
+    rec(f->sink, &cs->imode[f->is_inter][imode_ctx(f, bx, by)], (uint16_t)bc->imode);
     td_prediction(f, bx, by, bc->imode, td_pred);
     LumaCode lc;
     code_luma(cs, f->sink, f->step, 0, dc_ctx(f, bx, by), src, td_pred, 1, NULL, &lc);
@@ -1374,7 +1383,8 @@ static void code_macroblock(EncFrame *f, int mb_x, int mb_y, int blk_rows) {
  *         FOR each used direction (forward, then backward):
  *           MV delta: x, then y, each as binary decisions (levels.h, MV
  *           models by component, block size and for y whether x is zero)
- *   IF intra block: REC(imode[is_inter_frame], mode)  // SNT_IPRED_* (intra_acdc.h)
+ *   IF intra block: REC(imode[is_inter_frame][MPEG-4 direction], mode)  // SNT_IPRED_*,
+ *     direction: snt_acdc_direction (intra_acdc.h)
  *   DC level's binary decisions (levels.h, DC models; Z, S, G by the left
  *     and above blocks' DC levels, snt_dc_context)  // residual (inter) or pixels (intra)
  *   // Intra: the mode's coefficient prediction is subtracted first

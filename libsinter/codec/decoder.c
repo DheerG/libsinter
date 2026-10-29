@@ -121,12 +121,9 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     const SntSplinePlane *ref_b = is_bidi ? &sp_new : &sp_none;
     uint16_t step = snt_qp_to_step(ctx->header.base_qp);
 
-    /* ── SECTION A: Read fixed header ──────────────────────────────── */
-    snt_br_byte_align(&br);
-    uint32_t total_blocks = snt_br_get_bits(&br, 16);
-    (void)total_blocks;
+    /* Fixed fields: chroma present, global motion against each reference
+     * (skipped blocks predict with it), the overflow section's length */
     uint32_t chroma_present = snt_br_get_bits(&br, 1);
-    /* Global motion against each reference: skipped blocks predict with it */
     SntMV gmf = {0, 0}, gmb = {0, 0};
     if (is_inter) {
         gmf.x = (int16_t)snt_br_get_sexpgolomb(&br);
@@ -136,19 +133,16 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
         gmb.x = (int16_t)snt_br_get_sexpgolomb(&br);
         gmb.y = (int16_t)snt_br_get_sexpgolomb(&br);
     }
+    uint32_t ov_len = snt_br_get_expgolomb(&br);
     snt_br_byte_align(&br);
 
-    /* ── SECTION B: Read the range-coded payload ───────────────────── */
-    uint32_t rc_bytes = snt_br_get_bits(&br, 32);
-    if (rc_bytes > bs_len) rc_bytes = bs_len;  /* damaged stream */
-    uint8_t *rc_buf = (uint8_t *)malloc(rc_bytes + 4);
-    for (uint32_t i = 0; i < rc_bytes; i++)
-        rc_buf[i] = snt_br_get_byte(&br);
-
-    /* ── SECTION C: Overflow reader ────────────────────────────────── */
-    uint32_t ov_start = br.byte_pos;
+    /* Overflow bits, then the range-coded bytes to the end of the frame */
+    uint32_t ov_start = br.byte_pos < bs_len ? br.byte_pos : bs_len;
+    if (ov_len > bs_len - ov_start) ov_len = bs_len - ov_start;  /* damaged stream */
     SntBitReader ovr;
-    snt_br_init(&ovr, bitstream + ov_start, bs_len - ov_start);
+    snt_br_init(&ovr, bitstream + ov_start, ov_len);
+    const uint8_t *rc_buf = bitstream + ov_start + ov_len;
+    uint32_t rc_bytes = bs_len - ov_start - ov_len;
 
     /* ── Init range decoder ────────────────────────────────────────── */
     SntRangeDec rdec;
@@ -547,6 +541,5 @@ int sntd_decode_frame(SntDecoderCtx *ctx, const uint8_t *bitstream,
     free(blk_dir);
     free(blk_is_inter);
     free(blk_is_skip);
-    free(rc_buf);
     return 0;
 }

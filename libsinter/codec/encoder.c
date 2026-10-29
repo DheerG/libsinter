@@ -109,6 +109,7 @@ typedef struct {
 #ifdef SNT_TRAIN_STATS
     SntModel     *base;   /* first model of the set in use */
     uint32_t    (*hist)[256];
+    int           set;
 #endif
 } SymSink;
 
@@ -129,9 +130,23 @@ void snte_train_dump(FILE *f) {
 }
 #endif
 
+#ifdef SNT_TRAIN_STATS
+/* Ideal cost in bits of every coded symbol, by model set and model; and
+ * bytes outside the range coder (headers, escapes) by frame type */
+static double train_bits[2][SNT_NUM_MODELS];
+static double train_other[3];
+void snte_bits_dump(FILE *f) {
+    for (int set = 0; set < 2; set++)
+        for (int k = 0; k < SNT_NUM_MODELS; k++)
+            fprintf(f, "bits %d %d %.0f\n", set, k, train_bits[set][k]);
+    for (int t = 0; t < 3; t++) fprintf(f, "other %d %.0f\n", t, train_other[t]);
+}
+#endif
+
 static void rec(SymSink *s, SntModel *m, uint16_t sym) {
 #ifdef SNT_TRAIN_STATS
     s->hist[m - s->base][sym]++;
+    train_bits[s->set][m - s->base] += -log2((double)m->freq[sym] / m->total);
 #endif
     snt_rc_encode_sym(s->rc, m, sym);
 }
@@ -694,12 +709,13 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     ctx->header.width = (uint32_t)width;
     ctx->header.height = (uint32_t)height;
     ctx->header.frame_type = !is_inter ? SNT_FRAME_KEY : (is_bidi ? SNT_FRAME_BIDI : SNT_FRAME_INTER);
+    if (!is_inter)
+        ctx->header.key_frame_number = ctx->header.frame_number;
     SntFrameHeader fhdr = ctx->header;  /* this frame's header (QP may differ) */
     if (!is_inter)
         fhdr.base_qp = fhdr.base_qp > KEY_QP_OFFSET ? fhdr.base_qp - KEY_QP_OFFSET : 0;
     if (is_bidi)
         fhdr.base_qp = fhdr.base_qp + B_QP_OFFSET < 63 ? fhdr.base_qp + B_QP_OFFSET : 63;
-    snt_write_frame_header(&bw, &fhdr);
 
     uint16_t step = snt_qp_to_step(fhdr.base_qp);
 
@@ -723,20 +739,6 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         if (is_bidi)
             gmb = snte_global_motion(input_y, &sp_new, width, height, skip_sse);
     }
-
-    /* ── SECTION A: Fixed header ──────────────────────────────────── */
-    snt_bw_byte_align(&bw);
-    snt_bw_put_bits(&bw, (uint32_t)total_blocks, 16);
-    snt_bw_put_bits(&bw, (input_u && input_v) ? 1u : 0u, 1);
-    if (is_inter) {
-        snt_bw_put_sexpgolomb(&bw, gmf.x);
-        snt_bw_put_sexpgolomb(&bw, gmf.y);
-    }
-    if (is_bidi) {
-        snt_bw_put_sexpgolomb(&bw, gmb.x);
-        snt_bw_put_sexpgolomb(&bw, gmb.y);
-    }
-    snt_bw_byte_align(&bw);
 
     /* ── Range coder and overflow buffers ──────────────────────────── */
     int cw = width / 2, ch = height / 2;
@@ -769,7 +771,7 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
     int set_id = is_bidi ? SNT_SET_B : SNT_SET_P;
     if (!is_inter || !(is_bidi ? ctx->cdf_state_b_valid : ctx->cdf_state_valid))
         train_cls[set_id] = snt_model_class(fhdr.base_qp);
-    SymSink sink = { &renc, &ov, (SntModel *)cs, train_hist[set_id][train_cls[set_id]] };
+    SymSink sink = { &renc, &ov, (SntModel *)cs, train_hist[set_id][train_cls[set_id]], set_id };
 #else
     SymSink sink = { &renc, &ov };
 #endif
@@ -959,19 +961,32 @@ int snte_encode_frame(SntEncoderCtx *ctx, const uint8_t *input_y,
         snt_deblock_chroma(chroma_rec[1], cw, ch, cw, cstep, is_inter ? blk_is_skip : NULL, blk_cols);
     }
 
-    /* ── Write the range-coded bytes, then the overflow bits ───────── */
+    /* ── Frame: header, overflow bits, then the range-coded bytes up to
+     *    the end of the frame ───────────────────────────────────────── */
     uint32_t rc_bytes = snt_rc_enc_finish(&renc);
-    snt_bw_put_bits(&bw, rc_bytes, 32);
-    for (uint32_t i = 0; i < rc_bytes; i++)
-        snt_bw_put_byte(&bw, rc_buf[i]);
-
     snt_bw_byte_align(&ov);
     uint32_t ov_len = snt_bw_bytes_written(&ov);
+
+    snt_write_frame_header(&bw, &fhdr);
+    snt_bw_put_bits(&bw, (input_u && input_v) ? 1u : 0u, 1);
+    if (is_inter) {
+        snt_bw_put_sexpgolomb(&bw, gmf.x);
+        snt_bw_put_sexpgolomb(&bw, gmf.y);
+    }
+    if (is_bidi) {
+        snt_bw_put_sexpgolomb(&bw, gmb.x);
+        snt_bw_put_sexpgolomb(&bw, gmb.y);
+    }
+    snt_bw_put_expgolomb(&bw, ov_len);
+    snt_bw_byte_align(&bw);
     for (uint32_t i = 0; i < ov_len; i++)
         snt_bw_put_byte(&bw, ov_buf[i]);
-
-    snt_bw_byte_align(&bw);
+    for (uint32_t i = 0; i < rc_bytes; i++)
+        snt_bw_put_byte(&bw, rc_buf[i]);
     *bs_len = snt_bw_bytes_written(&bw);
+#ifdef SNT_TRAIN_STATS
+    train_other[fhdr.frame_type] += 8.0 * (*bs_len - rc_bytes);
+#endif
 
     /* Models now carry into the next frame of the same kind */
     if (is_bidi)
